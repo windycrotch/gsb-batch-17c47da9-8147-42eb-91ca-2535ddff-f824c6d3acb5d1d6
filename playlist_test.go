@@ -1,69 +1,92 @@
 package hls
 
 import (
-	"errors"
-	"fmt"
 	"os"
-	"path"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestGenerateHLSVariant(t *testing.T) {
-	cases := []struct {
-		Name          string
-		ResOptions    []string
-		Prefix        string
-		IsError       bool
-		ExpectedError string
-	}{
-		{
-			Name:       "test 1",
-			ResOptions: []string{"360p", "480p"},
-		},
-		{
-			Name:          "test 2",
-			ResOptions:    []string{},
-			IsError:       true,
-			ExpectedError: "Please give at least 1 resolutions.",
-		},
-		{
-			Name:          "test 3",
-			ResOptions:    []string{"invalid"},
-			IsError:       true,
-			ExpectedError: "No valid resolutions found.",
-		},
+	t.Run("valid resolutions", func(t *testing.T) {
+		variants, err := GenerateHLSVariant([]string{"360p", "480p"}, "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(variants) != 2 {
+			t.Fatalf("expected 2 variants, got %d", len(variants))
+		}
+	})
+
+	t.Run("empty resolutions", func(t *testing.T) {
+		if _, err := GenerateHLSVariant([]string{}, ""); err == nil {
+			t.Fatal("expected error for empty resolutions")
+		}
+	})
+
+	t.Run("unknown resolution is an error, not silently skipped", func(t *testing.T) {
+		_, err := GenerateHLSVariant([]string{"360p", "invalid"}, "")
+		if err == nil {
+			t.Fatal("expected error for unknown resolution")
+		}
+		if !errorsIs(err, ErrUnknownResolution) {
+			t.Fatalf("expected ErrUnknownResolution, got %v", err)
+		}
+	})
+
+	t.Run("location prefix", func(t *testing.T) {
+		variants, err := GenerateHLSVariant([]string{"720p"}, "prefix/dir")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if variants[0].URL != "prefix/dir/720p.m3u8" {
+			t.Fatalf("unexpected url %q", variants[0].URL)
+		}
+	})
+}
+
+func errorsIs(err, target error) bool {
+	for err != nil {
+		if err == target {
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
 	}
-
-	for _, test := range cases {
-		t.Run(test.Name, func(tester *testing.T) {
-			variants, err := GenerateHLSVariant(test.ResOptions, test.Prefix)
-
-			if test.IsError {
-				if err.Error() != test.ExpectedError {
-					fmt.Println(err)
-					panic(errors.New("Not expected error"))
-				}
-			} else {
-				if err != nil {
-					panic(err)
-				}
-
-				if len(variants) != len(test.ResOptions) {
-					panic(errors.New("Result should be the same"))
-				}
-			}
-		})
-	}
+	return false
 }
 
 func TestGeneratePlaylist(t *testing.T) {
-	variants, err := GenerateHLSVariant([]string{"480p"}, "")
+	dir := t.TempDir()
+	variants, err := GenerateHLSVariant([]string{"480p", "720p"}, "")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	base, _ := os.Getwd()
-	targetPath := path.Join(base, "static")
+	if err := GeneratePlaylist(variants, dir, ""); err != nil {
+		t.Fatalf("GeneratePlaylist failed: %v", err)
+	}
 
-	GeneratePlaylist(variants, targetPath, "")
+	data, err := os.ReadFile(filepath.Join(dir, "playlist.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.HasPrefix(content, "#EXTM3U\n") {
+		t.Fatalf("playlist missing m3u header: %q", content)
+	}
+	if !strings.Contains(content, "480p.m3u8") || !strings.Contains(content, "720p.m3u8") {
+		t.Fatalf("playlist missing variants: %q", content)
+	}
+
+	// No temporary files may be left behind.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".playlist-") {
+			t.Fatalf("temporary playlist file left behind: %s", e.Name())
+		}
+	}
 }

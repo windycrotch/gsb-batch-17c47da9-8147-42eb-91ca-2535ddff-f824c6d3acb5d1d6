@@ -31,17 +31,19 @@ type Variant struct {
 
 // GenerateHLSVariant will generate variants info from the given resolutions.
 // The available resolutions are: 360p, 480p, 720p and 1080p.
+// An unknown resolution is reported as an error instead of being silently
+// skipped.
 func GenerateHLSVariant(resOptions []string, locPrefix string) ([]*Variant, error) {
 	if len(resOptions) == 0 {
-		return nil, errors.New("Please give at least 1 resolutions.")
+		return nil, errors.New("hls: please give at least 1 resolution")
 	}
 
-	var variants []*Variant
+	variants := make([]*Variant, 0, len(resOptions))
 
 	for _, r := range resOptions {
 		c, err := getConfig(r)
 		if err != nil {
-			continue
+			return nil, err
 		}
 
 		url := fmt.Sprintf("%s.m3u8", c.Name)
@@ -49,39 +51,26 @@ func GenerateHLSVariant(resOptions []string, locPrefix string) ([]*Variant, erro
 			url = locPrefix + "/" + url
 		}
 
-		v := &Variant{
+		variants = append(variants, &Variant{
 			URL:        url,
 			Bandwidth:  c.Bandwidth,
 			Resolution: c.Resolution,
-		}
-
-		variants = append(variants, v)
-	}
-
-	if len(variants) == 0 {
-		return nil, errors.New("No valid resolutions found.")
+		})
 	}
 
 	return variants, nil
 }
 
-// GeneratePlaylist will generate playlist file from the given variants.
-// Variant itself can be generate from GenerateHLSVariant() function of
-// suplied by the caller
-func GeneratePlaylist(variants []*Variant, targetPath, filename string) {
-	// Set default filename
-	if filename == "" {
-		filename = "playlist.m3u8"
-	}
-
+// GeneratePlaylist renders the master playlist content for the given variants.
+func renderPlaylist(variants []*Variant) string {
 	// M3U Header
 	data := "#EXTM3U\n"
 	data += "#EXT-X-VERSION:3\n"
 
 	// Add M3U Info for each variant
 	for _, v := range variants {
-		// URL & bandwidth is required,
-		// if not found we will excluded them from the playlist
+		// URL & bandwidth is required; skip incomplete entries rather than
+		// emitting a broken master playlist line.
 		if v.URL == "" || v.Bandwidth == "" {
 			continue
 		}
@@ -98,9 +87,49 @@ func GeneratePlaylist(variants []*Variant, targetPath, filename string) {
 		data += fmt.Sprintf("\n%s\n", v.URL)
 	}
 
-	// Write everything to the file
-	f, _ := os.Create(filepath.Join(targetPath, filename))
-	defer f.Close()
+	return data
+}
 
-	f.Write([]byte(data))
+// GeneratePlaylist writes the master playlist file from the given variants
+// into targetPath/filename (default "playlist.m3u8"). The write is atomic:
+// content goes to a temporary file in the same directory and is renamed into
+// place, so a reader can never observe a partially written master playlist.
+func GeneratePlaylist(variants []*Variant, targetPath, filename string) error {
+	if filename == "" {
+		filename = "playlist.m3u8"
+	}
+
+	if err := os.MkdirAll(targetPath, 0o755); err != nil {
+		return err
+	}
+
+	finalPath := filepath.Join(targetPath, filename)
+
+	f, err := os.CreateTemp(targetPath, ".playlist-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+
+	if _, err := f.WriteString(renderPlaylist(variants)); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return err
+	}
+
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		cleanup()
+		return err
+	}
+	return nil
 }
