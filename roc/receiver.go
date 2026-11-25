@@ -176,6 +176,14 @@ import (
 type Receiver struct {
 	mu   sync.RWMutex
 	cPtr *C.roc_receiver
+
+	// closed is the authoritative one-shot terminal flag, set only after the
+	// native receiver has been closed successfully.
+	closed bool
+
+	// slots mirrors native slot state so broken slots can be rejected early
+	// and released cleanly on Unlink.
+	slots *slotBook
 }
 
 // Open a new receiver.
@@ -195,12 +203,14 @@ func OpenReceiver(context *Context, config ReceiverConfig) (receiver *Receiver, 
 		return nil, errors.New("context is nil")
 	}
 
-	context.mu.RLock()
-	defer context.mu.RUnlock()
-
-	if context.cPtr == nil {
-		return nil, errors.New("context is closed")
+	// Hold the context read lock for the whole open: a concurrent
+	// Context.Close cannot complete while the native open is in flight, and a
+	// context already closed is rejected up front.
+	release, err := context.beginOpen()
+	if err != nil {
+		return nil, err
 	}
+	defer release()
 
 	cTargetLatency, err := go2cUnsignedDuration(config.TargetLatency)
 	if err != nil {
@@ -240,7 +250,8 @@ func OpenReceiver(context *Context, config ReceiverConfig) (receiver *Receiver, 
 	}
 
 	receiver = &Receiver{
-		cPtr: cRecv,
+		cPtr:  cRecv,
+		slots: newSlotBook(),
 	}
 
 	return receiver, nil
@@ -269,8 +280,14 @@ func (r *Receiver) Configure(slot Slot, iface Interface, config InterfaceConfig)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if r.cPtr == nil {
-		return errors.New("receiver is closed")
+	if r.closed || r.cPtr == nil {
+		return errReceiverClosed
+	}
+
+	// A slot previously disabled by a failed operation stays reserved until
+	// it is released with Unlink; it must not be silently reconfigured.
+	if r.slots.isBroken(slot) {
+		return newNativeErr("roc_receiver_configure()", -1)
 	}
 
 	cOutgoingAddress, err := go2cStr(config.OutgoingAddress)
@@ -304,6 +321,9 @@ func (r *Receiver) Configure(slot Slot, iface Interface, config InterfaceConfig)
 		(C.roc_interface)(iface),
 		&cConfig)
 	if errCode != 0 {
+		// The native library disables and marks the whole slot broken. Mirror
+		// that state on the Go side so Unlink is required before reuse.
+		r.slots.markBroken(slot)
 		return newNativeErr("roc_receiver_configure()", errCode)
 	}
 
@@ -340,12 +360,16 @@ func (r *Receiver) Bind(slot Slot, iface Interface, endpoint *Endpoint) (err err
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if r.cPtr == nil {
-		return errors.New("receiver is closed")
+	if r.closed || r.cPtr == nil {
+		return errReceiverClosed
 	}
 
 	if endpoint == nil {
 		return errors.New("endpoint is nil")
+	}
+
+	if r.slots.isBroken(slot) {
+		return newNativeErr("roc_receiver_bind()", -1)
 	}
 
 	var errCode C.int
@@ -376,6 +400,9 @@ func (r *Receiver) Bind(slot Slot, iface Interface, endpoint *Endpoint) (err err
 		(C.roc_interface)(iface),
 		cEndp)
 	if errCode != 0 {
+		// A failed bind disables and breaks the whole slot; require Unlink
+		// before the index can be reused.
+		r.slots.markBroken(slot)
 		return newNativeErr("roc_receiver_bind()", errCode)
 	}
 
@@ -403,8 +430,8 @@ func (r *Receiver) Unlink(slot Slot) (err error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if r.cPtr == nil {
-		return errors.New("receiver is closed")
+	if r.closed || r.cPtr == nil {
+		return errReceiverClosed
 	}
 
 	var errCode C.int
@@ -415,6 +442,10 @@ func (r *Receiver) Unlink(slot Slot) (err error) {
 	if errCode != 0 {
 		return newNativeErr("roc_receiver_unlink()", errCode)
 	}
+
+	// The slot and all of its interfaces are gone; drop every trace of it so
+	// that the index can be re-used immediately from a clean state.
+	r.slots.release(slot)
 
 	return nil
 }
@@ -436,8 +467,8 @@ func (r *Receiver) ReadFloats(frame []float32) (err error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if r.cPtr == nil {
-		return errors.New("receiver is closed")
+	if r.closed || r.cPtr == nil {
+		return errReceiverClosed
 	}
 
 	if frame == nil {
@@ -472,14 +503,21 @@ func (r *Receiver) Close() (err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.cPtr != nil {
-		errCode := C.roc_receiver_close(r.cPtr)
-		if errCode != 0 {
-			return newNativeErr("roc_receiver_close()", errCode)
-		}
-
-		r.cPtr = nil
+	// Idempotent one-shot terminal: a second Close is a successful no-op.
+	if r.closed || r.cPtr == nil {
+		return nil
 	}
+
+	errCode := C.roc_receiver_close(r.cPtr)
+	if errCode != 0 {
+		// Native close failed: keep the pointer and the clear closed flag so
+		// the receiver stays usable and Close (or any other call) can be
+		// retried. It also stays attached to the context.
+		return newNativeErr("roc_receiver_close()", errCode)
+	}
+
+	r.cPtr = nil
+	r.closed = true
 
 	return nil
 }

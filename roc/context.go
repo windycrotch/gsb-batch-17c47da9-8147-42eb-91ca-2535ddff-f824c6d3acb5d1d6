@@ -6,7 +6,6 @@ package roc
 import "C"
 
 import (
-	"errors"
 	"sync"
 )
 
@@ -32,8 +31,14 @@ import (
 //
 // See also Sender, Receiver
 type Context struct {
-	mu   sync.RWMutex
+	mu sync.RWMutex
+
 	cPtr *C.roc_context
+
+	// closed is the authoritative one-shot terminal flag. It is set only
+	// after the native context has been closed successfully. All entry
+	// points check it under mu so they never touch a freed native pointer.
+	closed bool
 }
 
 // Open a new context.
@@ -97,8 +102,8 @@ func (c *Context) RegisterEncoding(encodingID int, encoding MediaEncoding) (err 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.cPtr == nil {
-		return errors.New("context is closed")
+	if c.closed || c.cPtr == nil {
+		return errContextClosed
 	}
 
 	cEncoding := C.struct_roc_media_encoding{
@@ -137,14 +142,38 @@ func (c *Context) Close() (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.cPtr != nil {
-		errCode := C.roc_context_close(c.cPtr)
-		if errCode != 0 {
-			return newNativeErr("roc_context_close()", errCode)
-		}
-
-		c.cPtr = nil
+	// Idempotent: closing an already closed context is a successful no-op so
+	// that Close is a stable, one-shot terminal operation.
+	if c.closed || c.cPtr == nil {
+		return nil
 	}
 
+	errCode := C.roc_context_close(c.cPtr)
+	if errCode != 0 {
+		// On failure the native context stays open and the closed flag stays
+		// clear, so the object remains usable and Close can be retried.
+		return newNativeErr("roc_context_close()", errCode)
+	}
+
+	c.cPtr = nil
+	c.closed = true
+
 	return nil
+}
+
+// beginOpen is shared by OpenSender and OpenReceiver. It holds the context
+// read lock for the whole duration of the native open call and refuses to run
+// once the context has been closed. Holding the lock means a concurrent
+// Context.Close cannot free the native context while an open is in flight.
+// The returned release function must be invoked exactly once when the open
+// attempt finishes.
+func (c *Context) beginOpen() (release func(), err error) {
+	c.mu.RLock()
+
+	if c.closed || c.cPtr == nil {
+		c.mu.RUnlock()
+		return nil, errContextClosed
+	}
+
+	return c.mu.RUnlock, nil
 }
