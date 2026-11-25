@@ -1,0 +1,105 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits"
+  ],
+  "minimumReleaseAge": "3 days",
+  "prHourlyLimit": 2,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track CI/build tool versions pinned in workflow env blocks and the Makefile via inline `# renovate:` markers (helm, helm-unittest, helm-schema, helm-docs, kubeconform, yq, gotestsum, controller-tools, mockery). The marker sits on the line directly above the value; the value line may be a workflow `KEY: value` or a Makefile `KEY ?= value`.",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/chart\\.yml$/",
+        "/^\\.github/workflows/ci\\.yml$/",
+        "/^\\.github/workflows/images\\.yml$/",
+        "/^\\.github/workflows/chart-autofix\\.yml$/",
+        "/^\\.github/workflows/release-please\\.yml$/",
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?(?: extractVersion=(?<extractVersion>\\S+))?[ \\t]*\\n[ \\t]*[\\w.-]+[ \\t]*(?::|\\?=|=)[ \\t]*[\"']?(?<currentValue>[^\"'\\s#]+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Group third-party Go module bumps into one PR; deps(gomod) so release-please folds a dependency move into each affected module's next release",
+      "matchManagers": [
+        "gomod"
+      ],
+      "groupName": "Go modules",
+      "semanticCommitType": "deps",
+      "semanticCommitScope": "gomod",
+      "matchPackageNames": [
+        "!github.com/qvest-digital/mxl-k8s/api"
+      ]
+    },
+    {
+      "description": "go-mxl's CI publishes throwaway tags such as v1.0.0-rc.9.test226 that outsort the real rc.N prereleases only because they carry an extra semver prerelease identifier (rc.9.test226 > rc.9). Reject any version with a .test segment so only real releases and rc prereleases are tracked",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/qvest-digital/go-mxl"
+      ],
+      "allowedVersions": "!/\\.test/"
+    },
+    {
+      "description": "Docker versioning for the go-mxl images, which are published only as rc prereleases; see the go-mxl group below.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/qvest-digital/go-mxl-builder",
+        "ghcr.io/qvest-digital/go-mxl-runtime"
+      ],
+      "versioning": "semver",
+      "ignoreUnstable": false
+    },
+    {
+      "description": "Group GitHub Actions bumps into one PR",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "semanticCommitType": "deps",
+      "semanticCommitScope": "actions"
+    },
+    {
+      "description": "CI/build tool versions tracked via inline markers in workflows and the Makefile. Third-party, so the default stability delay applies; these files are not under a release-please package path, so the bump does not cut a release.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchFileNames": [
+        ".github/workflows/*.yml",
+        "Makefile"
+      ],
+      "groupName": "CI tool versions",
+      "semanticCommitType": "deps",
+      "semanticCommitScope": "tools"
+    },
+    {
+      "description": "The api require of agent, operator and gateway is written by release-please (extra-files on the api package) inside the release pull request. A Renovate bump would race that and reintroduce the post-release PR this repo no longer opens.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/qvest-digital/mxl-k8s/api"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "go-mxl's Go module and its builder and runtime images move together: the images ship the libmxl the module is built against, and hack/check-go-mxl-pins.sh fails a PR that moves one without the other. The images are published only as rc prereleases, and Docker versioning reads everything after the first hyphen as a compatibility suffix and never offers an update that changes it, so semver orders the tags and ignoreUnstable goes with it. Placed after the grouping rules keyed on manager, which would otherwise pull the ci.yml container pin and the go.mod require into other groups.",
+      "matchPackageNames": [
+        "github.com/qvest-digital/go-mxl",
+        "ghcr.io/qvest-digital/go-mxl-builder",
+        "ghcr.io/qvest-digital/go-mxl-runtime"
+      ],
+      "groupName": "go-mxl",
+      "semanticCommitType": "deps",
+      "semanticCommitScope": "go-mxl"
+    }
+  ]
+}

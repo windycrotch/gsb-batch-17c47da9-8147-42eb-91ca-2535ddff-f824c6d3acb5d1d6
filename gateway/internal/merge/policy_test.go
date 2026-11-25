@@ -1,0 +1,1218 @@
+package merge
+
+import (
+	"fmt"
+	"math"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/stretchr/testify/require"
+)
+
+// ring simulates one member's ring: committed grains by index, with the
+// slot showing the last index written there.
+type ring struct {
+	grains  uint
+	head    uint64
+	slots   map[uint]Grain
+	partial bool // commit grains with half their slices
+}
+
+func newRing(grains uint) *ring { return &ring{grains: grains, slots: map[uint]Grain{}} }
+
+func (r *ring) commit(index uint64) {
+	g := Grain{Index: index, TotalSlices: 10, ValidSlices: 10}
+	if r.partial {
+		g.ValidSlices = 5
+	}
+	r.slots[uint(index%uint64(r.grains))] = g
+	r.head = index
+}
+
+func (r *ring) member() Member {
+	return Member{Head: r.head, Grain: func(slot uint) Grain { return r.slots[slot] }}
+}
+
+// drive runs both rings and the policy over [start, end), dropping what
+// drop says, and returns, per published index, the source it showed.
+func drive(t *testing.T, d *Discrete, rings []*ring, start, end uint64, drop func(m int, i uint64) bool) map[uint64]int {
+	t.Helper()
+	shown := map[uint64]int{}
+	now := time.Unix(0, 0)
+	for i := start; i < end; i++ {
+		for m, r := range rings {
+			if !drop(m, i) {
+				r.commit(i)
+			}
+		}
+		ms := make([]Member, len(rings))
+		for m, r := range rings {
+			ms[m] = r.member()
+		}
+		now = now.Add(20 * time.Millisecond)
+		before := d.Head
+		_, head, _ := d.Step(ms, now)
+		for j := before + 1; j <= head; j++ {
+			shown[j] = d.Current[uint(j%uint64(d.Grains))]
+		}
+	}
+	return shown
+}
+
+func TestDiscreteServesEveryGrainSomeMemberHas(t *testing.T) {
+	a, b := newRing(20), newRing(20)
+	d := NewDiscrete(20, 2)
+	d.Ordered, d.Skew = true, 2
+	// Staggered outages: a misses [100,150), b misses [200,250).
+	drop := func(m int, i uint64) bool {
+		return (m == 0 && i >= 100 && i < 150) || (m == 1 && i >= 200 && i < 250)
+	}
+	shown := drive(t, d, []*ring{a, b}, 10, 400, drop)
+
+	for i := uint64(20); i < 395; i++ {
+		src, ok := shown[i]
+		require.True(t, ok, "index %d was never published", i)
+		require.NotEqual(t, 2, src, "index %d published INVALID though a member had it", i)
+		require.False(t, drop(src, i), "index %d shown from member %d, which dropped it", i, src)
+	}
+}
+
+func TestDiscretePublishesInvalidOnlyWhereEveryMemberDropped(t *testing.T) {
+	a, b := newRing(20), newRing(20)
+	d := NewDiscrete(20, 2)
+	d.Ordered, d.Skew = true, 2
+	drop := func(m int, i uint64) bool { return i == 120 || (m == 0 && i == 130) }
+	shown := drive(t, d, []*ring{a, b}, 10, 200, drop)
+
+	require.Equal(t, 2, shown[120], "an index both members dropped is shown as a member's grain")
+	require.Equal(t, 1, shown[130])
+}
+
+// With both members healthy an ordered set never leaves its primary, so
+// readers never pay a switch.
+func TestDiscreteOrderedStaysOnThePrimary(t *testing.T) {
+	a, b := newRing(20), newRing(20)
+	d := NewDiscrete(20, 2)
+	d.Ordered, d.Skew = true, 2
+	switches := 0
+	now := time.Unix(0, 0)
+	for i := uint64(10); i < 300; i++ {
+		// b commits first every other grain, which must not move the
+		// set to b: the primary is only late if it misses the tolerance.
+		if i%2 == 0 {
+			b.commit(i)
+		} else {
+			a.commit(i)
+		}
+		now = now.Add(time.Millisecond)
+		sel, _, _ := d.Step([]Member{a.member(), b.member()}, now)
+		if i%2 == 0 {
+			a.commit(i)
+		} else {
+			b.commit(i)
+		}
+		sel2, _, _ := d.Step([]Member{a.member(), b.member()}, now)
+		switches += len(sel) + len(sel2)
+	}
+	require.LessOrEqual(t, switches, 20, "one select per slot at startup, none after")
+}
+
+// Mirrors over a network deliver the members' grains several
+// milliseconds apart, in either order. Within the skew budget that
+// jitter must not move the set off its primary: each move remaps the
+// slots in every reader. Only a primary late beyond the tolerance does.
+func TestDiscreteRidesOutJitterWithinTheBudget(t *testing.T) {
+	a, b := newRing(20), newRing(20)
+	d := NewDiscrete(20, 2)
+	d.Ordered, d.Skew, d.Tolerance = true, 2, ToleranceFor(40*time.Millisecond)
+	now := time.Unix(0, 0)
+	a.commit(9) // a arrives first once, and becomes the primary
+	d.Step([]Member{a.member(), b.member()}, now)
+	b.commit(9)
+	switches := 0
+	for i := uint64(10); i < 300; i++ {
+		now = now.Add(20 * time.Millisecond)
+		late := time.Duration(i%3) * 6 * time.Millisecond // a is 0, 6 or 12 ms behind b
+		b.commit(i)
+		sel, _, wait := d.Step([]Member{a.member(), b.member()}, now)
+		switches += len(sel)
+		// The engine wakes when the wait runs out, before a arrives.
+		if wait > 0 && wait < late {
+			sel, _, _ = d.Step([]Member{a.member(), b.member()}, now.Add(wait))
+			switches += len(sel)
+		}
+		a.commit(i)
+		sel, _, _ = d.Step([]Member{a.member(), b.member()}, now.Add(late))
+		switches += len(sel)
+	}
+	require.Equal(t, 0, d.Primary)
+	require.LessOrEqual(t, switches, 20, "one select per slot at startup, none after")
+
+	// A primary that stops is replaced once the tolerance has passed.
+	for i := uint64(300); i < 340; i++ {
+		now = now.Add(20 * time.Millisecond)
+		b.commit(i)
+		if _, _, wait := d.Step([]Member{a.member(), b.member()}, now); wait > 0 {
+			d.Step([]Member{a.member(), b.member()}, now.Add(wait))
+		}
+	}
+	require.Equal(t, 1, d.Primary)
+	require.Equal(t, uint64(339), d.Head)
+}
+
+// Mirrors over separate paths deliver the members a little apart. An
+// ordered set starts on its first member, even when the second's grain
+// is there first, as long as the first follows within the tolerance;
+// starting on whichever arrived first left the set on the second member
+// for as long as that one delivered.
+func TestDiscreteOrderedStartsOnTheFirstMember(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ordered bool
+		late    time.Duration // how long after b's grain a's arrives
+		want    int
+	}{
+		"ordered, first member within the tolerance": {true, 3 * time.Millisecond, 0},
+		"ordered, first member beyond the tolerance": {true, 30 * time.Millisecond, 1},
+		"first arrival": {false, 3 * time.Millisecond, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a, b := newRing(20), newRing(20)
+			d := NewDiscrete(20, 2)
+			d.Ordered, d.Skew, d.Tolerance = tc.ordered, 2, ToleranceFor(40*time.Millisecond)
+			now := time.Unix(0, 0)
+			b.commit(10)
+			_, _, wait := d.Step([]Member{a.member(), b.member()}, now)
+			if wait > 0 && wait < tc.late {
+				d.Step([]Member{a.member(), b.member()}, now.Add(wait))
+			}
+			a.commit(10)
+			d.Step([]Member{a.member(), b.member()}, now.Add(tc.late))
+			require.Equal(t, uint64(10), d.Head)
+			require.Equal(t, tc.want, d.Current[10])
+			if tc.ordered {
+				require.Equal(t, tc.want, d.Primary)
+			}
+		})
+	}
+}
+
+// A data grain's valid slices are its length, so a committed data grain
+// counts as complete; a video grain with half its slices does not.
+func TestDiscreteJudgesDataGrainsByCommit(t *testing.T) {
+	a := newRing(20)
+	a.partial = true
+	video := NewDiscrete(20, 1)
+	video.Skew = 100
+	data := NewDiscrete(20, 1)
+	data.Data, data.Skew = true, 100
+	for i := uint64(10); i < 30; i++ {
+		a.commit(i)
+	}
+	_, vh, _ := video.Step([]Member{a.member()}, time.Unix(1, 0))
+	_, dh, _ := data.Step([]Member{a.member()}, time.Unix(1, 0))
+	require.Equal(t, uint64(28), vh, "a partial video grain was published")
+	require.Equal(t, uint64(29), dh, "a committed data grain was held back")
+}
+
+func TestAudioServesEverySampleSomeMemberHoldsWhole(t *testing.T) {
+	const batch = 480
+	a := NewAudio(2, 38, 2)
+	a.Skew = 2048
+	held := [2]map[uint64]bool{{}, {}}
+	// a misses batches 100-119, b misses batches 300-319.
+	drop := func(m int, b uint64) bool {
+		return (m == 0 && b >= 100 && b < 120) || (m == 1 && b >= 300 && b < 320)
+	}
+	shownPage := map[uint64]int{}
+	now := time.Unix(0, 0)
+	for b := uint64(10); b < 500; b++ {
+		for m := 0; m < 2; m++ {
+			if !drop(m, b) {
+				a.Committed(m, b*batch, (b+1)*batch)
+				for s := b * batch; s < (b+1)*batch; s++ {
+					held[m][s] = true
+				}
+			}
+		}
+		now = now.Add(10 * time.Millisecond)
+		before := a.Head
+		_, head, _ := a.Step(now)
+		for s := before; s < head; s++ {
+			shownPage[s] = a.Current[(s/PageSamples)%a.Pages]
+		}
+	}
+	for s := uint64(20 * batch); s < 480*batch; s++ {
+		src, ok := shownPage[s]
+		require.True(t, ok, "sample %d never published", s)
+		require.NotEqual(t, 2, src, "sample %d published as silence though a member held its page", s)
+		require.True(t, held[src][s], "sample %d shown from member %d, which lacks it", s, src)
+	}
+}
+
+// The engine starts with whatever arrives first, mostly in the middle of
+// a page. Every sample it publishes must still come from a member.
+func TestAudioStartsAtAPageBoundaryWithoutSilence(t *testing.T) {
+	const batch = 480
+	a := NewAudio(1, 38, 1)
+	a.Skew = 2048
+	var shown []int
+	first := uint64(0)
+	for b := uint64(10); b < 60; b++ { // 4800 is in the middle of page 4
+		a.Committed(0, b*batch, (b+1)*batch)
+		before := a.Head
+		_, head, _ := a.Step(time.Unix(0, 0))
+		if first == 0 && head > before {
+			first = before
+		}
+		for s := before; s < head; s++ {
+			shown = append(shown, a.Current[(s/PageSamples)%a.Pages])
+		}
+	}
+	require.NotEmpty(t, shown)
+	require.Zero(t, first%PageSamples, "publishing started mid-page, at %d", first)
+	require.NotContains(t, shown, 1, "a published sample was silence though the member held it")
+}
+
+// Audio starts on its first member in the same way, rather than on the
+// member whose batch was reported first.
+func TestAudioStartsOnTheFirstMember(t *testing.T) {
+	for name, tc := range map[string]struct {
+		late time.Duration
+		want int
+	}{
+		"within the tolerance": {3 * time.Millisecond, 0},
+		"beyond the tolerance": {30 * time.Millisecond, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := NewAudio(2, 38, 2)
+			a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+			now := time.Unix(0, 0)
+			a.Committed(1, 10*PageSamples, 11*PageSamples)
+			if _, _, wait := a.Step(now); wait > 0 && wait < tc.late {
+				a.Step(now.Add(wait))
+			}
+			a.Committed(0, 10*PageSamples, 11*PageSamples)
+			a.Step(now.Add(tc.late))
+			require.Equal(t, uint64(11*PageSamples), a.Head)
+			require.Equal(t, tc.want, a.Current[10])
+			require.Equal(t, tc.want, a.Primary)
+		})
+	}
+}
+
+func TestAudioSilencesAPageNoMemberHoldsWhole(t *testing.T) {
+	a := NewAudio(2, 38, 2)
+	a.Skew = 2048
+	// Page 50 has a gap in both members, at different samples.
+	for m := 0; m < 2; m++ {
+		for s := uint64(40 * PageSamples); s < 60*PageSamples; s += 256 {
+			gap := (m == 0 && s == 50*PageSamples) || (m == 1 && s == 50*PageSamples+512)
+			if !gap {
+				a.Committed(m, s, s+256)
+			}
+		}
+	}
+	a.Step(time.Unix(1, 0))
+	require.Equal(t, 2, a.Current[50%a.Pages])
+	require.NotEqual(t, 2, a.Current[49%a.Pages])
+}
+
+// Mirrored members commit a grain after its period, so in steady state the
+// output's head sits one grain behind the index due. A member writes the
+// due index next, into a slot the output no longer offers, so nothing may
+// move: every select zaps the slot in every reader's mapping.
+func TestDiscreteRetiresNothingWhileTheOutputTrailsTheClockByOne(t *testing.T) {
+	const grains = 20
+	a, b := newRing(grains), newRing(grains)
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew = true, 8
+	now := time.Unix(0, 0)
+	for i := uint64(100); i < 160; i++ {
+		a.commit(i)
+		b.commit(i)
+		ms := []Member{a.member(), b.member()}
+		now = now.Add(20 * time.Millisecond)
+		d.Step(ms, now)
+		require.Equal(t, i, d.Head)
+		require.Empty(t, d.Retire(ms, i+1), "an output one grain behind the clock moved slots at index %d", i)
+	}
+}
+
+// While an index both members dropped holds the output back by up to the
+// skew, the members keep writing, each grain into the slot of the index
+// a ring period back. Every grain the output still offers its readers
+// must stay the grain of that index through the members' next write.
+func TestDiscreteRetiresSlotsTheMembersOverwriteWhileItLags(t *testing.T) {
+	const grains = 20
+	a, b := newRing(grains), newRing(grains)
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew = true, 8
+	now := time.Unix(0, 0)
+	retired := 0
+	for i := uint64(100); i < 160; i++ {
+		// The members write at the clock, so the index due is their head.
+		if i != 120 {
+			a.commit(i)
+			b.commit(i)
+		}
+		ms := []Member{a.member(), b.member()}
+		now = now.Add(20 * time.Millisecond)
+		d.Step(ms, now)
+		sel := d.Retire(ms, i)
+		if d.Head == i {
+			require.Empty(t, sel, "an output keeping up with the clock moved slots at index %d", i)
+		}
+		retired += len(sel)
+
+		// The engine passes at the boundary to i+1, then the members
+		// write i+1, at the clock.
+		now = now.Add(time.Microsecond)
+		d.Step(ms, now)
+		retired += len(d.Retire(ms, i+1))
+		next := map[*ring]Grain{}
+		for _, r := range []*ring{a, b} {
+			next[r] = r.slots[uint((i+1)%grains)]
+			r.slots[uint((i+1)%grains)] = Grain{Index: i + 1, TotalSlices: 10, ValidSlices: 10}
+		}
+		for j := max(d.Head+2, grains) - grains; j <= d.Head; j++ {
+			src := d.Current[uint(j%grains)]
+			if src == d.Placeholder {
+				continue
+			}
+			g := []*ring{a, b}[src].slots[uint(j%grains)]
+			require.Equal(t, j, g.Index, "after index %d the output offers index %d from member %d, whose slot holds %d",
+				i, j, src, g.Index)
+		}
+		for r, g := range next {
+			r.slots[uint((i+1)%grains)] = g
+		}
+	}
+	require.Equal(t, uint64(159), d.Head)
+	require.NotZero(t, retired, "the output never lagged")
+}
+
+// A member that commits each grain a period after its boundary is never
+// about to write the index due. Taken for one, it retired the oldest
+// grain readers trust on every grain, a remap in every reader each
+// time. After a loss it writes on at its own lag, and the slot that
+// write overwrites still moves first.
+func TestDiscreteRetiresForAMemberBehindTheClockOnlyWhatItOverwrites(t *testing.T) {
+	const grains = 20
+	a, b := newRing(grains), newRing(grains)
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew = true, 8
+	now := time.Unix(0, 0)
+	retired := 0
+	for i := uint64(100); i < 160; i++ {
+		// i is committed in the period of i+1, which wakes a pass.
+		if i != 140 {
+			a.commit(i)
+			b.commit(i)
+		}
+		ms := []Member{a.member(), b.member()}
+		now = now.Add(20 * time.Millisecond)
+		d.Step(ms, now)
+		sel := d.Retire(ms, i+1)
+		// The pass before the boundary of i+2, after which i+1 is written.
+		sel = append(sel, d.Retire(ms, i+2)...)
+		if d.Head == i {
+			require.Empty(t, sel, "an output keeping up with its members moved slots at index %d", i)
+		}
+		retired += len(sel)
+
+		next := map[*ring]Grain{}
+		for _, r := range []*ring{a, b} {
+			next[r] = r.slots[uint((i+1)%grains)]
+			r.slots[uint((i+1)%grains)] = Grain{Index: i + 1, TotalSlices: 10, ValidSlices: 10}
+		}
+		for j := max(d.Head+2, grains) - grains; j <= d.Head; j++ {
+			src := d.Current[uint(j%grains)]
+			if src == d.Placeholder {
+				continue
+			}
+			g := []*ring{a, b}[src].slots[uint(j%grains)]
+			require.Equal(t, j, g.Index, "after index %d the output offers index %d from member %d, whose slot holds %d",
+				i, j, src, g.Index)
+		}
+		for r, g := range next {
+			r.slots[uint((i+1)%grains)] = g
+		}
+	}
+	require.Equal(t, uint64(159), d.Head)
+	require.NotZero(t, retired, "the output never lagged")
+}
+
+// A member writing ahead of the clock overwrites sooner than one at the
+// clock: a slot it serves moves to the member that still holds the index,
+// and only to INVALID where both would overwrite it.
+func TestDiscreteRetiresToTheMemberThatStillHoldsTheIndex(t *testing.T) {
+	const grains = 20
+	a, b := newRing(grains), newRing(grains)
+	for i := uint64(90); i <= 128; i++ {
+		if i != 120 {
+			a.commit(i)
+		}
+	}
+	for i := uint64(90); i <= 123; i++ {
+		if i != 120 {
+			b.commit(i)
+		}
+	}
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew, d.Head, d.Primary = true, 10, 119, 0
+	for i := range d.Current {
+		d.Current[i] = 0
+	}
+	sel := d.Retire([]Member{a.member(), b.member()}, 123)
+
+	// a writes 129 next, into the slot of 109; b writes 124, into 104's.
+	want := map[uint]int{}
+	for i := uint64(101); i <= 109; i++ {
+		want[uint(i%grains)] = 1
+		if i <= 104 {
+			want[uint(i%grains)] = 2
+		}
+	}
+	got := map[uint]int{}
+	for _, s := range sel {
+		got[s.Slot] = s.Source
+	}
+	require.Equal(t, want, got)
+	for slot, src := range want {
+		require.Equal(t, src, d.Current[slot])
+	}
+}
+
+// Readers of an audio output trust half its buffer behind the head. With
+// a skew budget past that, an output held back by a page both members
+// broke lags members that keep writing, each sample over the one a
+// buffer back. Every sample the output still offers must stay true
+// through the members' next batch.
+func TestAudioRetiresPagesTheMembersOverwriteWhileItLags(t *testing.T) {
+	const (
+		pages  = 8
+		length = pages * PageSamples
+		batch  = 256
+	)
+	a := NewAudio(2, pages, 2)
+	a.Skew = 6000 // past the 4096 samples readers trust
+	rings := [2][]uint64{make([]uint64, length), make([]uint64, length)}
+	write := func(m int, start, end uint64) {
+		for s := start; s < end; s++ {
+			rings[m][s%length] = s
+		}
+	}
+	drop := func(b uint64) bool { return b == 80 } // both members break page 20
+	now := time.Unix(0, 0)
+	retired := 0
+	for b := uint64(32); b < 200; b++ {
+		if !drop(b) {
+			for m := 0; m < 2; m++ {
+				write(m, b*batch, (b+1)*batch)
+				a.Committed(m, b*batch, (b+1)*batch)
+			}
+		}
+		now = now.Add(5 * time.Millisecond)
+		a.Step(now)
+		// The members write at the clock: what is due is what they wrote.
+		sel := a.Retire((b + 1) * batch)
+		if a.Head+length/2 >= (b+2)*batch {
+			require.Empty(t, sel, "an output within half the buffer of the clock moved pages at batch %d", b)
+		}
+		retired += len(sel)
+
+		// The members' next batch lands before the next pass.
+		if !drop(b + 1) {
+			for m := 0; m < 2; m++ {
+				write(m, (b+1)*batch, (b+2)*batch)
+			}
+		}
+		for s := a.Head - min(a.Head, length/2); s < a.Head; s++ {
+			src := a.Current[(s/PageSamples)%pages]
+			if src == a.Silence {
+				continue
+			}
+			require.Equal(t, s, rings[src][s%length], "after batch %d the output offers sample %d from member %d, which holds %d there",
+				b, s, src, rings[src][s%length])
+		}
+	}
+	require.Equal(t, uint64(200*batch), a.Head)
+	require.NotZero(t, retired, "the output never lagged")
+}
+
+// A member writing ahead of the clock overwrites sooner: a page it serves
+// moves to the member that still holds it whole, and to silence once
+// that one would overwrite it too.
+func TestAudioRetiresToTheMemberThatStillHoldsThePage(t *testing.T) {
+	const (
+		pages = 8
+		batch = 256
+	)
+	a := NewAudio(2, pages, 2)
+	a.Skew = 1 << 20
+	for b := uint64(32); b < 102; b++ {
+		if b == 80 {
+			continue // both members break page 20
+		}
+		a.Committed(0, b*batch, (b+1)*batch)
+		if b < 86 {
+			a.Committed(1, b*batch, (b+1)*batch)
+		}
+		a.Step(time.Unix(0, 0))
+	}
+	require.Equal(t, uint64(20*PageSamples), a.Head)
+	require.Equal(t, 0, a.Primary)
+
+	// a reaches sample 26112 + 256 - 8192 = 18176, into page 17; b, at
+	// the clock, 14080. Readers trust from 16384, page 16.
+	sel := a.Retire(86 * batch)
+	require.ElementsMatch(t, []PageSelect{{Page: 16 % pages, Source: 1}, {Page: 17 % pages, Source: 1}}, sel)
+
+	// With the clock where a is, b would overwrite them as well.
+	sel = a.Retire(102 * batch)
+	require.ElementsMatch(t, []PageSelect{{Page: 16 % pages, Source: 2}, {Page: 17 % pages, Source: 2}}, sel)
+}
+
+// A local member's head can jump over a gap in one pass. That one range
+// says nothing about the batches that follow, and an output that keeps
+// up must not keep retiring its oldest pages because of it.
+func TestAudioRetireForgetsAJumpOnceTheBatchesResume(t *testing.T) {
+	const batch = 480
+	a := NewAudio(1, 8, 1)
+	a.Skew, a.Ahead = 2048, 960
+	end := uint64(40 * batch)
+	commit := func(n uint64) []PageSelect {
+		a.Committed(0, end, end+n)
+		end += n
+		a.Step(time.Unix(0, 0))
+		return a.Retire(end)
+	}
+	for i := 0; i < 40; i++ {
+		require.Empty(t, commit(batch), "an output keeping up moved pages")
+	}
+	commit(4096) // the head moved over a gap
+	commit(batch)
+	for i := 0; i < 40; i++ {
+		require.Empty(t, commit(batch), "pages still move %d batches after the jump", i+2)
+	}
+}
+
+// A restarted producer's new ring is put in place of its old one in every
+// view, and holds none of the grains the old one served: a slot left on
+// the member would show whatever the new ring has there. Every slot the
+// member serves moves first, to a member that still holds its grain or to
+// the INVALID grain, and the member is served again once its new ring
+// delivers.
+func TestDiscreteDropMovesAReplacedMembersSlotsToWhatStillHoldsThem(t *testing.T) {
+	const grains = 20
+	a, b := newRing(grains), newRing(grains)
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew = true, 8
+	now := time.Unix(0, 0)
+	var head uint64
+	for i := uint64(100); i <= 119; i++ {
+		a.commit(i)
+		if i < 110 || i > 112 {
+			b.commit(i)
+		}
+		_, head, _ = d.Step([]Member{a.member(), b.member()}, now)
+	}
+	require.Equal(t, uint64(119), head)
+	for slot, src := range d.Current {
+		require.Equal(t, 0, src, "slot %d not on the primary", slot)
+	}
+
+	sel := d.Drop([]Member{a.member(), b.member()}, 0)
+	require.Len(t, sel, grains, "a slot stayed on the replaced member")
+	for _, s := range sel {
+		require.Equal(t, uint64(s.Slot), s.Index%grains, "slot %d named for grain %d", s.Slot, s.Index)
+		switch {
+		case s.Index == 100: // as old as b may be overwriting
+			require.Equal(t, 2, s.Source)
+		case s.Index >= 110 && s.Index <= 112: // b skipped them
+			require.Equal(t, 2, s.Source, "grain %d moved to a member without it", s.Index)
+		default:
+			require.Equal(t, 1, s.Source, "grain %d not moved to b, which holds it", s.Index)
+		}
+		require.Equal(t, s.Source, d.Current[s.Slot])
+	}
+
+	fresh := newRing(grains) // the restarted producer's ring
+	for i := uint64(120); i <= 125; i++ {
+		b.commit(i)
+		if i >= 123 {
+			fresh.commit(i)
+		}
+	}
+	_, head, _ = d.Step([]Member{fresh.member(), b.member()}, now.Add(time.Second))
+	require.Equal(t, uint64(125), head)
+	from := map[uint64]int{}
+	for i := uint64(120); i <= 125; i++ {
+		from[i] = d.Current[i%grains]
+	}
+	require.Equal(t, map[uint64]int{120: 1, 121: 1, 122: 1, 123: 0, 124: 0, 125: 0}, from)
+}
+
+// The same for audio: every page the member serves moves to a member that
+// holds it whole, or to silence, and what the member committed before is
+// forgotten, so the new ring is not taken to hold it.
+func TestAudioDropMovesAReplacedMembersPagesToWhatStillHoldsThem(t *testing.T) {
+	a := NewAudio(2, 38, 2)
+	a.Skew = 2048
+	for n := uint64(10); n <= 40; n++ {
+		a.Committed(0, n*PageSamples, (n+1)*PageSamples)
+		switch n {
+		case 30: // b skipped it
+		case 25: // b holds half of it
+			a.Committed(1, n*PageSamples, n*PageSamples+PageSamples/2)
+		default:
+			a.Committed(1, n*PageSamples, (n+1)*PageSamples)
+		}
+	}
+	_, head, _ := a.Step(time.Unix(0, 0))
+	require.Equal(t, uint64(41*PageSamples), head)
+	// The old ring's last commits, which no pass has published yet.
+	a.Committed(0, 41*PageSamples, 43*PageSamples)
+
+	sel := a.Drop(0)
+	require.Len(t, sel, 31, "a page stayed on the replaced member")
+	for _, s := range sel {
+		want := 1
+		if s.Page == 30 || s.Page == 25 {
+			want = 2 // b does not hold it whole
+		}
+		require.Equal(t, want, s.Source, "page slot %d", s.Page)
+	}
+	for p, src := range a.Current {
+		require.NotEqual(t, 0, src, "page slot %d on the replaced member", p)
+	}
+
+	// The new ring commits from page 43 on; nothing before is taken from it.
+	a.Committed(1, 41*PageSamples, 44*PageSamples)
+	a.Committed(0, 43*PageSamples, 44*PageSamples)
+	sel, head, _ = a.Step(time.Unix(1, 0))
+	require.Equal(t, uint64(44*PageSamples), head)
+	require.Equal(t, []PageSelect{{Page: 41 % 38, Source: 1}, {Page: 42 % 38, Source: 1}, {Page: 43 % 38, Source: 0}}, sel)
+}
+
+// The replaced member's head is forgotten with its pages. Left in place,
+// the old ring's last commit would read as the member having skipped the
+// pages after it, and its new ring would be passed over at once rather
+// than waited for as a late primary.
+func TestAudioDropWaitsForTheNewRingAsALatePrimary(t *testing.T) {
+	a := NewAudio(2, 38, 2)
+	a.Skew, a.Tolerance = 2048, 5*time.Millisecond
+	for n := uint64(10); n <= 20; n++ {
+		a.Committed(0, n*PageSamples, (n+1)*PageSamples)
+		a.Committed(1, n*PageSamples, (n+1)*PageSamples)
+	}
+	now := time.Unix(0, 0)
+	_, head, _ := a.Step(now)
+	require.Equal(t, uint64(21*PageSamples), head)
+	a.Committed(0, 21*PageSamples, 23*PageSamples) // the old ring's last, unpublished
+
+	a.Drop(0)
+	a.Committed(1, 21*PageSamples, 24*PageSamples)
+	sel, head, wait := a.Step(now)
+	require.Empty(t, sel)
+	require.Equal(t, uint64(21*PageSamples), head)
+	require.Equal(t, a.Tolerance, wait, "the restarted primary is taken to have skipped what its old ring wrote")
+
+	_, head, _ = a.Step(now.Add(wait))
+	require.Equal(t, uint64(24*PageSamples), head)
+	require.Equal(t, 1, a.Primary)
+}
+
+// samples holds audio members' channel rings as the engine maps them, so
+// Audio.Zeros reads what the members wrote.
+type samples struct {
+	channels, length uint64
+	mem              [][]byte
+}
+
+func newSamples(members int, channels, pages uint64) *samples {
+	s := &samples{channels: channels, length: pages * PageSamples}
+	for range members {
+		s.mem = append(s.mem, make([]byte, channels*s.length*4))
+	}
+	return s
+}
+
+// content is a sample value that is never zero.
+func content(i uint64) float32 { return float32(i%997+1) / 1000 }
+
+// write puts v(i) on every channel of member m for samples [from, to).
+func (s *samples) write(m int, from, to uint64, v func(uint64) float32) {
+	words := unsafe.Slice((*uint32)(unsafe.Pointer(&s.mem[m][0])), len(s.mem[m])/4)
+	for i := from; i < to; i++ {
+		for c := range s.channels {
+			words[c*s.length+i%s.length] = math.Float32bits(v(i))
+		}
+	}
+}
+
+func (s *samples) zeros(m int, lo, from, to, hi, run uint64) uint64 {
+	return zeroRunStart(s.mem[m], s.channels, s.length, lo, from, to, hi, run)
+}
+
+func (s *samples) content(m int, from, to uint64) uint64 {
+	return contentStart(s.mem[m], s.channels, s.length, from, to)
+}
+
+func zero(uint64) float32 { return 0 }
+
+// driveGap runs two members over batches of 480 samples, member 0 holding
+// zeros where gap says and member 1 the content throughout, both
+// committing each batch at once, and returns, per published sample, the
+// source it showed.
+func driveGap(t *testing.T, gap func(uint64) bool) (*Audio, map[uint64]int) {
+	t.Helper()
+	const batch = 480
+	a := NewAudio(2, 38, 2)
+	a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+	s := newSamples(2, 2, 38)
+	a.Zeros, a.Content = s.zeros, s.content
+	shown := map[uint64]int{}
+	now := time.Unix(0, 0)
+	for b := uint64(10); b < 200; b++ {
+		from, to := b*batch, (b+1)*batch
+		s.write(1, from, to, content)
+		s.write(0, from, to, func(i uint64) float32 {
+			if gap(i) {
+				return 0
+			}
+			return content(i)
+		})
+		a.Committed(0, from, to)
+		a.Committed(1, from, to)
+		now = now.Add(10 * time.Millisecond)
+		before := a.Head
+		_, head, _ := a.Step(now)
+		for i := before; i < head; i++ {
+			shown[i] = a.Current[(i/PageSamples)%a.Pages]
+		}
+	}
+	require.Equal(t, uint64(200*batch), a.Head)
+	require.Equal(t, 0, a.Primary, "the primary was replaced")
+	for i := uint64(11 * batch); i < 200*batch; i++ {
+		src, ok := shown[i]
+		require.True(t, ok, "sample %d never published", i)
+		if gap(i) {
+			require.Equal(t, 1, src, "sample %d of the gap shown from member %d", i, src)
+		}
+	}
+	return a, shown
+}
+
+// A writer that skips a range has libmxl fill it with zeros on its next
+// commit, under its head: a member's gap arrives as committed silence.
+// While another member holds the same samples, they are served from it,
+// the page where the primary resumes mid-page included, whose published
+// part the primary holds as zeros. The primary stays the primary.
+func TestAudioServesAMemberWithContentOverAZeroFilledGap(t *testing.T) {
+	_, shown := driveGap(t, func(i uint64) bool { return i >= 48000 && i < 50400 })
+	// The pages after the one the gap ends in are the primary's again.
+	require.Equal(t, 0, shown[51*PageSamples])
+	require.Equal(t, 1, shown[50400], "the page the primary resumed in moved back to its zeros")
+}
+
+// A gap that starts fewer samples before a page boundary than a run
+// takes is a run all the same: the zeros past the boundary, which the
+// member committed with them, count.
+func TestAudioServesAroundAGapEndingAPage(t *testing.T) {
+	driveGap(t, func(i uint64) bool { return i >= 21*PageSamples-30 && i < 21*PageSamples+400 })
+}
+
+// driveMembers runs members over batches of batch samples, member m
+// holding zeros where zero(m, i) says and the content elsewhere, all
+// committing each batch at once, and returns, per published sample, the
+// source it showed.
+func driveMembers(t *testing.T, batch uint64, zero func(m int, i uint64) bool) map[uint64]int {
+	t.Helper()
+	const members, pages = 3, 38
+	a := NewAudio(members, pages, members)
+	a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+	s := newSamples(members, 2, pages)
+	a.Zeros, a.Content = s.zeros, s.content
+	shown := map[uint64]int{}
+	now := time.Unix(0, 0)
+	first, end := 10*PageSamples/batch*batch+batch, 200*PageSamples/batch*batch
+	for from := first; from < end; from += batch {
+		to := from + batch
+		for m := range members {
+			s.write(m, from, to, func(i uint64) float32 {
+				if zero(m, i) {
+					return 0
+				}
+				return content(i)
+			})
+			a.Committed(m, from, to)
+		}
+		now = now.Add(time.Duration(batch) * time.Second / 48000)
+		before := a.Head
+		_, head, _ := a.Step(now)
+		for i := before; i < head; i++ {
+			shown[i] = a.Current[(i/PageSamples)%a.Pages]
+		}
+	}
+	require.Equal(t, end, a.Head)
+	return shown
+}
+
+// Members carry the same samples, so zeros one member holds where another
+// does not are a gap, however short: libmxl zero-fills what a writer
+// skipped, a few samples included. Two of three members holding a run
+// shorter than a page, and shorter than a millisecond at any rate, must
+// not reach the output while the third holds the samples. Batches stand
+// for writers committing 2 ms and 10 ms at 48 kHz and at 96 kHz.
+func TestAudioServesAMemberWithContentAroundAShortZeroRun(t *testing.T) {
+	for _, batch := range []uint64{96, 192, 480, 960} {
+		for _, run := range []uint64{1, 16, 32, 47} {
+			for _, at := range []uint64{60*PageSamples + 300, 61*PageSamples - run/2} {
+				t.Run(fmt.Sprintf("batch%d/run%d/at%d", batch, run, at%PageSamples), func(t *testing.T) {
+					gap := func(i uint64) bool { return i >= at && i < at+run }
+					shown := driveMembers(t, batch, func(m int, i uint64) bool { return m < 2 && gap(i) })
+					for i := at; i < at+run; i++ {
+						require.Equal(t, 2, shown[i], "sample %d of the run shown from member %d", i, shown[i])
+					}
+				})
+			}
+		}
+	}
+}
+
+// Zeros every member holds are the signal's own, a short stretch of
+// digital silence included, and are served from the primary as before:
+// no member is moved away from, and nothing is served as silence.
+func TestAudioServesAShortStretchOfZerosEveryMemberHolds(t *testing.T) {
+	for _, batch := range []uint64{96, 480} {
+		at := uint64(60*PageSamples + 300)
+		shown := driveMembers(t, batch, func(_ int, i uint64) bool { return i >= at && i < at+16 })
+		for i := uint64(11 * PageSamples); i < 199*PageSamples; i++ {
+			require.Equal(t, 0, shown[i], "batch %d: sample %d shown from %d", batch, i, shown[i])
+		}
+	}
+}
+
+// After zeros every member holds, the head moves no further than they
+// reach: a member's gap a few samples later, in the same committed
+// range, is still served from a member that holds the samples.
+func TestAudioWeighsTheMembersAgainAfterZerosEveryMemberHolds(t *testing.T) {
+	at := uint64(60*PageSamples + 300)
+	shown := driveMembers(t, 960, func(m int, i uint64) bool {
+		return i == at || (m == 0 && i >= at+40 && i < at+72)
+	})
+	for i := at + 40; i < at+72; i++ {
+		require.NotEqual(t, 0, shown[i], "sample %d of member 0's gap shown from it", i)
+	}
+}
+
+// Zeros shorter than a run are served as they are once no member that
+// committed them holds more: a member that has not committed them yet is
+// not waited for. Low-level audio holds single samples of zeros on every
+// channel often, and a wait at each would put the output as far behind
+// as the slowest member, or a Tolerance behind per zero for one that
+// lags within Skew.
+func TestAudioDoesNotWaitForALateMemberOverZerosShorterThanARun(t *testing.T) {
+	for _, batch := range []uint64{96, 480} {
+		const members, pages = 3, 38
+		a := NewAudio(members, pages, members)
+		a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+		s := newSamples(members, 2, pages)
+		a.Zeros, a.Content = s.zeros, s.content
+		natural := func(i uint64) float32 {
+			if i%10 == 0 {
+				return 0
+			}
+			return content(i)
+		}
+		now := time.Unix(0, 0)
+		first := 10*PageSamples/batch*batch + batch
+		for from := first; from < 120*PageSamples; from += batch {
+			to := from + batch
+			for m := range members {
+				s.write(m, from, to, natural)
+			}
+			a.Committed(0, from, to)
+			a.Committed(1, from, to)
+			if from > first {
+				// Member 2 commits each batch one batch late, within Skew.
+				a.Committed(2, from-batch, from)
+			}
+			now = now.Add(time.Duration(batch) * time.Second / 48000)
+			_, head, wait := a.Step(now)
+			require.Zero(t, wait, "batch %d: waited at %d for the late member", batch, head)
+			// Publishing starts at the first page boundary.
+			require.Equal(t, max(to, uint64(11*PageSamples)), head, "batch %d: the output fell behind the committed members", batch)
+		}
+	}
+}
+
+// A member that resumes mid-page after a gap holds zeros under samples
+// of that page already published from another member. Its own zeros
+// elsewhere on the page, where every member holds them, are the
+// signal's and do not lift that: the page stays on the member it was
+// published from, and the gap is not shown in place of those samples.
+func TestAudioKeepsAPageOffAGapUnderPublishedSamplesAmidOwnZeros(t *testing.T) {
+	at, end := uint64(60*PageSamples+300), uint64(60*PageSamples+700)
+	shown := driveMembers(t, 480, func(m int, i uint64) bool {
+		return i%10 == 0 || (m == 0 && i >= at && i < end)
+	})
+	for i := at; i < 61*PageSamples; i++ {
+		require.NotEqual(t, 0, shown[i], "sample %d of page 60 shown from member 0", i)
+	}
+}
+
+// A member's gap shorter than a run, under samples of the page already
+// published from another member, is shown in their place when the page
+// moves to it: the page is shown whole from one member. Where another
+// member holds the page without such a gap, the page moves to that one.
+func TestAudioMovesAPageOffAShortGapUnderPublishedSamples(t *testing.T) {
+	page := uint64(60 * PageSamples)
+	for _, run := range []uint64{1, 16, 47} {
+		shown := driveMembers(t, 480, func(m int, i uint64) bool {
+			switch m {
+			case 0: // the primary stops mid-page, its gap zero-filled
+				return i >= page+500 && i < page+1100
+			case 1: // a gap under what page 60 already showed from member 0
+				return i >= page+100 && i < page+100+run
+			}
+			return false
+		})
+		for i := page + 500; i < page+PageSamples; i++ {
+			require.Equal(t, 2, shown[i], "run %d: sample %d of page 60 shown from %d", run, i, shown[i])
+		}
+	}
+}
+
+// A member held back only for a short gap under the published part
+// holds samples at the head, and is served as far as they go: where it
+// holds zeros later that another member holding the samples does not,
+// the members are weighed again. Here no member holds samples at the
+// head itself: the primary has a run, member 1 short zeros.
+func TestAudioWeighsAMemberHeldForAPublishedGapAtItsLaterZeros(t *testing.T) {
+	page := uint64(60 * PageSamples)
+	shown := driveMembers(t, 480, func(m int, i uint64) bool {
+		switch m {
+		case 0:
+			return i >= page+500 && i < page+1100
+		case 1:
+			return i >= page+500 && i < page+516
+		}
+		return (i >= page+100 && i < page+116) || (i >= page+700 && i < page+716)
+	})
+	for i := page + 700; i < page+716; i++ {
+		require.NotEqual(t, 2, shown[i], "sample %d of member 2's later gap shown from it", i)
+	}
+}
+
+// The zero-filled range usually arrives before the same samples from a
+// member that commits them later, as a replica holding blocks for
+// evidence does. A member within Skew of the head that has not committed
+// them is waited for up to Tolerance; past that, the zeros are served,
+// and the head does not stall.
+func TestAudioWaitsForAMemberBehindAZeroFilledRange(t *testing.T) {
+	setup := func() (*Audio, *samples, time.Time) {
+		a := NewAudio(2, 38, 2)
+		a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+		s := newSamples(2, 2, 38)
+		a.Zeros, a.Content = s.zeros, s.content
+		for m := range 2 {
+			s.write(m, 10*PageSamples, 20*PageSamples, content)
+			a.Committed(m, 10*PageSamples, 20*PageSamples)
+		}
+		now := time.Unix(0, 0)
+		_, head, _ := a.Step(now)
+		require.Equal(t, uint64(20*PageSamples), head)
+		// The primary's gap, filled with zeros, and its next batch.
+		s.write(0, 20*PageSamples, 22*PageSamples, zero)
+		s.write(0, 22*PageSamples, 23*PageSamples, content)
+		a.Committed(0, 20*PageSamples, 23*PageSamples)
+		sel, head, wait := a.Step(now)
+		require.Empty(t, sel)
+		require.Equal(t, uint64(20*PageSamples), head, "the zeros were published before the other member could arrive")
+		require.Equal(t, a.Tolerance, wait)
+		return a, s, now
+	}
+
+	t.Run("it arrives within the tolerance", func(t *testing.T) {
+		a, s, now := setup()
+		s.write(1, 20*PageSamples, 23*PageSamples, content)
+		a.Committed(1, 20*PageSamples, 23*PageSamples)
+		_, head, _ := a.Step(now.Add(a.Tolerance / 2))
+		require.Equal(t, uint64(23*PageSamples), head)
+		require.Equal(t, []int{1, 1, 0}, a.Current[20:23])
+		require.Equal(t, 0, a.Primary)
+	})
+	t.Run("it does not", func(t *testing.T) {
+		a, _, now := setup()
+		_, head, _ := a.Step(now.Add(a.Tolerance))
+		require.Equal(t, uint64(23*PageSamples), head)
+		require.Equal(t, []int{0, 0, 0}, a.Current[20:23])
+	})
+}
+
+// Members holding the same silence a little apart wait once per stretch
+// of it, not at every batch the later one has not committed yet.
+func TestAudioWaitsOncePerStretchOfSilence(t *testing.T) {
+	const batch = 480
+	a := NewAudio(2, 38, 2)
+	a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+	s := newSamples(2, 2, 38)
+	a.Zeros, a.Content = s.zeros, s.content
+	now := time.Unix(0, 0)
+	waits := 0
+	for b := uint64(10); b < 120; b++ {
+		v := content
+		if b >= 30 && b < 110 {
+			v = zero
+		}
+		for m := range 2 {
+			s.write(m, b*batch, (b+1)*batch, v)
+			a.Committed(m, b*batch, (b+1)*batch)
+			_, _, wait := a.Step(now)
+			if wait > 0 && b >= 30 && b < 110 {
+				waits++
+			}
+			now = now.Add(5 * time.Millisecond) // member 1 commits 5 ms after member 0
+		}
+	}
+	require.Equal(t, uint64(120*batch), a.Head)
+	require.LessOrEqual(t, waits, 1, "a stretch of silence waited more than once")
+	require.Equal(t, 0, a.Primary)
+}
+
+// A late primary whose alternative holds zeros is waited for once: the
+// zeros' wait and the late primary's run on one clock.
+func TestAudioWaitsForALatePrimaryOverZerosOnce(t *testing.T) {
+	a := NewAudio(2, 38, 2)
+	a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+	s := newSamples(2, 2, 38)
+	a.Zeros, a.Content = s.zeros, s.content
+	for m := range 2 {
+		s.write(m, 10*PageSamples, 20*PageSamples, content)
+		a.Committed(m, 10*PageSamples, 20*PageSamples)
+	}
+	now := time.Unix(0, 0)
+	_, head, _ := a.Step(now)
+	require.Equal(t, uint64(20*PageSamples), head)
+	s.write(1, 20*PageSamples, 21*PageSamples, zero)
+	a.Committed(1, 20*PageSamples, 21*PageSamples)
+	_, head, wait := a.Step(now)
+	require.Equal(t, uint64(20*PageSamples), head)
+	require.Equal(t, a.Tolerance, wait)
+
+	_, head, wait = a.Step(now.Add(a.Tolerance))
+	require.Zero(t, wait, "the late primary was waited for a second time")
+	require.Equal(t, uint64(21*PageSamples), head)
+}
+
+// Digital silence on every member is content like any other: nothing is
+// waited for and no page moves off the primary.
+func TestAudioServesSilenceOnEveryMemberFromThePrimary(t *testing.T) {
+	const batch = 480
+	a := NewAudio(2, 38, 2)
+	a.Skew, a.Tolerance = 2048, ToleranceFor(40*time.Millisecond)
+	s := newSamples(2, 2, 38)
+	a.Zeros, a.Content = s.zeros, s.content
+	now := time.Unix(0, 0)
+	selects := 0
+	for b := uint64(10); b < 200; b++ {
+		v := content
+		if b >= 50 && b < 150 {
+			v = zero
+		}
+		for m := range 2 {
+			s.write(m, b*batch, (b+1)*batch, v)
+			a.Committed(m, b*batch, (b+1)*batch)
+		}
+		now = now.Add(10 * time.Millisecond)
+		sel, head, wait := a.Step(now)
+		require.Zero(t, wait, "batch %d waited", b)
+		require.Equal(t, (b+1)*batch, head, "batch %d", b)
+		for _, p := range sel {
+			require.Equal(t, 0, p.Source, "batch %d moved page %d", b, p.Page)
+		}
+		selects += len(sel)
+	}
+	require.Equal(t, 0, a.Primary)
+	require.LessOrEqual(t, selects, len(a.Current), "a page moved more than once")
+}
+
+// Drop moves a page to a member that holds it without zeros where
+// another holds it with them.
+func TestAudioDropPrefersAMemberWithoutZeros(t *testing.T) {
+	a := NewAudio(3, 38, 3)
+	a.Skew = 2048
+	s := newSamples(3, 2, 38)
+	a.Zeros, a.Content = s.zeros, s.content
+	for m := range 3 {
+		s.write(m, 10*PageSamples, 41*PageSamples, content)
+		a.Committed(m, 10*PageSamples, 41*PageSamples)
+	}
+	s.write(1, 30*PageSamples+100, 31*PageSamples, zero)
+	_, head, _ := a.Step(time.Unix(0, 0))
+	require.Equal(t, uint64(41*PageSamples), head)
+
+	sel := a.Drop(0)
+	require.Len(t, sel, 31)
+	for _, p := range sel {
+		want := 1
+		if p.Page == 30 {
+			want = 2
+		}
+		require.Equal(t, want, p.Source, "page slot %d", p.Page)
+	}
+}
+
+func TestZeroRunStartFindsTheFirstRunOnEveryChannel(t *testing.T) {
+	s := newSamples(1, 2, 2)
+	s.write(0, 0, 2*PageSamples, content)
+	at := func(from, to uint64) uint64 { return s.zeros(0, from, from, to, to, 48) }
+	// A zero on one channel only is not a run; on both, 47 samples are
+	// too short, 48 are one.
+	words := unsafe.Slice((*uint32)(unsafe.Pointer(&s.mem[0][0])), len(s.mem[0])/4)
+	for i := uint64(100); i < 300; i++ {
+		words[i] = 0
+	}
+	s.write(0, 400, 447, zero)
+	s.write(0, 600, 648, zero)
+	require.Equal(t, uint64(600), at(0, 2*PageSamples))
+	require.Equal(t, uint64(2*PageSamples), at(601, 2*PageSamples), "only the range counts")
+	require.Equal(t, uint64(640), at(0, 640), "a run cut short by the range is none")
+	// Around the range, as far as run - 1 samples into what it may read.
+	require.Equal(t, uint64(620), s.zeros(0, 0, 620, 2*PageSamples, 2*PageSamples, 48))
+	require.Equal(t, uint64(600), s.zeros(0, 0, 0, 640, 2*PageSamples, 48))
+	require.Equal(t, uint64(640), s.zeros(0, 0, 0, 640, 647, 48), "past what may be read")
+	require.Equal(t, uint64(2*PageSamples), s.zeros(0, 0, 648, 2*PageSamples, 2*PageSamples, 48), "a run before the range")
+	// Across the ring's end.
+	s.write(0, 2*PageSamples-20, 2*PageSamples+40, zero)
+	require.Equal(t, uint64(2*PageSamples-20), at(PageSamples, 3*PageSamples))
+}
+
+// The cost of Audio.Zeros over one page of 1024 samples, the most one
+// pass reads per member and page: content, where the first channel ends
+// each sample's check, and silence on every channel, where a run ends
+// the scan after 48 samples.
+func BenchmarkZeroRunStartPage(b *testing.B) {
+	for _, tc := range []struct {
+		name     string
+		channels uint64
+		v        func(uint64) float32
+	}{
+		{"content/2ch", 2, content},
+		{"content/16ch", 16, content},
+		{"silence/2ch", 2, zero},
+		{"silence/16ch", 16, zero},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			s := newSamples(1, tc.channels, 38)
+			s.write(0, 0, 38*PageSamples, tc.v)
+			for i := 0; b.Loop(); i++ {
+				p := uint64(i%38) * PageSamples
+				s.zeros(0, p, p, p+PageSamples, p+PageSamples, 48)
+			}
+		})
+	}
+}

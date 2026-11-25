@@ -1,0 +1,241 @@
+# Per-node anatomy
+
+[01-system-context](./01-system-context.md) showed which processes
+live on a node; [02-components](./02-components.md) broke each
+process down into the workflows it runs. This chapter covers the
+one aspect those two skip: **how a single node's processes share
+memory through tmpfs files, and how libmxl-fabrics registers a
+slice of that memory for cross-node RDMA**. That sharing is what
+makes mxl-k8s zero-copy on the data path.
+
+## On-disk layout
+
+Everything mxl-k8s touches on a node lives under `/run/mxl/`:
+
+![Per-node tmpfs layout](./diagrams/03-tmpfs-layout.drawio.svg)
+
+Four things matter here:
+
+- **`/run/mxl` is a tmpfs**, not a backed mount. The bytes live in
+  page-cache RAM. Nothing survives a node reboot. mxl-k8s does not
+  provision the mount -- that is left to the host's init system or a
+  privileged bootstrap step. Inside it the agent creates one
+  directory per `MxlDomain` selected for the node, writes the
+  domain's `domain_def.json` (its BCP-007-03 identity) and, where
+  `spec.historyDuration` is set, the history option in libmxl's
+  `options.json`. It reports each domain's state on the node in
+  `MxlDomain.status.nodes` (`ready`, `mirrored`, `capacityBytes`,
+  `freeBytes`, `fanotifyReady`). Only the directory named by
+  `--domain-path` is watched and mirrored.
+- **A flow directory's lifetime is tied to a libmxl FlowWriter
+  handle.** `mxlCreateFlowWriter` creates
+  `<flowID>.mxl-flow/{flow_def.json,data,grains/}`; closing the
+  writer removes them. This is why the gateway's TargetReconciler
+  recovery path keeps `mxl.Writer` alive even when the libfabric
+  side died -- releasing the writer would remove the on-disk flow
+  definition and invalidate every consumer pod's `FlowReader`
+  handle on the same node.
+- **`agent.sock` is a per-node singleton.** The agent binds it at
+  startup with mode `0666`; access control happens after `accept()`
+  via `SO_PEERCRED` and the subsequent `podlookup.PodForPID` call,
+  not via filesystem permissions. The socket file is bind-mounted
+  into any consumer pod that uses the LD_PRELOAD shim. The agent
+  runs with `hostPID: true` so `SO_PEERCRED` returns the consumer's
+  host-namespace PID and `/proc/<pid>/cgroup` is readable for the
+  pod-UID lookup.
+- **`libmxl-intent.so` sits next to the socket.** The agent writes
+  the copy it carries to `/run/mxl/libmxl-intent.so` on every start,
+  world-readable and replacing whatever was there. A consumer that
+  preloads it off the node therefore runs the shim belonging to the
+  agent it then talks to, and an agent upgrade leaves no older
+  build behind.
+
+## Shared-memory zero-copy
+
+This is the central anatomical fact about a node and the reason
+mxl-k8s exists as an *orchestration* layer rather than a transport
+layer:
+
+![Shared-memory zero-copy on one node](./diagrams/03-mmap.drawio.svg)
+
+Two things to read out of the diagram:
+
+- **All four roles map the same file.** The grain payload ring is
+  one tmpfs file. The writer pod's libmxl `mmap`s it for writes;
+  the consumer pod's libmxl `mmap`s it for reads; the gateway's
+  libmxl handles `mmap` the same range from its own address space.
+  No process holds an intermediate copy.
+- **The gateway side, and only the gateway side, registers a
+  libfabric memory region** over that mapping. libfabric needs to
+  know the (virtual address, length, `rkey`) triple before a remote
+  peer can RDMA into the region. Writer and consumer pods don't
+  participate in libfabric at all -- they only see the libmxl
+  HeadIndex semantics.
+
+The per-grain narrative captured in the diagram is the same one as
+the data-plane sequence at the end of this chapter, but viewed from
+a single node:
+
+- **Source side.** Writer fills payload directly in tmpfs. Commit is
+  one counter update. The source gateway, which maps the *same*
+  tmpfs pages, waits in a blocking read for the grain and sees it
+  with no copy. `Initiator.TransferGrain` reads from its
+  libfabric-registered region and emits an RDMA write.
+- **Target side.** The RDMA write lands in this node's registered
+  region, which *is* a slice of this node's tmpfs file. The target
+  gateway calls `ReadGrainNonBlocking` to learn the index, then
+  `Writer.OpenGrain(i).Commit` -- a metadata-only HeadIndex bump
+  because the payload bytes were already placed by RDMA. The
+  consumer's `FlowReader` sees the HeadIndex move (same tmpfs
+  pages, mapped read-only) and `GetGrain` returns a pointer into
+  its own mapping.
+
+There is exactly one moment in the whole pipeline where a process
+*reads* bytes from a file backed by tmpfs: when the writer's libmxl
+copies payload from the caller's buffer into the mapped slot, and
+when the consumer's libmxl returns a pointer that the caller will
+read from. Everything in between is pointer arithmetic and RDMA.
+
+## Hostpath + shim injection at a glance
+
+The mount and library-injection story is mechanical but worth a
+table:
+
+| Process | mounts `/run/mxl/domain` | mounts `/run/mxl/agent.sock` | linked / preloaded libraries |
+| --- | --- | --- | --- |
+| writer pod | rw | -- | libmxl |
+| consumer pod | rw | rw (bind-mount of the socket file) | libmxl + libmxl-intent.so via `LD_PRELOAD` |
+| agent DaemonSet | rw | rw (binds, listens) | none (pure Go) |
+| gateway DaemonSet | rw | -- | libmxl + libmxl-fabrics + libfabric provider |
+
+The LD_PRELOAD shim reaches the consumer either off the node or out
+of the carrier image. The agent writes the copy it carries to
+`/run/mxl/libmxl-intent.so` on every start. The consumer mounts that
+file on a path of its own as a `hostPath` of type `File` and
+preloads from there, rather than naming it inside the `/run/mxl`
+directory mount: `/run` is tmpfs, so a node reboot loses the shim and
+the agent races the workload pods to write it back, and the loader
+treats an `LD_PRELOAD` object it cannot open as a warning. Declared
+as a `File`, the mount is what stops a pod from starting
+uninstrumented and staying that way for its whole life. The carrier
+image is the two-container pattern: an initContainer copies the same
+`.so` into a shared `emptyDir` and the main container preloads it
+from there, which is ordered by the kubelet and needs no gate. The default agent socket path can be
+overridden with `MXL_INTENT_SOCK`. The shim itself has no daemon, no
+Kubernetes client, and no state -- see
+[02-components](./02-components.md#shim).
+
+## Why these per-node choices
+
+The hostNetwork rationale (libfabric MSG/RC endpoints need routable
+IPs) lives in [01-system-context](./01-system-context.md#why-these-architectural-choices),
+and the LD_PRELOAD-vs-kernel-hook rationale lives in
+[02-components](./02-components.md#shim). What's unique to a node
+view:
+
+- **hostPath for `/run/mxl/domain`.** libmxl's domain is per-node
+  by design: one tmpfs, one set of files, and every libmxl handle
+  on the node maps the same memory. PersistentVolumes would mean
+  per-pod views, which would defeat the zero-copy story.
+- **Bind-mount of `/run/mxl/agent.sock` into consumer pods.** The
+  alternative -- a TCP listener on localhost -- would force the shim
+  to use a different syscall path and lose `SO_PEERCRED`-based
+  caller identification. A UDS file fits the shim's "intercept the
+  libmxl probe and block" model with minimal surface.
+- **Volatile tmpfs is acceptable** because every flow exists in the
+  cluster only while a writer is running. There is nothing to
+  persist across reboots: when the writer pod comes back, it
+  re-creates the flow files and the agent re-publishes the Origin
+  location. The cluster does not assume any prior on-disk state.
+
+## End-to-end: a grain in flight
+
+Once a mirror has reached `phase=Ready` (see
+[02-components](./02-components.md#end-to-end-applying-an-mxlreceiver)),
+the control plane is out of the loop. Grains travel from the writer's
+tmpfs domain on Node A to the consumer's tmpfs domain on Node B
+without any further round-trips through the Kubernetes API.
+
+![End-to-end: a grain in flight](./diagrams/03-data-plane-sequence.drawio.svg)
+
+Steps for one grain index *N*:
+
+1. **Writer pod** calls `OpenGrain(N)` on its libmxl FlowWriter,
+   fills the payload bytes directly into the mmap'd ring slot, and
+   calls `Commit(slices, ...)`. The commit writes the grain header
+   and advances the flow's `HeadIndex` in tmpfs.
+2. **Source gateway's transfer goroutine** for the mirror waits for
+   the next index in `GetGrainSlice(idx, start+batch, 200 ms)`, where
+   batch is the flow's `maxSyncBatchSizeHint`, and calls
+   `Initiator.TransferGrain(idx, start, validSlices)`, then
+   `Initiator.MakeProgress` until it stops returning not-ready. It
+   repeats that for the same grain until every slice went; an invalid
+   grain goes as its header alone. The grain is read from the
+   gateway's mapping of the *same tmpfs file* -- the bytes never
+   leave RAM on this node.
+3. **libfabric** performs an RDMA write into the target node's
+   registered region. For the `tcp` provider this is a sequence of
+   socket sends to the remote target; for `verbs`/EFA it is a real
+   one-sided RDMA. In both cases the payload + grain header land
+   *directly in the target's ring slot* -- no intermediate buffer
+   on the target gateway.
+4. **Target gateway's progress goroutine** calls
+   `Target.ReadGrain`, which blocks for up to 20 ms. On success it
+   returns the index that just completed; on `ErrNotReady` it calls
+   again.
+5. **Target gateway** calls `commitArrivedGrain(writer, idx)`,
+   which is `Writer.OpenGrain(idx)` followed immediately by a
+   `Commit` with the valid slices the arrived header carries. This
+   does not copy data -- the payload and header are already in place.
+   The Commit only advances the local flow's `HeadIndex` so consumer
+   FlowReaders on this node see the new grain, a slice batch of it as
+   soon as that batch lands.
+6. **Consumer pod's FlowReader** sees `HeadIndex >= N` on its next
+   `GetGrain(N)` call. The grain bytes are returned via a pointer
+   into the consumer's mmap of the local data file -- zero-copy on
+   the consumer side as well.
+
+Three details from the diagram are worth pulling out:
+
+- **Why a blocking `ReadGrain` survives signals.** libfabric's
+  `util_wait.c` returns `-EINTR` from `epoll_wait` as a fatal "poll
+  failed" in release builds, and Go's async preemption sends SIGURG
+  to running goroutines routinely. libmxl-fabrics catches that
+  interrupt and returns `MXL_ERR_INTERRUPTED` with the endpoint
+  intact, and the loop calls again.
+- **Why `Commit` is metadata-only on the target.** The payload +
+  header bytes were RDMA'd into the ring slot by the remote
+  initiator *before* `ReadGrain` reported the index as ready. What
+  the local node's libmxl needs in order to surface the new grain
+  to consumer FlowReaders is the `HeadIndex` bump, and
+  `OpenGrain(N).Commit` is the path that performs it. This mirrors
+  the receive pattern in upstream
+  `mxl-fabrics-demo/tools/mxl-fabrics-demo/demo.cpp`.
+- **Fatal-error recovery keeps `mxl.Writer` alive.** On any
+  non-`ErrNotReady` error from `ReadGrain`, the target progress
+  loop exits and `recoverFromFatalError(key)`
+  ([`target.go:375`](../../gateway/internal/mirror/target.go))
+  rebuilds only the fabric triple. The writer is retained so the
+  on-disk flow definition and any consumer `FlowReader` handles
+  point at it. The new `TargetInfo` is published as the mirror's
+  `MxlFlowMirrorTarget` and its hash into status; the
+  source side detects the rotation through its existing watch and
+  swaps that one target on its initiator.
+- **One initiator per mirror on the source side.** A flow mirrored
+  from this node to several others is one `FlowReader`, keyed on
+  (flow, provider), and per mirror one `Initiator` holding that
+  mirror's target and one transfer goroutine. A target that stops
+  completing transfers holds up no other mirror of the flow.
+
+Each mirror has at most one transfer outstanding. Grains the producer
+commits meanwhile wait in its ring, and the next transfer starts where
+the last one ended. A transfer that takes longer than one grain
+interval (one batch, for audio) is counted late. The loop skips
+grains only once the reader can no longer hand them out or it trails
+the head by more than four grains, and samples only once they have
+left the reader's window. A transfer outstanding for 2 s, or a target
+the initiator dropped, ends the loop, and the mirror's target is added
+again. Consumer reads honour libmxl's
+normal grain-ring semantics -- if the consumer is too slow it will
+start receiving "grain aged out" errors from `GetGrain`. mxl-k8s does
+not interpose on this; the ring is libmxl's, not ours.

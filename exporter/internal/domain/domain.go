@@ -1,0 +1,420 @@
+// Package domain reads an MXL domain directory and reports what each
+// flow in it is doing. Every value comes from go-mxl, so the
+// shared-memory layout stays libmxl's to define.
+package domain
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/qvest-digital/go-mxl/mxl"
+	"golang.org/x/sys/unix"
+
+	"github.com/qvest-digital/mxl-k8s/api/mxlfs"
+	mxlv1alpha1 "github.com/qvest-digital/mxl-k8s/api/v1alpha1"
+)
+
+// flowDirSuffix is what libmxl names a flow's directory inside a
+// domain: "<flow-id>.mxl-flow".
+const flowDirSuffix = ".mxl-flow"
+
+// Observation is one flow's state at the moment it was sampled.
+type Observation struct {
+	// ID is the flow UUID, taken from its directory name.
+	ID string
+
+	// Present reports whether the flow's directory is still in the
+	// domain. A departed flow keeps being observed, with Present
+	// false, until its lifetime expires.
+	Present bool
+
+	// Active reports whether the flow was written within its own
+	// activity window, measured on the MXL clock that stamps the write
+	// itself. A flow can be present and inactive, which is what a
+	// stalled writer looks like from outside.
+	Active bool
+
+	// HaveInfo reports whether Info and Latency could be read. A flow
+	// whose directory exists but whose reader cannot be opened yet
+	// (mid-creation, or already torn down) has none.
+	HaveInfo bool
+
+	// Info is the flow's config and runtime state.
+	Info mxl.FlowInfo
+
+	// LatencyGrains is how far the head index sits behind where the
+	// MXL clock says it should be at this grain rate. Negative means
+	// the writer is running ahead of the clock. Zero on an event flow,
+	// whose head does not follow the clock.
+	LatencyGrains int64
+
+	// WriteAge is the MXL-clock time since the last write. Derived
+	// from the same clock that stamps LastWriteTime rather than from
+	// wall time, so the two are comparable.
+	WriteAge time.Duration
+
+	// HaveWriteAge reports whether WriteAge carries a reading. Only a
+	// discrete or an event flow stamps the field it derives from, so a
+	// continuous flow leaves it unset rather than reporting an age
+	// measured from a timestamp nothing advances.
+	HaveWriteAge bool
+
+	// Def is the parsed flow_def.json, nil when it could not be read
+	// or parsed.
+	Def *FlowDef
+}
+
+// FSStat describes the filesystem backing a domain.
+type FSStat struct {
+	TotalBytes     uint64
+	AvailableBytes uint64
+	UsedBytes      uint64
+}
+
+// entry tracks one flow across observations.
+type entry struct {
+	id     string
+	reader *mxl.Reader
+	def    *FlowDef
+
+	removedAt   time.Time
+	sizeBytes   uint64
+	openAttempt bool
+}
+
+// Domain is an open MXL domain directory.
+type Domain struct {
+	path     string
+	lifetime time.Duration
+
+	inst *mxl.Instance
+
+	mu        sync.Mutex
+	flows     map[string]*entry
+	sizeBytes uint64
+}
+
+// Open opens the domain at path. lifetime is how long a departed flow
+// keeps being reported before it is forgotten.
+func Open(path string, lifetime time.Duration) (*Domain, error) {
+	inst, err := mxl.NewInstance(path, "")
+	if err != nil {
+		return nil, fmt.Errorf("open mxl domain %q: %w", path, err)
+	}
+	return &Domain{
+		path:     path,
+		lifetime: lifetime,
+		inst:     inst,
+		flows:    map[string]*entry{},
+	}, nil
+}
+
+// Path returns the domain directory this Domain reports on.
+func (d *Domain) Path() string { return d.path }
+
+// Close releases every open reader and the underlying instance.
+func (d *Domain) Close() error {
+	d.mu.Lock()
+	for _, e := range d.flows {
+		e.close()
+	}
+	d.flows = map[string]*entry{}
+	d.mu.Unlock()
+	return d.inst.Close()
+}
+
+// Scan re-lists the domain directory, opening readers for flows that
+// appeared, closing those for flows that left, and dropping entries
+// whose lifetime has expired. It also refreshes the cached on-disk
+// size, which keeps the directory walk off the scrape path.
+func (d *Domain) Scan() error {
+	ids, sizes, err := d.listFlows()
+	if err != nil {
+		return err
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var total uint64
+	for _, size := range sizes {
+		total += size
+	}
+	d.sizeBytes = total
+
+	for id := range ids {
+		e, ok := d.flows[id]
+		if !ok {
+			e = &entry{id: id}
+			d.flows[id] = e
+		}
+		e.removedAt = time.Time{}
+		e.sizeBytes = sizes[id]
+		d.openReader(e)
+	}
+
+	now := time.Now()
+	for id, e := range d.flows {
+		if _, still := ids[id]; still {
+			continue
+		}
+		if e.removedAt.IsZero() {
+			// The flow is gone; drop the libmxl handle now rather than
+			// at expiry, so a held reader never keeps a torn-down flow
+			// from being collected.
+			e.removedAt = now
+			e.close()
+			continue
+		}
+		if d.lifetime >= 0 && now.Sub(e.removedAt) > d.lifetime {
+			delete(d.flows, id)
+		}
+	}
+	return nil
+}
+
+// openReader opens a reader for e if it does not have one. A flow
+// caught mid-creation fails here and is retried on the next scan.
+func (d *Domain) openReader(e *entry) {
+	if e.reader != nil {
+		return
+	}
+	// The domain was listed before every flow's size was walked, which
+	// leaves time for a flow to go. libmxl looks the flow up by name, and
+	// on mxlfs a lookup of a flow directory that is not there waits for
+	// it to appear, with d.mu held, so the flow is listed again first.
+	if ok, _ := mxlfs.Listed(d.path, e.id+flowDirSuffix); !ok {
+		e.openAttempt = false
+		return
+	}
+	r, err := newReader(d.inst, e.id)
+	if err != nil {
+		e.openAttempt = false
+		return
+	}
+	e.reader = r
+	e.openAttempt = true
+	if raw, err := d.inst.FlowDef(e.id); err == nil {
+		if def, err := ParseFlowDef(raw); err == nil {
+			e.def = def
+		}
+	}
+}
+
+// newReader is libmxl's lookup of a flow by name; tests replace it.
+var newReader = (*mxl.Instance).NewReader
+
+// minActivityWindow floors the window derived from a flow's cadence.
+// A 48 kHz audio flow commits every 10 ms and a 60 fps video flow
+// every 17 ms; three of either is shorter than the jitter between two
+// scrapes, so without a floor a healthy fast flow would flap.
+const minActivityWindow = 100 * time.Millisecond
+
+// activeGrains is how many writes a flow may miss before it reads as
+// stalled.
+const activeGrains = 3
+
+// activityWindow returns how long after its last write a flow still
+// counts as active, derived from the flow's own cadence.
+//
+// libmxl does not define this. Its own notion of an active flow is
+// whether any process holds the data file locked, which is what
+// mxlGarbageCollectFlows tests; it maintains lastWriteTime but attaches
+// no threshold to it. The threshold is this exporter's policy, so it
+// has to be relative to the flow rather than a constant: a fixed window
+// that means three grains at 25 fps means a fifth of a grain at 1 fps,
+// where it would report a healthy flow stalled between every frame.
+//
+// On a continuous flow the grain rate is the sample rate and writes
+// land one commit batch apart, not one sample apart.
+func activityWindow(cfg mxl.CommonFlowConfig) time.Duration {
+	rate := cfg.GrainRate
+	if rate.Num <= 0 || rate.Den <= 0 {
+		return minActivityWindow
+	}
+	// One unit per write: a grain on a discrete flow, a commit batch of
+	// samples on a continuous one. Multiplied in before the division so
+	// a rate that does not divide evenly into a nanosecond does not
+	// lose a whole batch to truncation.
+	units := int64(1)
+	if !cfg.Format.IsDiscrete() && cfg.MaxCommitBatchSizeHint > 0 {
+		units = int64(cfg.MaxCommitBatchSizeHint)
+	}
+	perWrite := time.Duration(int64(time.Second) * rate.Den * units / rate.Num)
+	if w := activeGrains * perWrite; w > minActivityWindow {
+		return w
+	}
+	return minActivityWindow
+}
+
+// continuousActiveLag is how far a continuous flow's head may sit
+// behind the clock and still count as active, in samples.
+//
+// A continuous flow cannot be judged by LastWriteTime the way a
+// discrete one is: PosixDiscreteFlowWriter stamps that field on every
+// commit and PosixContinuousFlowWriter::commit never touches it, so on
+// a continuous flow it holds whatever FlowManager wrote at creation.
+// Any window measured against it expires once and reports every audio
+// flow stalled from then on, however healthy the writer.
+//
+// The head index is what the continuous writer does maintain. libmxl
+// sizes bufferLength at twice the history duration (Instance.cpp:
+// historyDuration * sampleRate / 500e6), so half of it is the span a
+// reader can still reach; a head further behind than that has nothing
+// left for anyone to read, which is the same "no usable data" the
+// discrete window reports. Deriving the bound from the flow's own ring
+// keeps it correct across sample rates and history durations, and
+// leaves room for the offset a producer's own buffering introduces,
+// which is a property of the producer rather than of its health.
+func continuousActiveLag(cfg mxl.FlowConfig) int64 {
+	if n := cfg.Continuous.BufferLength; n > 0 {
+		return int64(n / 2)
+	}
+	// A flow that declares no ring leaves only its cadence to go on:
+	// the same window the discrete path uses, expressed in samples.
+	rate := cfg.Common.GrainRate
+	if rate.Num <= 0 || rate.Den <= 0 {
+		return 0
+	}
+	return int64(activityWindow(cfg.Common)) * rate.Num / (int64(time.Second) * rate.Den)
+}
+
+// Observe samples every tracked flow. It holds no state across calls:
+// every value is read from the flow header, so calling it twice in a
+// row answers the same thing twice.
+//
+// Activity used to be a delta against the previous call, which made it
+// a property of the caller rather than of the flow. Two collectors are
+// registered and Prometheus calls both in one scrape, so whichever ran
+// first consumed the head advancement and the other reported the flow
+// idle - the same scrape could carry an advancing head index and
+// active=0. Anything else sampling the endpoint, a probe or a second
+// Prometheus, corrupted the answer the same way.
+func (d *Domain) Observe() []Observation {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := mxl.Now()
+	out := make([]Observation, 0, len(d.flows))
+	for _, e := range d.flows {
+		obs := Observation{
+			ID:      e.id,
+			Present: e.removedAt.IsZero(),
+			Def:     e.def,
+		}
+		active := false
+		if e.reader != nil {
+			if info, err := e.reader.Info(); err == nil {
+				obs.HaveInfo = true
+				obs.Info = info
+
+				format := info.Config.Common.Format
+				rate := info.Config.Common.GrainRate
+				haveRate := rate.Den != 0 && rate.Num != 0
+				// An event flow's head is a queue position, not a time:
+				// MXL_UNDEFINED_INDEX until the first commit, then one
+				// step per event however far apart they come.
+				if haveRate && format != mxl.FormatEvent {
+					obs.LatencyGrains = int64(mxl.TimestampToIndex(rate, now)) - int64(info.Runtime.HeadIndex)
+				}
+				// The discrete and the event writer both stamp
+				// lastWriteTime on every commit.
+				if format.IsDiscrete() || format == mxl.FormatEvent {
+					if lw := info.Runtime.LastWriteTime; lw != 0 && now > lw {
+						obs.WriteAge = time.Duration(now-lw) * time.Nanosecond
+						obs.HaveWriteAge = true
+						active = obs.WriteAge < activityWindow(info.Config.Common)
+					}
+				} else if haveRate {
+					active = obs.LatencyGrains < continuousActiveLag(info.Config)
+				}
+			}
+		}
+		// A departed flow is never active, however recent its last
+		// write was.
+		obs.Active = active && obs.Present
+		out = append(out, obs)
+	}
+	return out
+}
+
+// SizeBytes is the combined on-disk size of the domain's flows as of
+// the last Scan.
+func (d *Domain) SizeBytes() uint64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.sizeBytes
+}
+
+// listFlows returns the flow ids present in the domain and the on-disk
+// size of each.
+func (d *Domain) listFlows() (map[string]struct{}, map[string]uint64, error) {
+	dir, err := os.Open(d.path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read domain %q: %w", d.path, err)
+	}
+	defer dir.Close()
+	dirents, err := dir.ReadDir(-1)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read domain %q: %w", d.path, err)
+	}
+	ids := map[string]struct{}{}
+	sizes := map[string]uint64{}
+	for _, de := range dirents {
+		if !de.IsDir() || !strings.HasSuffix(de.Name(), flowDirSuffix) {
+			continue
+		}
+		id := strings.TrimSuffix(de.Name(), flowDirSuffix)
+		// A placeholder is not a flow this node has: its ring is empty and
+		// unallocated, and reading it would report a flow that is not here.
+		if id == "" || mxlv1alpha1.IsPlaceholder(d.path, id) {
+			continue
+		}
+		ids[id] = struct{}{}
+		sizes[id] = dirSize(dir, de.Name())
+	}
+	return ids, sizes, nil
+}
+
+// dirSize sums the apparent size of every regular file in the directory
+// name in parent and below it. name is looked up once, just after the
+// listing returned it, and everything below is read in the directories
+// opened: on mxlfs a lookup through a flow directory that went mid-walk
+// waits for it to come back, once per file. A file that vanishes
+// mid-walk is skipped rather than failing the walk: flows are created
+// and torn down while this runs. A symlink is not followed, so the walk
+// stays inside the flow's directory.
+func dirSize(parent *os.File, name string) uint64 {
+	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0
+	}
+	dir := os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name))
+	defer dir.Close()
+	names, _ := dir.Readdirnames(-1)
+	var total uint64
+	for _, n := range names {
+		var st unix.Stat_t
+		if unix.Fstatat(fd, n, &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+			continue
+		}
+		switch st.Mode & unix.S_IFMT {
+		case unix.S_IFDIR:
+			total += dirSize(dir, n)
+		case unix.S_IFREG:
+			total += uint64(st.Size)
+		}
+	}
+	return total
+}
+
+func (e *entry) close() {
+	if e.reader != nil {
+		_ = e.reader.Close()
+		e.reader = nil
+	}
+}

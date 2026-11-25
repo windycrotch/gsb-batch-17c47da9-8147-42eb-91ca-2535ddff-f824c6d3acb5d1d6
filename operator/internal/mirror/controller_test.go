@@ -1,0 +1,1032 @@
+package mirror
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
+	utilptr "k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	mxlv1alpha1 "github.com/qvest-digital/mxl-k8s/api/v1alpha1"
+)
+
+const (
+	flowID  = "11111111-2222-3333-4444-555555555555"
+	srcNode = "n-src"
+	tgtNode = "n-target"
+	testNS  = "ns"
+)
+
+func newScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(mxlv1alpha1.AddToScheme(s))
+	return s
+}
+
+func node(name string) *corev1.Node {
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
+
+// flowOriginAt is the flow as the agent on origin publishes it.
+func flowOriginAt(origin string) *mxlv1alpha1.MxlFlow {
+	return &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: origin, Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+			},
+		},
+	}
+}
+
+type mirrorOpt func(*mxlv1alpha1.MxlFlowMirror)
+
+func newMirror(opts ...mirrorOpt) *mxlv1alpha1.MxlFlowMirror {
+	m := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "m1"},
+		Spec: mxlv1alpha1.MxlFlowMirrorSpec{
+			FlowID:     flowID,
+			SourceNode: srcNode,
+			TargetNode: tgtNode,
+			Provider:   mxlv1alpha1.ProviderTCP,
+		},
+	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
+}
+
+// withRequestor is the on-demand path's claim: the agent records the
+// pod whose ENOENT triggered the materialization.
+func withRequestor(name, uid string) mirrorOpt {
+	return func(m *mxlv1alpha1.MxlFlowMirror) {
+		m.Spec.Requestor = &mxlv1alpha1.PodRef{
+			Namespace: testNS, Name: name, UID: uid,
+		}
+	}
+}
+
+// withReceiverOwner is the declarative path's claim.
+func withReceiverOwner(name string, uid types.UID) mirrorOpt {
+	return func(m *mxlv1alpha1.MxlFlowMirror) {
+		m.OwnerReferences = append(m.OwnerReferences, metav1.OwnerReference{
+			APIVersion:         mxlv1alpha1.GroupVersion.String(),
+			Kind:               "MxlReceiver",
+			Name:               name,
+			UID:                uid,
+			Controller:         utilptr.To(false),
+			BlockOwnerDeletion: utilptr.To(false),
+		})
+	}
+}
+
+// withIntentLabel stamps the creator label. It is diagnostic only:
+// nothing in the lifecycle may read it, which is what these pin.
+func withIntentLabel() mirrorOpt {
+	return func(m *mxlv1alpha1.MxlFlowMirror) {
+		if m.Labels == nil {
+			m.Labels = map[string]string{}
+		}
+		m.Labels[mxlv1alpha1.LabelCreatedByIntent] = tgtNode
+	}
+}
+
+func pod(name, uid string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNS, Name: name, UID: types.UID(uid),
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   tgtNode,
+			Containers: []corev1.Container{{Name: "c", Image: "pause:3.10"}},
+		},
+	}
+}
+
+func receiver(name string, uid types.UID) *mxlv1alpha1.MxlReceiver {
+	return &mxlv1alpha1.MxlReceiver{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: name, UID: uid},
+		Spec: mxlv1alpha1.MxlReceiverSpec{
+			FlowID:      flowID,
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "c"}},
+		},
+	}
+}
+
+type fakeLease struct {
+	fresh    map[string]bool
+	deadline time.Time
+}
+
+func (f *fakeLease) IsFresh(_ context.Context, flow, nodeName string) (bool, time.Time, error) {
+	if f.fresh == nil {
+		return true, f.deadline, nil
+	}
+	return f.fresh[flow+"/"+nodeName], f.deadline, nil
+}
+
+// harness builds the reconciler with both nodes present and a lease
+// checker that considers every origin fresh unless told otherwise.
+func harness(t *testing.T, grace time.Duration, objs ...client.Object) (*Reconciler, client.Client) {
+	t.Helper()
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}, &mxlv1alpha1.MxlFlow{}).
+		WithObjects(node(srcNode), node(tgtNode)).
+		WithObjects(objs...).
+		Build()
+	return &Reconciler{
+		Client:      c,
+		Recorder:    record.NewFakeRecorder(32),
+		Lease:       &fakeLease{},
+		GracePeriod: grace,
+	}, c
+}
+
+func reconcileOnce(t *testing.T, r *Reconciler, name string) ctrl.Result {
+	t.Helper()
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: name},
+	})
+	require.NoError(t, err)
+	return res
+}
+
+func getMirror(t *testing.T, c client.Client, name string) *mxlv1alpha1.MxlFlowMirror {
+	t.Helper()
+	var m mxlv1alpha1.MxlFlowMirror
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: name}, &m))
+	return &m
+}
+
+func mirrorGone(t *testing.T, c client.Client, name string) bool {
+	t.Helper()
+	var m mxlv1alpha1.MxlFlowMirror
+	err := c.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: name}, &m)
+	return apierrors.IsNotFound(err)
+}
+
+func condition(t *testing.T, m *mxlv1alpha1.MxlFlowMirror, typ string) *metav1.Condition {
+	t.Helper()
+	return meta.FindStatusCondition(m.Status.Conditions, typ)
+}
+
+// backdate moves both operator-owned conditions back so a test can
+// reach the far side of the grace period without waiting it out. The
+// clock living on the object rather than in the operator's memory is
+// the point: it used to reset on every mirror at once whenever the
+// operator restarted.
+func backdate(t *testing.T, c client.Client, name string, by time.Duration) {
+	t.Helper()
+	m := getMirror(t, c, name)
+	for i := range m.Status.Conditions {
+		switch m.Status.Conditions[i].Type {
+		case mxlv1alpha1.ConditionTypeClaimed, mxlv1alpha1.ConditionTypeSourceable:
+			m.Status.Conditions[i].LastTransitionTime = metav1.NewTime(time.Now().Add(-by))
+		}
+	}
+	require.NoError(t, c.Status().Update(context.Background(), m))
+}
+
+// --- claim -----------------------------------------------------------
+
+// collectedAfterHandover reports whether a mirror whose requestor is
+// gone survives the first pass and is deleted once the handover window
+// has passed with nobody named in its place.
+func collectedAfterHandover(t *testing.T, r *Reconciler, c client.Client, name string) bool {
+	t.Helper()
+	res := reconcileOnce(t, r, name)
+	if mirrorGone(t, c, name) {
+		t.Errorf("collected on the pass that found its requestor gone; the agent had no time to hand it over")
+		return true
+	}
+	assert.Greater(t, res.RequeueAfter, RequestorHandover-10*time.Second,
+		"the pass has to come back when the window closes, since nothing else may arrive to wake it")
+	assert.LessOrEqual(t, res.RequeueAfter, RequestorHandover)
+	backdate(t, c, name, RequestorHandover)
+	reconcileOnce(t, r, name)
+	return mirrorGone(t, c, name)
+}
+
+// A claim names its claimant, and a named pod does not come back the
+// way a producer can, so this waits only the handover window and not
+// the grace period: long enough for the agent to name a reader still
+// using the flow, short enough that a flow nobody reads is not pulled
+// across the fabric for minutes.
+func TestClaim_RequestorPodGone_CollectedAfterTheHandover(t *testing.T) {
+	m := newMirror(withIntentLabel(), withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, flowOriginAt(srcNode))
+
+	assert.True(t, collectedAfterHandover(t, r, c, m.Name))
+}
+
+// A reader replaced on the same node opens a flow whose mirrored
+// directory is still there, so it never asks and is never recorded as
+// the requestor. Collecting the moment the old pod went left the new
+// one reading a ring nothing wrote any more, offline until it too was
+// replaced. The agent naming it inside the window is what keeps the
+// mirror.
+func TestClaim_RequestorHandedOverInsideTheWindow_IsKept(t *testing.T) {
+	m := newMirror(withIntentLabel(), withRequestor("old", "uid-old"))
+	r, c := harness(t, time.Hour, m, flowOriginAt(srcNode), pod("new", "uid-new"))
+
+	reconcileOnce(t, r, m.Name)
+	require.False(t, mirrorGone(t, c, m.Name),
+		"the old reader going must not take the mirror from the new one before the agent can name it")
+
+	got := getMirror(t, c, m.Name)
+	got.Spec.Requestor = &mxlv1alpha1.PodRef{Namespace: testNS, Name: "new", UID: "uid-new"}
+	require.NoError(t, c.Update(context.Background(), got))
+	backdate(t, c, m.Name, RequestorHandover)
+
+	reconcileOnce(t, r, m.Name)
+	require.False(t, mirrorGone(t, c, m.Name))
+	claimed := condition(t, getMirror(t, c, m.Name), mxlv1alpha1.ConditionTypeClaimed)
+	require.NotNil(t, claimed)
+	assert.Equal(t, mxlv1alpha1.ReasonRequestorLive, claimed.Reason)
+}
+
+// The window exists for a reader on the target node. One that has left
+// the cluster has none, so the mirror goes at once.
+func TestClaim_RequestorGoneOnADepartedTarget_CollectsAtOnce(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Spec.TargetNode = "reclaimed"
+	r, c := harness(t, time.Hour, m, flowOriginAt(srcNode))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+func TestClaim_RequestorPodAlive_IsKept(t *testing.T) {
+	m := newMirror(withIntentLabel(), withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.False(t, mirrorGone(t, c, m.Name))
+
+	claimed := condition(t, getMirror(t, c, m.Name), mxlv1alpha1.ConditionTypeClaimed)
+	require.NotNil(t, claimed)
+	assert.Equal(t, mxlv1alpha1.ReasonRequestorLive, claimed.Reason)
+}
+
+// A pod recreated under the same name is a different consumer. The
+// UID is what says so.
+func TestClaim_RequestorPodReplaced_IsUnclaimed(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), pod("consumer", "uid-2"))
+
+	assert.True(t, collectedAfterHandover(t, r, c, m.Name))
+}
+
+func TestClaim_LiveReceiverOwner_IsKept(t *testing.T) {
+	m := newMirror(withReceiverOwner("recv", "recv-uid"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), receiver("recv", "recv-uid"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.False(t, mirrorGone(t, c, m.Name))
+
+	claimed := condition(t, getMirror(t, c, m.Name), mxlv1alpha1.ConditionTypeClaimed)
+	require.NotNil(t, claimed)
+	assert.Equal(t, mxlv1alpha1.ReasonReceiverOwned, claimed.Reason)
+}
+
+func withSetOwner(name string, uid types.UID) mirrorOpt {
+	return func(m *mxlv1alpha1.MxlFlowMirror) {
+		m.OwnerReferences = append(m.OwnerReferences, metav1.OwnerReference{
+			APIVersion: mxlv1alpha1.GroupVersion.String(),
+			Kind:       "MxlFlowRedundancySet",
+			Name:       name,
+			UID:        uid,
+		})
+	}
+}
+
+func set(uid types.UID, nodes ...string) *mxlv1alpha1.MxlFlowRedundancySet {
+	return &mxlv1alpha1.MxlFlowRedundancySet{
+		ObjectMeta: metav1.ObjectMeta{Name: "programme", UID: uid},
+		Status:     mxlv1alpha1.MxlFlowRedundancySetStatus{Nodes: nodes},
+	}
+}
+
+// A set mirrors each member to every node its output is read on, and
+// no pod is named on such a mirror: the reader holds the output, not
+// the member. The set wanting the output on the target is the claim.
+func TestClaim_SetWantingOutputOnTarget_IsKept(t *testing.T) {
+	m := newMirror(withSetOwner("programme", "set-uid"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), set("set-uid", tgtNode))
+	r.RedundancySets = true
+
+	reconcileOnce(t, r, m.Name)
+	assert.False(t, mirrorGone(t, c, m.Name))
+
+	claimed := condition(t, getMirror(t, c, m.Name), mxlv1alpha1.ConditionTypeClaimed)
+	require.NotNil(t, claimed)
+	assert.Equal(t, mxlv1alpha1.ReasonRedundancySetOwned, claimed.Reason)
+}
+
+func TestClaim_SetNotWantingOutputOnTarget_IsCollected(t *testing.T) {
+	m := newMirror(withSetOwner("programme", "set-uid"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), set("set-uid", "elsewhere"))
+	r.RedundancySets = true
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+func TestClaim_SetRecreatedUnderTheSameName_IsNotAClaim(t *testing.T) {
+	m := newMirror(withSetOwner("programme", "old-uid"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), set("new-uid", tgtNode))
+	r.RedundancySets = true
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// Without redundancy sets the operator has no access to them, and an
+// owner reference left from when it had is no claim: the mirror goes
+// like any other nothing wants.
+func TestClaim_SetOwnerWithoutRedundancySets_IsNotAClaim(t *testing.T) {
+	m := newMirror(withSetOwner("programme", "set-uid"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), set("set-uid", tgtNode))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// The trap the old collectors left open. A receiver that stops wanting
+// a mirror removes its owner reference rather than being deleted, and
+// apiserver garbage collection fires when an owner is deleted, not
+// when the list is emptied by an update. Nothing collected the result.
+func TestClaim_OwnerlessMirror_IsCollected(t *testing.T) {
+	m := newMirror()
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// An owner reference to a receiver that no longer exists is not a
+// claim. The name may even have been reused by a different object,
+// which the UID catches.
+func TestClaim_DanglingOwnerRef_IsNotAClaim(t *testing.T) {
+	m := newMirror(withReceiverOwner("recv", "old-uid"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode),
+		receiver("recv", "new-uid"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// The mirror that survived a day and a half on the showcase cluster.
+// Its creator labels had been edited off, so the label-keyed collector
+// skipped it and even stripped its own finalizer; the owner-ref-keyed
+// one never looked at it either. Its requestor pod had been gone since
+// the day before, which is the fact that should have decided it.
+func TestClaim_NoCreatorLabels_IsStillJudgedOnItsRequestor(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Labels = nil
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode))
+
+	assert.True(t, collectedAfterHandover(t, r, c, m.Name),
+		"a claim is what the requesting side wrote into spec and "+
+			"ownerReferences; a label that can be edited off must not be "+
+			"what decides whether an object can ever be collected")
+}
+
+// --- source ----------------------------------------------------------
+
+// The dev-cluster case: the producer's node was reclaimed, the flow
+// kept the mirror target's Ready location and nothing else, and the
+// mirror addressed the departed node forever. Its requestor pod was
+// alive the whole time, so the claim alone would have kept it.
+func TestSource_FlowHasNoOrigin_CollectsAfterGraceDespiteALiveClaim(t *testing.T) {
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: tgtNode, Phase: mxlv1alpha1.MxlFlowLocationReady},
+			},
+		},
+	}
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, flow, pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	live := getMirror(t, c, m.Name)
+	assert.Equal(t, metav1.ConditionTrue,
+		condition(t, live, mxlv1alpha1.ConditionTypeClaimed).Status)
+	sourceable := condition(t, live, mxlv1alpha1.ConditionTypeSourceable)
+	require.NotNil(t, sourceable)
+	assert.Equal(t, metav1.ConditionFalse, sourceable.Status)
+	assert.Equal(t, mxlv1alpha1.ReasonOriginUnresolved, sourceable.Reason,
+		"no node claims to hold the flow, which is what a reclaimed "+
+			"producer node leaves once its location has been pruned; "+
+			"nothing is going to take that back")
+
+	backdate(t, c, m.Name, 2*time.Hour)
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name),
+		"a consumer that happens to still be running is not a reason to "+
+			"keep a mirror of a flow that has no producer left")
+}
+
+func TestSource_FlowGone_IsUnsourceable(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Nanosecond, m, pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// An expired lease says a node that still claims to hold the flow has
+// no agent renewing for it. That is a control-plane failure, and the
+// producer and both gateways may be fine and still delivering: an
+// agent stuck in CrashLoopBackOff produces exactly this. Collecting on
+// it would tear down a live transfer on the evidence of a component
+// that is not carrying it, so the condition reports the fault and the
+// mirror stays.
+func TestSource_EveryOriginLeaseExpired_IsReportedButNotCollected(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), pod("consumer", "uid-1"))
+	r.Lease = &fakeLease{fresh: map[string]bool{}}
+
+	reconcileOnce(t, r, m.Name)
+	sourceable := condition(t, getMirror(t, c, m.Name), mxlv1alpha1.ConditionTypeSourceable)
+	require.NotNil(t, sourceable)
+	assert.Equal(t, metav1.ConditionFalse, sourceable.Status)
+	assert.Equal(t, mxlv1alpha1.ReasonLeaseExpired, sourceable.Reason)
+
+	backdate(t, c, m.Name, 2*time.Hour)
+	reconcileOnce(t, r, m.Name)
+	assert.False(t, mirrorGone(t, c, m.Name),
+		"the grace period is not what decides this: no amount of waiting "+
+			"makes a lapsed lease evidence that the flow has no producer")
+}
+
+// A mirror that is both unclaimed and merely lease-stale is still
+// collected: nothing asks for it, whatever its source is doing.
+func TestSource_LeaseExpiredAndUnclaimed_IsStillCollected(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, flowOriginAt(srcNode))
+	r.Lease = &fakeLease{fresh: map[string]bool{}}
+
+	assert.True(t, collectedAfterHandover(t, r, c, m.Name))
+}
+
+// No gateway will ever open the writer: the DaemonSet pod that would
+// have done it died with the node. A departed node is the one signal
+// the platform already treats as terminal -- it is what separates a
+// departed node from a drained one -- so this does not wait.
+func TestSource_TargetNodeGone_CollectsAtOnce(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Spec.TargetNode = "reclaimed"
+	r, c := harness(t, time.Hour, m, flowOriginAt(srcNode), pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// The same at the other end. Nothing will publish on a node that has
+// left, so a mirror still sourcing from it is reporting a producer
+// that cannot exist, and waiting buys nothing while the fabric carries
+// a stream nobody can read.
+func TestSource_SourceNodeGone_CollectsAtOnce(t *testing.T) {
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+	}
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Spec.SourceNode = "reclaimed"
+	r, c := harness(t, time.Hour, m, flow, pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// outputSet is a redundancy set whose output is the mirrored flow's id.
+func outputSet() *mxlv1alpha1.MxlFlowRedundancySet {
+	s := set("set-uid")
+	s.Spec.Output = mxlv1alpha1.RedundancyFlowRef{FlowID: flowID}
+	return s
+}
+
+// staleFlow is the flow as the agent leaves it once its producer has
+// stopped: the location demoted, the object kept for the flow
+// controller to collect.
+func staleFlow() *mxlv1alpha1.MxlFlow {
+	f := flowOriginAt(srcNode)
+	f.Status.Locations[0].Phase = mxlv1alpha1.MxlFlowLocationStale
+	return f
+}
+
+// A producer handing its flow's id to a redundancy set stops writing it.
+// The mirror a reader elsewhere had of that flow then has no source, and
+// none will come back: the agents publish no flow of a set's output id.
+// Its writer on the target node keeps the gateway from building the
+// output there, so waiting the grace period out kept the output from
+// that node's readers for as long.
+func TestSource_IdTakenOverByARedundancySet_CollectsAtOnce(t *testing.T) {
+	for name, flow := range map[string]*mxlv1alpha1.MxlFlow{"flow left": staleFlow(), "flow collected": nil} {
+		t.Run(name, func(t *testing.T) {
+			m := newMirror(withRequestor("consumer", "uid-1"))
+			objs := []client.Object{m, pod("consumer", "uid-1"), outputSet()}
+			if flow != nil {
+				objs = append(objs, flow)
+			}
+			r, c := harness(t, time.Hour, objs...)
+			r.RedundancySets = true
+
+			reconcileOnce(t, r, m.Name)
+			assert.True(t, mirrorGone(t, c, m.Name), "a mirror of a set's output id waited for a producer")
+		})
+	}
+}
+
+// A set refused for a reason of its own serves nothing: collecting the
+// mirror for it would leave the id unserved once its producer restarts.
+// One refused only because a producer holds the id is the handover.
+func TestSource_IdOfASetRefusedForAnotherReason_WaitsTheGracePeriod(t *testing.T) {
+	for reason, collected := range map[string]bool{
+		"MemberInOtherDomain": false,
+		"MembersMisaligned":   false,
+		"OutputIsAFlow":       true,
+	} {
+		t.Run(reason, func(t *testing.T) {
+			s := outputSet()
+			s.Status.Conditions = []metav1.Condition{{
+				Type: mxlv1alpha1.ConditionTypeValid, Status: metav1.ConditionFalse, Reason: reason,
+			}}
+			m := newMirror(withRequestor("consumer", "uid-1"))
+			r, c := harness(t, time.Hour, m, staleFlow(), pod("consumer", "uid-1"), s)
+			r.RedundancySets = true
+
+			reconcileOnce(t, r, m.Name)
+			assert.Equal(t, collected, mirrorGone(t, c, m.Name))
+		})
+	}
+}
+
+// What the set must not take over: a producer still writing the id. Its
+// mirror stays, and so does one whose Origin's Lease lapsed, which an
+// agent that is down leaves while its producer writes on.
+func TestSource_IdOfARedundancySetStillProduced_IsKept(t *testing.T) {
+	for name, fresh := range map[string]map[string]bool{"lease renewed": nil, "lease lapsed": {}} {
+		t.Run(name, func(t *testing.T) {
+			m := newMirror(withRequestor("consumer", "uid-1"))
+			r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), pod("consumer", "uid-1"), outputSet())
+			r.RedundancySets = true
+			r.Lease = &fakeLease{fresh: fresh}
+
+			reconcileOnce(t, r, m.Name)
+			backdate(t, c, m.Name, time.Hour)
+			reconcileOnce(t, r, m.Name)
+			assert.False(t, mirrorGone(t, c, m.Name))
+		})
+	}
+}
+
+// Without redundancy sets no set is read, and a sourceless mirror waits
+// the grace period as any other.
+func TestSource_IdOfASetWithoutRedundancySets_WaitsTheGracePeriod(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, staleFlow(), pod("consumer", "uid-1"), outputSet())
+
+	res := reconcileOnce(t, r, m.Name)
+	assert.False(t, mirrorGone(t, c, m.Name))
+	assert.Greater(t, res.RequeueAfter, 59*time.Minute)
+}
+
+// A mirror that is wanted and sourceable is left alone however badly
+// it is doing. Degraded says grains are not moving, which is a
+// data-plane fault the gateway may still recover from -- collecting on
+// it would tear down a stream that was about to come back.
+func TestCollect_DegradedButJustified_IsLeftAlone(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Status.Phase = mxlv1alpha1.MxlFlowMirrorDegraded
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode), pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.False(t, mirrorGone(t, c, m.Name))
+}
+
+// --- repoint ---------------------------------------------------------
+
+// Mirror names do not encode the source node, so a mirror created
+// before the producer moved addresses the node it left for life. The
+// source gateway there opens a reader on a copy nothing writes to, and
+// reopening it -- the only recovery the data plane has -- yields
+// another reader on the same dead copy.
+func TestRepoint_OriginMoved_SpecFollowsIt(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, flowOriginAt("n-moved"),
+		pod("consumer", "uid-1"), node("n-moved"))
+
+	reconcileOnce(t, r, m.Name)
+
+	got := getMirror(t, c, m.Name)
+	assert.Equal(t, "n-moved", got.Spec.SourceNode)
+	assert.Equal(t, srcNode, got.Status.PreviousSourceNode)
+	assert.NotNil(t, got.Status.SourceRetargetedAt,
+		"a mirror briefly Degraded after its producer moves is converging "+
+			"and one Degraded with no recent retarget is not; without the "+
+			"timestamp the two look alike on the object")
+	assert.Equal(t, metav1.ConditionTrue,
+		condition(t, got, mxlv1alpha1.ConditionTypeSourceable).Status)
+}
+
+// Both creation paths land on the same object, so repointing has to
+// cover both. It used to live in the agent, which only looked at
+// mirrors targeting its own node and carrying no owner reference.
+func TestRepoint_CoversReceiverOwnedMirrorsToo(t *testing.T) {
+	m := newMirror(withReceiverOwner("recv", "recv-uid"))
+	r, c := harness(t, time.Hour, m, flowOriginAt("n-moved"),
+		receiver("recv", "recv-uid"), node("n-moved"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.Equal(t, "n-moved", getMirror(t, c, m.Name).Spec.SourceNode)
+}
+
+// The origin landing on the mirror's own target node makes the mirror
+// a transfer from a node to itself; the consumer reads the local copy
+// directly.
+func TestRepoint_OriginLandsOnTheTarget_MirrorIsDeleted(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, flowOriginAt(tgtNode), pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// --- finalizer -------------------------------------------------------
+
+// The finalizer an earlier collector added did nothing on deletion but
+// remove itself, so all it bought was a round trip and one more way
+// for a mirror to sit in Terminating while the operator was down.
+func TestLegacyIntentFinalizer_IsStripped(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Finalizers = []string{legacyIntentFinalizer}
+	r, c := harness(t, time.Hour, m, flowOriginAt(srcNode), pod("consumer", "uid-1"))
+
+	reconcileOnce(t, r, m.Name)
+	assert.NotContains(t, getMirror(t, c, m.Name).Finalizers, legacyIntentFinalizer)
+}
+
+func TestReconcile_DeletingMirror_IsLeftToTheGateway(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Finalizers = []string{"gateway.mxl.qvest-digital.com/target-side"}
+	now := metav1.Now()
+	m.DeletionTimestamp = &now
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode))
+
+	res := reconcileOnce(t, r, m.Name)
+	assert.Equal(t, ctrl.Result{}, res)
+	assert.False(t, mirrorGone(t, c, m.Name),
+		"the gateway finalizers own the teardown; nothing this controller "+
+			"decides applies to an object already on its way out")
+}
+
+func TestReconcile_MissingMirror_NoError(t *testing.T) {
+	r, _ := harness(t, time.Hour)
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: "absent"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, res)
+}
+
+// --- watches ---------------------------------------------------------
+
+func TestWatches_EnqueueTheMirrorsEachInputAffects(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"),
+		withReceiverOwner("recv", "recv-uid"))
+	r, _ := harness(t, time.Hour, m, flowOriginAt(srcNode))
+	ctx := context.Background()
+
+	assert.Len(t, r.podToMirrors(ctx, pod("consumer", "uid-1")), 1)
+	assert.Empty(t, r.podToMirrors(ctx, pod("other", "uid-9")))
+
+	assert.Len(t, r.receiverToMirrors(ctx, receiver("recv", "recv-uid")), 1)
+	assert.Empty(t, r.receiverToMirrors(ctx, receiver("recv", "different-uid")))
+
+	assert.Len(t, r.flowToMirrors(ctx, flowOriginAt(srcNode)), 1)
+
+	lease := &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{
+		Namespace: mxlv1alpha1.LeaseNamespace,
+		Name:      mxlv1alpha1.LeaseName(flowID, srcNode),
+	}}
+	assert.Len(t, r.leaseToMirrors(ctx, lease), 1)
+	lease.Name = "kube-controller-manager"
+	assert.Empty(t, r.leaseToMirrors(ctx, lease))
+
+	assert.Len(t, r.nodeToMirrors(ctx, node(tgtNode)), 1)
+	assert.Len(t, r.nodeToMirrors(ctx, node(srcNode)), 1)
+	assert.Empty(t, r.nodeToMirrors(ctx, node("unrelated")))
+}
+
+// A set leaving a node changes nothing on its member mirrors there, so
+// only a watch on the set brings them back to be collected.
+func TestWatches_EnqueueTheMirrorsASetOwns(t *testing.T) {
+	m := newMirror(withSetOwner("programme", "set-uid"))
+	other := newMirror(withRequestor("consumer", "uid-1"))
+	other.Name = "m2"
+	r, _ := harness(t, time.Hour, m, other)
+	ctx := context.Background()
+
+	got := r.setToMirrors(ctx, set("set-uid"))
+	require.Len(t, got, 1)
+	assert.Equal(t, m.Name, got[0].Name)
+	assert.Empty(t, r.setToMirrors(ctx, set("new-uid")), "a set recreated under the name owns nothing")
+}
+
+// A set naming a flow's id as its output changes nothing on the mirrors
+// of that flow, so only the watch on the set has them judged again.
+func TestWatches_EnqueueTheMirrorsOfASetsOutput(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, _ := harness(t, time.Hour, m)
+
+	got := r.setToMirrors(context.Background(), outputSet())
+	require.Len(t, got, 1)
+	assert.Equal(t, m.Name, got[0].Name)
+}
+
+func TestPodPredicate_DenyKubeSystem(t *testing.T) {
+	p := podLifecyclePredicate()
+	sys := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "p"}}
+	app := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "p"}}
+
+	assert.False(t, p.Create(event.CreateEvent{Object: sys}))
+	assert.True(t, p.Create(event.CreateEvent{Object: app}))
+	assert.False(t, p.Delete(event.DeleteEvent{Object: sys}))
+	assert.True(t, p.Delete(event.DeleteEvent{Object: app}))
+	assert.False(t, p.Generic(event.GenericEvent{Object: app}))
+
+	same := app.DeepCopy()
+	assert.False(t, p.Update(event.UpdateEvent{ObjectOld: app, ObjectNew: same}),
+		"a status tick is not a change of claim")
+	replaced := app.DeepCopy()
+	replaced.UID = "different"
+	assert.True(t, p.Update(event.UpdateEvent{ObjectOld: app, ObjectNew: replaced}))
+}
+
+func TestNodeDeletedOnly_AcceptsDeletesOnly(t *testing.T) {
+	p := nodeDeletedOnly()
+	n := node(tgtNode)
+	assert.False(t, p.Create(event.CreateEvent{Object: n}))
+	assert.False(t, p.Update(event.UpdateEvent{ObjectOld: n, ObjectNew: n}))
+	assert.False(t, p.Generic(event.GenericEvent{Object: n}))
+	assert.True(t, p.Delete(event.DeleteEvent{Object: n}))
+}
+
+// The grace measures from the Sourceable condition alone; the claim
+// half does not wait at all.
+func TestUnsourceableSince_ReadsTheSourceableCondition(t *testing.T) {
+	when := metav1.NewTime(time.Now().Add(-time.Hour))
+	m := newMirror()
+	m.Status.Conditions = []metav1.Condition{
+		{Type: mxlv1alpha1.ConditionTypeClaimed, LastTransitionTime: metav1.Now()},
+		{Type: mxlv1alpha1.ConditionTypeSourceable, LastTransitionTime: when},
+	}
+	assert.Equal(t, when.Time, unsourceableSince(m))
+}
+
+// A mirror this operator has not written conditions onto yet gets a
+// full grace period rather than being collected on sight, so an
+// upgrade does not reap every collectable mirror at once.
+func TestUnsourceableSince_NoConditionYetCountsAsJustTurned(t *testing.T) {
+	assert.WithinDuration(t, time.Now(), unsourceableSince(newMirror()), time.Second)
+}
+
+// --- review-driven regressions ---------------------------------------
+
+// The delete is preconditioned on the version the judgement was taken
+// against, and the condition write that precedes it moves that version
+// on. Returning the pre-apply one made every precondition fail as a
+// conflict, which is silently tolerated, so nothing was ever
+// collected -- the whole change set, disabled by one stale field.
+func TestCollect_DeleteUsesTheVersionTheConditionWriteProduced(t *testing.T) {
+	m := newMirror()
+	r, c := harness(t, time.Nanosecond, m, flowOriginAt(srcNode))
+
+	reconcileOnce(t, r, m.Name)
+	assert.True(t, mirrorGone(t, c, m.Name))
+}
+
+// A write that lands between the judgement and the delete makes the
+// precondition fail, and the requeue judges the mirror again against
+// what it now says.
+func TestCollect_StaleReadDoesNotDeleteOnAMovedResourceVersion(t *testing.T) {
+	// A flow with no Origin while both nodes are still in the cluster:
+	// a producer that may be restarting, so the mirror waits and can
+	// be read back.
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+	}
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	r, c := harness(t, time.Hour, m, flow, pod("consumer", "uid-1"))
+	reconcileOnce(t, r, m.Name)
+	backdate(t, c, m.Name, 2*time.Hour)
+
+	stale := getMirror(t, c, m.Name)
+
+	// Somebody writes, moving the resourceVersion on.
+	live := getMirror(t, c, m.Name)
+	live.Status.Phase = mxlv1alpha1.MxlFlowMirrorReady
+	require.NoError(t, c.Status().Update(context.Background(), live))
+
+	require.NoError(t, r.delete(context.Background(), stale,
+		ReasonMirrorCollected, "Collected: %s", "test"))
+	assert.False(t, mirrorGone(t, c, m.Name),
+		"deleting on a stale read would drop a mirror whose judgement had "+
+			"already moved on")
+}
+
+// Whoever created the mirror may have pinned the provider -- the
+// agent's --provider flag forces one cluster-wide, a receiver's
+// spec.provider per consumer -- and neither is recorded anywhere this
+// controller can read. Re-resolving on every move would silently
+// overrule that on the first origin change.
+func TestRepoint_KeepsAProviderBothNodesStillSpeak(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Spec.Provider = mxlv1alpha1.ProviderTCP
+	r, c := harness(t, time.Hour, m, flowOriginAt("n-moved"),
+		pod("consumer", "uid-1"), node("n-moved"),
+		capsFor("n-moved", mxlv1alpha1.ProviderTCP, mxlv1alpha1.ProviderVerbs),
+		capsFor(tgtNode, mxlv1alpha1.ProviderTCP, mxlv1alpha1.ProviderVerbs))
+
+	reconcileOnce(t, r, m.Name)
+
+	got := getMirror(t, c, m.Name)
+	assert.Equal(t, "n-moved", got.Spec.SourceNode)
+	assert.Equal(t, mxlv1alpha1.ProviderTCP, got.Spec.Provider,
+		"both nodes speak tcp, so the recorded choice still works and "+
+			"nothing here knows better than whoever made it")
+}
+
+// A move onto a node that does not speak it is the case where
+// overruling is the only option: a mirror asking for a provider one of
+// its ends cannot build never comes up.
+func TestRepoint_ReresolvesAProviderTheNewSourceCannotSpeak(t *testing.T) {
+	m := newMirror(withRequestor("consumer", "uid-1"))
+	m.Spec.Provider = mxlv1alpha1.ProviderVerbs
+	r, c := harness(t, time.Hour, m, flowOriginAt("n-moved"),
+		pod("consumer", "uid-1"), node("n-moved"),
+		capsFor("n-moved", mxlv1alpha1.ProviderTCP),
+		capsFor(tgtNode, mxlv1alpha1.ProviderTCP, mxlv1alpha1.ProviderVerbs))
+
+	reconcileOnce(t, r, m.Name)
+	assert.Equal(t, mxlv1alpha1.ProviderTCP, getMirror(t, c, m.Name).Spec.Provider)
+}
+
+// capsFor is the MxlNodeCapabilities a probed gateway publishes for a
+// node that found a device for each named provider.
+func capsFor(node string, providers ...mxlv1alpha1.MxlFabricsProvider) *mxlv1alpha1.MxlNodeCapabilities {
+	caps := &mxlv1alpha1.MxlNodeCapabilities{
+		ObjectMeta: metav1.ObjectMeta{Name: node},
+		Status: mxlv1alpha1.MxlNodeCapabilitiesStatus{
+			Conditions: []metav1.Condition{{
+				Type:               mxlv1alpha1.ConditionTypeProbed,
+				Status:             metav1.ConditionTrue,
+				Reason:             mxlv1alpha1.ReasonProbeComplete,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+	for _, p := range providers {
+		caps.Status.Providers = append(caps.Status.Providers,
+			mxlv1alpha1.MxlFabricsProviderCapability{Name: p, DeviceCount: 1})
+	}
+	return caps
+}
+
+// --- status writes ---------------------------------------------------
+
+// Every gateway status write is an event that reconciles the mirror
+// here. An apply that restates conditions the mirror already carries
+// is not free: the apiserver decodes and merges the whole stored
+// object, descriptor included, to find nothing changed. Only a pass
+// whose answer moved may write.
+func TestWriteConditions_UnchangedJudgement_SendsNoApply(t *testing.T) {
+	m := newMirror(withIntentLabel(), withRequestor("consumer", "uid-1"))
+	applies := 0
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}, &mxlv1alpha1.MxlFlow{}).
+		WithObjects(node(srcNode), node(tgtNode), m, flowOriginAt(srcNode), pod("consumer", "uid-1")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if _, ok := obj.(*unstructured.Unstructured); ok && patch.Type() == types.ApplyPatchType {
+					applies++
+				}
+				return cl.SubResource(sub).Patch(ctx, obj, patch, opts...)
+			},
+		}).
+		Build()
+	lease := &fakeLease{fresh: map[string]bool{flowID + "/" + srcNode: true}}
+	r := &Reconciler{Client: c, Recorder: record.NewFakeRecorder(32), Lease: lease, GracePeriod: time.Hour}
+
+	reconcileOnce(t, r, m.Name)
+	require.Equal(t, 1, applies, "the first pass has conditions to publish")
+	first := getMirror(t, c, m.Name)
+
+	reconcileOnce(t, r, m.Name)
+	reconcileOnce(t, r, m.Name)
+	assert.Equal(t, 1, applies, "passes that reach the same judgement must not write")
+	assert.Equal(t, first.ResourceVersion, getMirror(t, c, m.Name).ResourceVersion)
+
+	lease.fresh[flowID+"/"+srcNode] = false
+	reconcileOnce(t, r, m.Name)
+	assert.Equal(t, 2, applies, "a changed judgement is written")
+	src := condition(t, getMirror(t, c, m.Name), mxlv1alpha1.ConditionTypeSourceable)
+	require.NotNil(t, src)
+	assert.Equal(t, metav1.ConditionFalse, src.Status)
+}
+
+// The skip compares every field the apply would write except the
+// transition time. A judgement that differs from what the mirror carries
+// only in its message, or only in the generation it was made against,
+// is written all the same.
+func TestWriteConditions_MessageOrGenerationAloneStillApplies(t *testing.T) {
+	claimed := judgement{ok: true, reason: mxlv1alpha1.ReasonRequestorLive, message: "consumer is live"}
+	src := sourceJudgement{judgement: judgement{ok: true, reason: "OriginLive", message: "origin on n-src"}}
+	current := func(gen int64) []metav1.Condition {
+		return []metav1.Condition{
+			{Type: mxlv1alpha1.ConditionTypeClaimed, Status: metav1.ConditionTrue, Reason: claimed.reason,
+				Message: claimed.message, ObservedGeneration: gen, LastTransitionTime: metav1.Now()},
+			{Type: mxlv1alpha1.ConditionTypeSourceable, Status: metav1.ConditionTrue, Reason: src.reason,
+				Message: src.message, ObservedGeneration: gen, LastTransitionTime: metav1.Now()},
+		}
+	}
+	cases := map[string]struct {
+		gen     int64
+		claimed judgement
+		want    int
+	}{
+		"unchanged":               {gen: 1, claimed: claimed, want: 0},
+		"message only":            {gen: 1, claimed: judgement{ok: true, reason: claimed.reason, message: "another consumer is live"}, want: 1},
+		"observedGeneration only": {gen: 2, claimed: claimed, want: 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := newMirror()
+			m.Generation = tc.gen
+			m.Status.Conditions = current(1)
+			applies := 0
+			c := fake.NewClientBuilder().
+				WithScheme(newScheme(t)).
+				WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+				WithObjects(m).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: func(ctx context.Context, cl client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+						applies++
+						return cl.SubResource(sub).Patch(ctx, obj, patch, opts...)
+					},
+				}).
+				Build()
+			r := &Reconciler{Client: c}
+			_, err := r.writeConditions(context.Background(), m, tc.claimed, src)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, applies)
+		})
+	}
+}
+
+// Mirror heartbeat Leases share the Origin Leases' namespace and renew
+// every few seconds per mirror side. None of them bears on a mirror's
+// judgement, so the Lease watch leaves them out.
+func TestLeasePredicate_IgnoresMirrorHeartbeats(t *testing.T) {
+	p := leaseInMxlSystem()
+	origin := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Namespace: mxlv1alpha1.LeaseNamespace, Name: mxlv1alpha1.LeaseName(flowID, srcNode)}}
+	beat := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Namespace: mxlv1alpha1.LeaseNamespace,
+		Name:      mxlv1alpha1.MirrorLeaseName(testNS, "m1", mxlv1alpha1.MirrorSideSource),
+		Labels:    map[string]string{mxlv1alpha1.LabelMirrorSide: string(mxlv1alpha1.MirrorSideSource)}}}
+	assert.True(t, p.Update(event.UpdateEvent{ObjectOld: origin, ObjectNew: origin}))
+	assert.False(t, p.Update(event.UpdateEvent{ObjectOld: beat, ObjectNew: beat}))
+}

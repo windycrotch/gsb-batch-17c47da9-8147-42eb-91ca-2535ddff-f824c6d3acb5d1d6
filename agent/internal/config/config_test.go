@@ -1,0 +1,308 @@
+package config
+
+import (
+	"flag"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// FromFlags parses CLI args, falls back to env vars for NodeName and
+// Kubeconfig, and finally calls Validate. The tests pin defaults
+// (because the operator uses them to derive cluster-wide
+// readiness expectations) and every Validate rejection path.
+
+func TestFromFlags_DefaultsAndRequiredFields(t *testing.T) {
+	t.Setenv("NODE_NAME", "")
+	t.Setenv("KUBECONFIG", "")
+
+	_, err := FromFlags(flag.NewFlagSet("agent", flag.ContinueOnError), nil)
+	require.Error(t, err,
+		"FromFlags must reject an empty args set; --domain-path has no default")
+	assert.Contains(t, err.Error(), "--domain-path")
+}
+
+func TestFromFlags_DefaultsFireWhenArgsProvided(t *testing.T) {
+	t.Setenv("NODE_NAME", "")
+	t.Setenv("KUBECONFIG", "")
+
+	c, err := FromFlags(flag.NewFlagSet("agent", flag.ContinueOnError),
+		[]string{"--domain-path=/run/mxl/domain", "--node-name=n1"})
+	require.NoError(t, err)
+	assert.Equal(t, "/run/mxl/domain", c.DomainPath)
+	assert.Equal(t, "n1", c.NodeName)
+	assert.Equal(t, ":8081", c.ProbeAddr,
+		"probe address default must stay :8081 because the chart's "+
+			"liveness/readiness probes target that port; flipping it "+
+			"silently disables every pod's probes on upgrade")
+	assert.Equal(t, ":8080", c.MetricsAddr)
+	assert.Equal(t, 30*time.Second, c.ResyncPeriod)
+	assert.Equal(t, 5*time.Minute, c.ObservedRefreshInterval,
+		"every lastObserved stamp is a write of the whole MxlFlow status; "+
+			"at the 30s rescan it was the largest source of MxlFlow writes")
+	assert.Equal(t, "/run/mxl/agent.sock", c.IntentSocketPath)
+	assert.Equal(t, "/run/mxl/libmxl-intent.so", c.ShimPath,
+		"consumer pods hardcode this path in LD_PRELOAD; moving it "+
+			"breaks every pod that preloads the node-delivered shim")
+	assert.Equal(t, 5*time.Second, c.MaterializeTimeout)
+	assert.Equal(t, 50.0, c.KubeAPIQPS,
+		"client-go's 5 QPS fallback queues status publishes behind "+
+			"second-long delays during flow appear/vanish bursts; the "+
+			"default must stay well above that")
+	assert.Equal(t, 100, c.KubeAPIBurst)
+	assert.Equal(t, 50.0, c.IntentAPIQPS,
+		"the intent client serves every on-demand mirror; below the main "+
+			"client's rate a production's readers starting at once would get "+
+			"their mirrors later than before the split")
+	assert.Equal(t, 100, c.IntentAPIBurst)
+	assert.Equal(t, 64, c.IntentMirrorsPerPod,
+		"an on-demand mirror lives as long as its pod, so this caps what a "+
+			"long-lived reader that switches flows accumulates, not a glob")
+	assert.Equal(t, 128, c.IntentMirrorsPerNode)
+	assert.Equal(t, 8, c.IntentMirrorBurst,
+		"a glob over the domain opens every flow at once; without a burst "+
+			"limit each open becomes a mirror onto the node")
+	assert.Equal(t, 10*time.Second, c.IntentMirrorBurstWindow)
+}
+
+func TestFromFlags_IntentMirrorLimits(t *testing.T) {
+	t.Setenv("NODE_NAME", "")
+	base := []string{"--domain-path=/run/mxl/domain", "--node-name=n1"}
+	parse := func(extra ...string) (*Config, error) {
+		return FromFlags(flag.NewFlagSet("agent", flag.ContinueOnError), append(base, extra...))
+	}
+
+	c, err := parse("--intent-mirrors-per-pod=0", "--intent-mirrors-per-node=0",
+		"--intent-mirror-burst=0", "--intent-mirror-burst-window=0")
+	require.NoError(t, err, "0 turns every limit off")
+	assert.Zero(t, c.IntentMirrorBurst)
+
+	_, err = parse("--intent-mirrors-per-pod=-1")
+	require.Error(t, err)
+	_, err = parse("--intent-mirror-burst=4", "--intent-mirror-burst-window=0")
+	require.ErrorContains(t, err, "--intent-mirror-burst-window must be positive",
+		"a burst with no window would count nothing and refuse nothing")
+}
+
+func TestFromFlags_OverridesAreRespected(t *testing.T) {
+	t.Setenv("NODE_NAME", "")
+	t.Setenv("KUBECONFIG", "")
+
+	c, err := FromFlags(flag.NewFlagSet("agent", flag.ContinueOnError), []string{
+		"--domain-path=/data/mxl",
+		"--node-name=worker-7",
+		"--kubeconfig=/etc/kube",
+		"--health-probe-bind-address=:9081",
+		"--metrics-bind-address=:9080",
+		"--resync-period=15s",
+		"--observed-refresh-interval=90s",
+		"--intent-socket=/tmp/mxl.sock",
+		"--shim-path=/tmp/libmxl-intent.so",
+		"--materialize-timeout=2s",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/data/mxl", c.DomainPath)
+	assert.Equal(t, "worker-7", c.NodeName)
+	assert.Equal(t, "/etc/kube", c.Kubeconfig)
+	assert.Equal(t, ":9081", c.ProbeAddr)
+	assert.Equal(t, ":9080", c.MetricsAddr)
+	assert.Equal(t, 15*time.Second, c.ResyncPeriod)
+	assert.Equal(t, 90*time.Second, c.ObservedRefreshInterval)
+	assert.Equal(t, "/tmp/mxl.sock", c.IntentSocketPath)
+	assert.Equal(t, "/tmp/libmxl-intent.so", c.ShimPath)
+	assert.Equal(t, 2*time.Second, c.MaterializeTimeout)
+}
+
+func TestFromFlags_NodeNameFallsBackToEnv(t *testing.T) {
+	t.Setenv("NODE_NAME", "from-env")
+	t.Setenv("KUBECONFIG", "/some/path")
+
+	c, err := FromFlags(flag.NewFlagSet("agent", flag.ContinueOnError),
+		[]string{"--domain-path=/run/mxl/domain"})
+	require.NoError(t, err)
+	assert.Equal(t, "from-env", c.NodeName)
+	assert.Equal(t, "/some/path", c.Kubeconfig,
+		"downward-API env vars must be picked up; missing them on a "+
+			"production node would make the agent fail to look itself up")
+}
+
+func TestValidate(t *testing.T) {
+	cases := []struct {
+		name    string
+		c       Config
+		wantErr string
+	}{
+		{
+			name:    "missing domain path",
+			c:       Config{NodeName: "n1"},
+			wantErr: "--domain-path is required",
+		},
+		{
+			name:    "relative domain path",
+			c:       Config{DomainPath: "run/mxl/domain", NodeName: "n1"},
+			wantErr: "must be absolute",
+		},
+		{
+			// The primary would also be a domain at domains/<id>, and
+			// be tracked and mirrored under two names.
+			name:    "domain path inside domains/",
+			c:       Config{DomainPath: "/run/mxl/domains/0e1f", NodeName: "n1"},
+			wantErr: "must not be inside domains/",
+		},
+		{
+			name:    "missing node name",
+			c:       Config{DomainPath: "/run/mxl/domain"},
+			wantErr: "--node-name",
+		},
+		{
+			name:    "negative observed refresh interval",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: -time.Second},
+			wantErr: "--observed-refresh-interval must be positive",
+		},
+		{
+			// The publisher reads zero as its 5m default, so a zero
+			// passed through would quietly mean something else.
+			name:    "zero observed refresh interval",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100},
+			wantErr: "--observed-refresh-interval must be positive",
+		},
+		{
+			name:    "valid",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			name:    "explicit provider override",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", Provider: "verbs", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			name:    "auto provider is accepted (resolves per node)",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", Provider: "auto", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			name:    "zero qps rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--kube-api-qps",
+		},
+		{
+			name:    "zero intent qps rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--intent-api-qps",
+		},
+		{
+			name:    "zero intent burst rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50},
+			wantErr: "--intent-api-burst",
+		},
+		{
+			name:    "zero burst rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--kube-api-burst",
+		},
+		{
+			name:    "relative shim path rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", ShimPath: "libmxl-intent.so", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--shim-path must be absolute",
+		},
+		{
+			name:    "empty shim path disables the drop",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			name:    "huge=always passes",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", MxlfsHuge: "always", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			// tmpfs's never and advise are values mxlfs refuses.
+			name:    "a huge= value mxlfs does not have is rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", MxlfsHuge: "never", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--mxlfs-huge",
+		},
+		{
+			name:    "a NUMA node passes",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", MxlfsNumaNodeDefault: "1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			name:    "numa node auto passes",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", MxlfsNumaNodeDefault: "auto", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "",
+		},
+		{
+			name:    "a negative NUMA node is rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", MxlfsNumaNodeDefault: "-1", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--mxlfs-numa-placement-node-default",
+		},
+		{
+			name:    "a NUMA node that is no number is rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", MxlfsNumaNodeDefault: "near", KubeAPIQPS: 50, KubeAPIBurst: 100, IntentAPIQPS: 50, IntentAPIBurst: 100, ObservedRefreshInterval: time.Minute},
+			wantErr: "--mxlfs-numa-placement-node-default",
+		},
+		{
+			name:    "unknown provider rejected",
+			c:       Config{DomainPath: "/run/mxl/domain", NodeName: "n1", Provider: "rdma"},
+			wantErr: "--provider",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.c.Validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// Every mode with its settings, and what each refuses.
+func TestNumaPlacementFlags(t *testing.T) {
+	base := []string{"--domain-path=/run/mxl/domain", "--node-name=n1", "--mxlfs"}
+	for _, tc := range []struct {
+		args     []string
+		mode     string
+		node     string
+		flowDflt string
+		rate     uint64
+		wantErr  string
+	}{
+		{args: nil, mode: NumaOff, node: "auto", flowDflt: "local"},
+		{args: []string{"--mxlfs-numa-placement-mode=node"}, mode: NumaNode, node: "auto", flowDflt: "local"},
+		{args: []string{"--mxlfs-numa-placement-mode=node", "--mxlfs-numa-placement-node-default=1"},
+			mode: NumaNode, node: "1", flowDflt: "local"},
+		{args: []string{"--mxlfs-numa-placement-mode=flow"}, mode: NumaFlow, node: "auto", flowDflt: "local", rate: 512 << 20},
+		{args: []string{"--mxlfs-numa-placement-mode=flow", "--mxlfs-numa-placement-flow-default=nic",
+			"--mxlfs-numa-placement-flow-release-rate=1Gi"}, mode: NumaFlow, node: "auto", flowDflt: "nic", rate: 1 << 30},
+		{args: []string{"--mxlfs-numa-placement-mode=flow", "--mxlfs-numa-placement-flow-default=far"}, wantErr: "nic, local"},
+		{args: []string{"--mxlfs-numa-placement-mode=flow", "--mxlfs-numa-placement-flow-release-rate=0"}, wantErr: "positive quantity"},
+		{args: []string{"--mxlfs-numa-placement-mode=flow", "--mxlfs-numa-placement-flow-release-period=0s"}, wantErr: "period"},
+		{args: []string{"--mxlfs-numa-placement-mode=numa"}, wantErr: "off, node, flow"},
+		{args: []string{"--mxlfs-numa-placement-node-default=none"}, wantErr: "NUMA node or auto"},
+		{args: []string{"--mxlfs-numa-node=auto"}, wantErr: "flag provided but not defined"},
+	} {
+		c, err := FromFlags(flag.NewFlagSet("t", flag.ContinueOnError), append(append([]string{}, base...), tc.args...))
+		if tc.wantErr != "" {
+			require.ErrorContains(t, err, tc.wantErr, "%v", tc.args)
+			continue
+		}
+		require.NoError(t, err, "%v", tc.args)
+		require.Equal(t, tc.mode, c.MxlfsNumaMode, "%v", tc.args)
+		require.Equal(t, tc.node, c.MxlfsNumaNodeDefault, "%v", tc.args)
+		require.Equal(t, tc.flowDflt, c.MxlfsNumaFlowDefault, "%v", tc.args)
+		if tc.mode == NumaFlow {
+			require.Equal(t, tc.rate, c.ReleaseRate(), "%v", tc.args)
+		}
+	}
+	_, err := FromFlags(flag.NewFlagSet("t", flag.ContinueOnError),
+		[]string{"--domain-path=/run/mxl/domain", "--node-name=n1", "--mxlfs-numa-placement-mode=flow"})
+	require.ErrorContains(t, err, "needs --mxlfs")
+}

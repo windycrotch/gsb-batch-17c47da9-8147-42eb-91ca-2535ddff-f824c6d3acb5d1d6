@@ -1,0 +1,88 @@
+{{- if and .Values.operator.enabled .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "mxlk8s.serviceAccountName" (dict "Context" . "component" "operator" "values" .Values.operator) }}
+  labels:
+    {{- include "mxlk8s.componentLabels" (dict "Context" . "component" "operator") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  # Pruning MxlFlow locations whose node has left the cluster needs
+  # to see which nodes still exist, and to hear about departures.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  # delete collects an origin Lease once it is expired and either the
+  # node that holds it or the flow it names is gone. The agent that
+  # wrote it is the only other thing that deletes one, and a node
+  # removed from the cluster takes its agent with it.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [delete, get, list, watch]
+  # delete removes an MxlDomain left in the per-node shape the
+  # resource had before it described a domain.
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxldomains]
+    verbs: [get, list, watch, delete]
+  # delete removes the capabilities of a node that has left, for the
+  # ones carrying no owner reference to be collected by.
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlnodecapabilities]
+    verbs: [delete, get, list, watch]
+  # delete collects a flow once it has read Live=False for longer than
+  # the grace period: no origin holding a renewed lease, and no mirror
+  # referencing it.
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflows]
+    verbs: [delete, get, list, watch]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlnodecapabilities/status]
+    verbs: [get]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxldomains/status]
+    verbs: [get, update, patch]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflows/status]
+    verbs: [get, patch, update]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflowmirrors]
+    verbs: [create, delete, get, list, patch, update, watch]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflowmirrors/finalizers, mxlreceivers/finalizers]
+    verbs: [update]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflowmirrors/status, mxlreceivers/status]
+    verbs: [get, patch, update]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlreceivers]
+    verbs: [get, list, patch, update, watch]
+  {{- if .Values.mxlfs.enabled }}
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflowredundancysets]
+    verbs: [get, list, watch]
+  - apiGroups: [mxl.qvest-digital.com]
+    resources: [mxlflowredundancysets/status]
+    verbs: [get, patch, update]
+  {{- end }}
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "mxlk8s.serviceAccountName" (dict "Context" . "component" "operator" "values" .Values.operator) }}
+  labels:
+    {{- include "mxlk8s.componentLabels" (dict "Context" . "component" "operator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "mxlk8s.serviceAccountName" (dict "Context" . "component" "operator" "values" .Values.operator) }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "mxlk8s.serviceAccountName" (dict "Context" . "component" "operator" "values" .Values.operator) }}
+    namespace: {{ include "mxlk8s.namespace" . }}
+{{- end }}

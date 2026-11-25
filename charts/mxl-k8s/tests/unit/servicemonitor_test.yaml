@@ -1,0 +1,49 @@
+suite: servicemonitor
+templates:
+  - templates/servicemonitor-operator.yaml
+  - templates/servicemonitor-agent.yaml
+  - templates/servicemonitor-gateway.yaml
+tests:
+  - it: no ServiceMonitor by default (Prometheus Operator stays optional)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: operator ServiceMonitor renders when toggled
+    set:
+      operator.metrics.serviceMonitor.enabled: true
+    template: templates/servicemonitor-operator.yaml
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - equal:
+          path: spec.endpoints[0].interval
+          value: 30s
+
+  - it: extra labels on the ServiceMonitor land on the resource
+    set:
+      gateway.metrics.serviceMonitor.enabled: true
+      gateway.metrics.serviceMonitor.labels:
+        release: prometheus-stack
+    template: templates/servicemonitor-gateway.yaml
+    asserts:
+      - equal:
+          path: metadata.labels.release
+          value: prometheus-stack
+
+  - it: gateway series carry the variant of their pod
+    set:
+      gateway.metrics.serviceMonitor.enabled: true
+      gateway.metrics.serviceMonitor.relabelings:
+        - targetLabel: cluster
+          replacement: c1
+    template: templates/servicemonitor-gateway.yaml
+    asserts:
+      - equal:
+          path: spec.endpoints[0].relabelings[0]
+          value:
+            sourceLabels: [__meta_kubernetes_pod_label_mxl_qvest_digital_com_gateway_variant]
+            targetLabel: variant
+      - equal:
+          path: spec.endpoints[0].relabelings[1].targetLabel
+          value: cluster

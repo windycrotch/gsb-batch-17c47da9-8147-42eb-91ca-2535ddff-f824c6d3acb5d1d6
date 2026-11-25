@@ -1,0 +1,235 @@
+# mxl-k8s
+
+Kubernetes control plane for [MXL][mxl]. mxl-k8s is the
+cluster-side complement to [`dmf-mxl`][mxl]: it links upstream
+`libmxl` and `libmxl-fabrics` and turns MXL's cross-node transport
+into a cluster feature so individual media functions don't have to
+carry it themselves.
+
+## Why
+
+MXL gives media functions intra-node, zero-copy flow exchange
+on tmpfs. The moment two functions land on different machines,
+crossing the wire is a separate stack: discover where the flow
+lives, open a libmxl-fabrics Target on the consumer node, run
+an Initiator on the producer node, exchange addresses and
+memory keys, register memory regions, drive a transfer loop,
+recover from drops. That is a lot to ask of a function whose
+job is to produce or consume grains.
+
+mxl-k8s lifts that stack into the cluster. A producer or
+consumer pod keeps the same shape it has on a single node: it
+reads or writes against its local `/run/mxl/domain` and never
+mentions libmxl-fabrics. The cluster makes sure the flow shows
+up there.
+
+## How
+
+![System context](docs/architecture/diagrams/01-system-context.drawio.svg)
+
+Four pieces, all running inside the cluster:
+
+- A per-node **agent** DaemonSet watches `/run/mxl/domain` via
+  `fanotify` and publishes each flow on the Kubernetes API.
+- A per-node **gateway** DaemonSet owns the libmxl-fabrics
+  handles: FlowReader on producer nodes, FlowWriter on consumer
+  nodes, Initiator/Target on the fabric, and the per-grain
+  transfer loop.
+- A cluster-scoped **operator** reconciles `MxlReceiver` intent
+  ("this pod wants to consume that flow") into one
+  `MxlFlowMirror` per (flow, target-node). Multiple consumers on
+  the same node share a single mirror; the share is refcounted
+  through the mirror's `metadata.ownerReferences`, so removing
+  one consumer leaves the mirror in place for the others and the
+  operator tears the mirror down only when the last owner ref is
+  gone.
+- An **LD_PRELOAD shim** in consumer pods turns the first
+  libmxl probe (`access`, `stat`, `open`, ...) for a not-yet-
+  materialised flow into a synchronous wait on the local agent.
+  Consumer code calls `mxlCreateFlowReader` the same way it does
+  on a single node.
+
+The CRDs (`MxlFlow`, `MxlReceiver`, `MxlFlowMirror`,
+`MxlDomain`, `MxlNodeCapabilities`) describe flows, who wants
+them, and what each node can carry.
+
+For the full architecture walkthrough (per-node anatomy,
+control-plane and data-plane sequences, lifecycle diagrams) see
+[`docs/architecture/`](docs/architecture/).
+
+## Scope
+
+mxl-k8s lives in the Media Exchange row of the
+[EBU Dynamic Media Facility Reference Architecture (V2.0,
+April 2026)](https://tech.ebu.ch/publications/white-paper-2026-04-15).
+It covers the cross-node flow lifecycle: discovery and
+registration, the per-mirror libmxl-fabrics handshake, and recovery
+on writer or gateway restarts. Container orchestration, identity, and
+per-function on-node behaviour stay with Kubernetes, the cluster's
+identity provider, and upstream `dmf-mxl` respectively.
+
+![DMF coverage map](docs/diagrams/dmf-coverage.drawio.svg)
+
+`libmxl` and `libmxl-fabrics` are linked from
+[`dmf-mxl/mxl`](https://github.com/dmf-mxl/mxl) through the
+[`go-mxl`](https://github.com/qvest-digital/go-mxl) bindings.
+FlowReader / FlowWriter semantics, grain layout, and the shape
+of `flow_def.json` remain upstream's design; mxl-k8s is the
+cluster orchestration around them.
+
+See [`ROADMAP.md`](ROADMAP.md) for the feature roadmap.
+
+## What you do not have to write
+
+For media-function authors:
+
+- No `libmxl-fabrics` link, no `libfabric` link, no headers.
+- No TargetInfo handshake, no memory-region registration, no
+  per-grain transfer loop.
+- No provider choice at code time. The fabric provider
+  (`tcp`, `verbs`, `efa`, `shm`) is a YAML knob on the
+  `MxlReceiver`.
+- No reconnect path for producer or consumer restarts. The
+  gateway rebuilds the fabric side and republishes the new
+  address on its own; the function keeps reading from its local
+  domain.
+
+For cluster operators:
+
+- One DaemonSet per node owns the fabric. Bandwidth scaling and
+  failure isolation follow the standard Kubernetes affordances.
+- Provider rollout and host-side prerequisites
+  (`/dev/infiniband`, `IPC_LOCK`, RoCEv2 PFC/DSCP, EFA AMI
+  configuration) are documented under
+  [`docs/RDMA.md`](docs/RDMA.md).
+- Container images publish to
+  `ghcr.io/qvest-digital/mxl-k8s/<component>` for every PR,
+  every push to `main` (`:dev` plus `:sha-<short>`), and every
+  release tag (`:vX.Y.Z` plus `:latest` or `:pre`). operator,
+  agent, gateway, exporter, shim and the chart share one version, so
+  `vX.Y.Z` names the same release across all of them.
+
+## Install via Helm
+
+The control plane (operator, agent, gateway, CRDs, RBAC) ships as a
+Helm chart at
+`oci://ghcr.io/qvest-digital/mxl-k8s/charts/mxl-k8s`.
+
+```sh
+helm install mxl oci://ghcr.io/qvest-digital/mxl-k8s/charts/mxl-k8s \
+  --version 1.0.0-rc.13 \
+  --namespace mxl-system --create-namespace
+```
+
+FluxCD users point an `OCI`-typed `HelmRepository` at the same URL.
+See [`charts/mxl-k8s/README.md`](charts/mxl-k8s/README.md) for the
+full values reference, override examples (RDMA, private registry,
+IRSA), and the FluxCD `HelmRelease` snippet.
+
+## Run the demo locally
+
+The repo ships a KIND cluster that runs an end-to-end TCP flow
+across two worker nodes. Requires Docker, [`kind`][kind] >= 0.20,
+`kubectl`, and `helm`. Linux host with a kernel >= 5.17 (the
+agent's `fanotify` needs `FAN_REPORT_DFID_NAME`).
+
+For docker run:
+
+```sh
+make kind-up
+```
+
+or for podman:
+
+```sh
+make kind-up CONTAINER_RUNTIME=podman
+```
+
+That builds every component image locally, brings up a
+three-node KIND cluster (control plane plus two workers),
+installs the `mxl-k8s` Helm chart against the overlay in
+[`examples/kind/`](examples/kind/), applies the demo writer/
+reader workload from [`examples/kind/demo/`](examples/kind/demo/),
+and waits for the `MxlFlowMirror` to reach `Ready`. After about
+a minute the writer pod is producing grains on one worker and
+the reader pod is consuming them on the other.
+
+```sh
+kubectl --context kind-mxl-k8s-demo -n mxl-system logs pod/mxl-tcp-demo-reader
+```
+
+The reader prints one line per grain (`idx=... size=... slices=.../...`).
+Use `make kind-status` for the converged state of the CRDs and
+pods, `make kind-down` to tear the cluster down.
+
+The cluster also brings up kube-prometheus-stack, with the exporter,
+gateway and operator scraped and the flow and fabric dashboards
+loaded:
+
+```sh
+make kind-grafana
+```
+
+It prints the dashboard URLs and credentials (admin / admin). The
+forward binds every interface, so the board is reachable from another
+host on the network; `KIND_GRAFANA_ADDRESS=127.0.0.1` keeps it on the
+loopback, and `KIND_GRAFANA_PORT` moves it off 3000.
+
+The writer and reader are producing grains, so the panels carry live
+data from the demo flows. `MONITORING=0 make kind-up` leaves the whole
+stack out.
+
+[`docs/KIND.md`](docs/KIND.md) walks through what each step does
+and what to look at if convergence stalls.
+
+## Repository layout
+
+The repo is a Go workspace with five modules:
+
+| Module | Path | Purpose |
+| --- | --- | --- |
+| `api` | `github.com/qvest-digital/mxl-k8s/api` | CRD types. |
+| `operator` | `github.com/qvest-digital/mxl-k8s/operator` | Cluster operator that reconciles the CRDs. |
+| `agent` | `github.com/qvest-digital/mxl-k8s/agent` | Per-node DaemonSet. Pure Go; watches the domain via `fanotify`, does not link libmxl. |
+| `gateway` | `github.com/qvest-digital/mxl-k8s/gateway` | Per-node DaemonSet. Links libmxl + libmxl-fabrics via [`go-mxl`][go-mxl]. |
+| `exporter` | `github.com/qvest-digital/mxl-k8s/exporter` | Per-node DaemonSet. Prometheus metrics for the flows in the node's domain. Links libmxl via [`go-mxl`][go-mxl]. |
+
+The exporter's metric set and its entry-lifetime model are ported from
+[`jonasohland/mxl-exporter`][mxl-exporter] (Apache-2.0). That
+exporter predates go-mxl's public release and read the domain's
+shared-memory layout by parsing the structures itself; here the same
+values come from go-mxl. The metric names are kept, so dashboards built
+against it keep working.
+
+Its series carry `node` and `flow_id`, not `pod`. A domain is shared by
+every pod on its node, so one exporter per node reports each flow once.
+`mxl_flow_location_info`, read from the `MxlFlow` CRs, gives the phase
+per node -- `Origin` on the node the writer runs on -- which separates a
+produced flow from a mirrored one without a media function labelling
+itself. `mxl_mirror_heartbeat_age_seconds{mirror_namespace,mirror,side,node}`,
+read from the heartbeat Leases the gateways renew, is the time since
+each mirror side last made progress, reported by the exporter on the
+node of the gateway serving that side.
+
+The chart ships two Grafana dashboards under `dashboards.enabled`:
+"MXL Flow Metrics" over those metrics, and "MXL Fabric" over the
+operator's placement metrics and the gateway's port and link metrics
+(see [`docs/RDMA.md`](docs/RDMA.md#metrics)). Each is a ConfigMap for
+Grafana's dashboard sidecar to discover. That sidecar's `searchNamespace` defaults to the namespace
+Grafana runs in, so a Grafana installed elsewhere needs either that
+setting widened or `dashboards.namespace` pointed at it. The discovery
+label, folder annotation and Prometheus datasource uid are values too;
+the uid defaults to the one kube-prometheus-stack gives its own
+datasource.
+
+[`docs/USAGE.md`](docs/USAGE.md) covers the prerequisites for a
+media function (container, libmxl link, capabilities) and how to
+integrate it as a producer or consumer.
+[`docs/BUILD.md`](docs/BUILD.md) covers local-build prerequisites
+and the cgo lane for `gateway`.
+[`CLAUDE.md`](CLAUDE.md) carries the contributor rules.
+
+[mxl]: https://github.com/dmf-mxl/mxl
+[go-mxl]: https://github.com/qvest-digital/go-mxl
+[kind]: https://kind.sigs.k8s.io/
+[mxl-exporter]: https://github.com/jonasohland/mxl-exporter

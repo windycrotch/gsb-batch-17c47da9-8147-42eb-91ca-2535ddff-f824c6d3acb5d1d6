@@ -1,0 +1,384 @@
+package config
+
+import (
+	"flag"
+	"fmt"
+	"net/netip"
+	"os"
+	"strings"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/qvest-digital/go-mxl/fabrics"
+
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/domaingc"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/fabric"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/ports"
+)
+
+// Config holds the gateway's runtime configuration.
+type Config struct {
+	// NodeName is the Kubernetes node hosting this gateway. Sourced
+	// from --node-name or the NODE_NAME env var.
+	NodeName string
+
+	// DomainPath is the absolute path of the MXL domain directory this
+	// gateway operates on. One mxl.Instance is opened against this
+	// directory at boot and shared across all flows.
+	DomainPath string
+
+	// BindAddress is the one IP address this gateway's endpoints
+	// bind. It restricts the interfaces of the providers that name
+	// one by IP, tcp and verbs, to that address; efa names an
+	// interface by its EFA GID and shm by the host's name, and
+	// neither is narrowed by it. Empty considers every address
+	// libmxl-fabrics reports. For in-cluster use this is $POD_IP.
+	BindAddress string
+
+	// Providers is the upper bound on the libmxl-fabrics providers
+	// this gateway may advertise and use. What it actually advertises
+	// is the intersection of this list with what libmxl-fabrics
+	// enumerates on the node, so a provider named here whose hardware
+	// is absent is published with a zero device count rather than
+	// claimed. Naming fabrics.ProviderAny imposes no bound.
+	Providers []fabrics.Provider
+
+	// FabricCIDRs restricts the interfaces this gateway may advertise
+	// and bind to those whose address falls inside one of these
+	// prefixes. Empty imposes no restriction.
+	FabricCIDRs []netip.Prefix
+
+	// FabricDevices restricts those interfaces to the devices named
+	// here, as the provider names them. Empty imposes no restriction.
+	FabricDevices []string
+
+	// FabricMinLinkSpeed rejects interfaces below this link speed in
+	// bits per second. Zero imposes no restriction.
+	FabricMinLinkSpeed uint64
+
+	// PortCapacities override the link speed mirror placement plans
+	// each fabric interface for.
+	PortCapacities []ports.CapacityRule
+
+	// Budgets are caps shared by the fabric interfaces of one device or
+	// of the host.
+	Budgets []ports.BudgetRule
+
+	// MaxUtilizationPercent is how much of a capacity placement may
+	// commit on this node. Zero leaves it to the operator.
+	MaxUtilizationPercent int32
+
+	// PlacementWait is how long the target side of a mirror with no
+	// placement waits for the operator to place it before binding the
+	// first interface, on a node offering more than one.
+	PlacementWait time.Duration
+
+	// Kubeconfig is an optional kubeconfig path; empty uses in-cluster.
+	Kubeconfig string
+
+	// ProbeAddr is the address for http liveness/readiness probes.
+	ProbeAddr string
+
+	// MetricsAddr is the address for prometheus metrics.
+	MetricsAddr string
+
+	// PprofAddr is the address the net/http/pprof endpoint binds to.
+	// Empty disables the endpoint. The chart's values.schema.json
+	// constrains this to loopback (127.0.0.1: or localhost:) so an
+	// operator with multi-NIC pods cannot accidentally expose pprof.
+	PprofAddr string
+
+	// ResyncPeriod is how often the gateway refreshes
+	// MxlNodeCapabilities status.
+	ResyncPeriod time.Duration
+
+	// ProbePeriod is the shortest interval between two libmxl-fabrics
+	// enumerations. The status still refreshes on ResyncPeriod.
+	ProbePeriod time.Duration
+
+	// RDMAEnumerationLiveness fails the liveness probe once the host
+	// exposes RDMA devices the enumerated providers do not account
+	// for. Off by default: the restart it asks for clears a gateway
+	// that enumerated before the hardware was usable, and loops on a
+	// node whose devices the built providers never drive.
+	RDMAEnumerationLiveness bool
+
+	// RDMAEnumerationGrace is how long that discrepancy holds before
+	// the probe fails. Measured across consecutive enumerations, so
+	// it wants to span several ProbePeriod.
+	RDMAEnumerationGrace time.Duration
+
+	// DegradedAfter is the inactivity window the target-side
+	// reconciler uses to demote a Ready mirror to Degraded and to
+	// invalidate its Reconcile fast-path. Matches the operator-side
+	// MxlFlowMirror freshness expectation.
+	DegradedAfter time.Duration
+
+	// DomainGCInterval is how often the gateway asks libmxl to reclaim
+	// flow directories no writer holds. Zero disables the sweep.
+	DomainGCInterval time.Duration
+
+	// DomainGCGrace is how long after start the first sweep is held
+	// back, so a restart does not collect mirror copies the target
+	// reconciler is about to re-establish.
+	DomainGCGrace time.Duration
+
+	// DomainGCScaffoldGrace is how old a half-built flow directory has
+	// to be before the sweep reclaims it. libmxl's own collection never
+	// sees one, so a producer killed part way through allocating its
+	// ring leaves the whole allocation in the shared domain. Negative
+	// turns that reclamation off.
+	DomainGCScaffoldGrace time.Duration
+
+	// ReaderStallAfter is how long the source-side reconciler lets a
+	// reader report an unchanged head index, having never transferred
+	// a grain, before SourceProgress reports ReaderNotAdvancing.
+	ReaderStallAfter time.Duration
+
+	// KubeAPIQPS is the sustained request rate the Kubernetes API
+	// client allows before throttling. Each flowing mirror side renews
+	// its heartbeat Lease every few seconds, so the sustained write
+	// rate scales with the flowing mirrors on the node. client-go falls
+	// back to 5 QPS when the limit is unset, which saturates at a few
+	// dozen mirrors and queues heartbeat writes behind second-long
+	// delays - a late heartbeat then skews the cross-side
+	// stuck-handshake comparison.
+	KubeAPIQPS float64
+
+	// KubeAPIBurst is the burst ceiling of the Kubernetes API client
+	// rate limiter.
+	KubeAPIBurst int
+
+	// Mxlfs runs what a domain on mxlfs needs: placeholders, lazy
+	// allocation, the redundancy set merge engine. Off, every domain is
+	// a plain directory.
+	Mxlfs bool
+
+	// MxlfsNumaMode is how the rings of mxlfs domains are placed on NUMA
+	// nodes: off, node or flow. Only flow concerns the gateway: it holds
+	// the ring of every flow it registers with a NIC and moves it to the
+	// NICs' node first, and gives target rings that node as preference.
+	MxlfsNumaMode string
+}
+
+// FlowPlacement reports whether the gateway places rings per flow.
+func (c *Config) FlowPlacement() bool { return c.MxlfsNumaMode == "flow" }
+
+// FromFlags populates a Config from command-line flags.
+func FromFlags(fs *flag.FlagSet, args []string) (*Config, error) {
+	c := &Config{}
+	var providers, fabricCIDRs, fabricDevices, fabricMinLinkSpeed, portCapacity, budgets string
+	var maxUtilization int
+	fs.StringVar(&c.NodeName, "node-name", os.Getenv("NODE_NAME"),
+		"Kubernetes node name (defaults to $NODE_NAME).")
+	fs.StringVar(&c.DomainPath, "domain-path", os.Getenv("MXL_DOMAIN"),
+		"Absolute path to the MXL domain directory the gateway operates on.")
+	fs.StringVar(&c.BindAddress, "bind-address", os.Getenv("POD_IP"),
+		"Local IP address libmxl-fabrics endpoints bind to (defaults to $POD_IP, empty for all "+
+			"addresses). Narrows the tcp and verbs interfaces only: efa and shm do not address an "+
+			"interface by IP.")
+	fs.StringVar(&providers, "providers", "any",
+		"Comma-separated upper bound on the libmxl-fabrics providers to advertise and use "+
+			"(any,tcp,verbs,efa,shm; auto is an alias for any). What the node advertises is "+
+			"this list intersected with what libmxl-fabrics finds on it.")
+	fs.StringVar(&fabricCIDRs, "fabric-cidr", "",
+		"Comma-separated CIDRs the fabric interfaces must fall inside. Empty considers every "+
+			"address libmxl-fabrics reports. Set this on a node whose other NICs carry traffic "+
+			"MXL must stay off, such as an ST 2110 or management network.")
+	fs.StringVar(&fabricDevices, "fabric-device", "",
+		"Comma-separated device names the fabric interfaces must match, as the provider names "+
+			"them (the kernel netdev name for tcp). Empty considers every device.")
+	fs.StringVar(&fabricMinLinkSpeed, "fabric-min-link-speed", "",
+		"Minimum link speed a fabric interface must report, as a quantity in bits per second "+
+			"(for example 25G). Empty imposes no floor. An interface whose provider reports no "+
+			"link speed is rejected when this is set, which includes most interfaces with no "+
+			"physical NIC behind them.")
+	fs.StringVar(&portCapacity, "fabric-port-capacity", "",
+		"Comma-separated <match>=<quantity> overrides of the capacity mirror placement plans a fabric "+
+			"interface for, in bits per second; match is a device name, an address or a CIDR, and the "+
+			"first match wins. Unmatched interfaces keep the link speed their provider reports.")
+	fs.StringVar(&budgets, "fabric-shared-budget", "",
+		"Comma-separated <scope>=<quantity>[:<mode>] caps shared by several fabric interfaces, in bits "+
+			"per second. Scope nic makes one per PCI device, host one over every interface; mode ingress "+
+			"(default) counts mirrors received, egress mirrors sent, combined both. Empty declares none.")
+	fs.IntVar(&maxUtilization, "fabric-max-utilization", 0,
+		"Percent of an interface's or budget's capacity mirror placement may commit on this node. "+
+			"Zero leaves it to the operator's --placement-max-utilization.")
+	fs.DurationVar(&c.PlacementWait, "placement-wait", 10*time.Second,
+		"How long the target side of a mirror the operator has not placed waits, on a node offering more "+
+			"than one fabric interface, before binding the first as an unplaced mirror does. The operator "+
+			"places within its reconcile; this covers an operator that is down or slow.")
+	fs.StringVar(&c.Kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"),
+		"Path to a kubeconfig file. Empty uses the in-cluster config.")
+	fs.StringVar(&c.ProbeAddr, "health-probe-bind-address", ":8081",
+		"Address the health probe endpoint binds to.")
+	fs.StringVar(&c.MetricsAddr, "metrics-bind-address", ":8080",
+		"Address the metrics endpoint binds to.")
+	fs.StringVar(&c.PprofAddr, "pprof-bind-address", "",
+		"Address the net/http/pprof endpoint binds to. Empty disables. "+
+			"Must be a loopback bind (127.0.0.1: or localhost:); use "+
+			"kubectl port-forward to reach it.")
+	fs.DurationVar(&c.ResyncPeriod, "resync-period", 30*time.Second,
+		"How often to refresh MxlNodeCapabilities status.")
+	fs.DurationVar(&c.ProbePeriod, "probe-period", 5*time.Minute,
+		"Shortest interval between two libmxl-fabrics interface enumerations. The status "+
+			"still refreshes every --resync-period from the last result. Each enumeration "+
+			"sweeps every provider libfabric was built with and warns about those it finds "+
+			"no device for.")
+	fs.BoolVar(&c.Mxlfs, "mxlfs", false,
+		"Run what a domain on mxlfs needs: placeholders for absent flows, lazy ring "+
+			"allocation and the MxlFlowRedundancySet merge engine. Off, every domain is "+
+			"treated as a plain directory.")
+	fs.StringVar(&c.MxlfsNumaMode, "mxlfs-numa-placement-mode", "off",
+		"NUMA placement of mxlfs rings: off, node (the mount's numa_node=, nothing per flow) or "+
+			"flow (hold the ring of every flow registered with a NIC and move it to the NICs' "+
+			"node first; needs --mxlfs and CAP_SYS_NICE).")
+	fs.BoolVar(&c.RDMAEnumerationLiveness, "rdma-enumeration-liveness", false,
+		"Fail the liveness probe while the host exposes RDMA devices that no enumerated "+
+			"provider accounts for. libfabric fixes a provider's device list at the first "+
+			"enumeration, so a gateway that started before the hardware was usable never "+
+			"revisits it and a restart is the only thing that does. Off by default: the "+
+			"same discrepancy is reported by a node whose devices the built providers "+
+			"cannot drive, where restarting loops instead of recovering.")
+	fs.DurationVar(&c.RDMAEnumerationGrace, "rdma-enumeration-grace", 10*time.Minute,
+		"How long the host device discrepancy must hold before --rdma-enumeration-liveness "+
+			"fails the probe. Spans several --probe-period so a single enumeration does not "+
+			"decide it.")
+	fs.DurationVar(&c.DegradedAfter, "degraded-after", 10*time.Second,
+		"Grain-commit inactivity after which the target gateway demotes a mirror to Degraded.")
+	fs.DurationVar(&c.DomainGCInterval, "domain-gc-interval", domaingc.DefaultInterval,
+		"How often to reclaim flow directories no writer holds. Zero disables it.")
+	fs.DurationVar(&c.DomainGCGrace, "domain-gc-grace", domaingc.DefaultGrace,
+		"How long after start to hold back the first reclaim sweep.")
+	fs.DurationVar(&c.DomainGCScaffoldGrace, "domain-gc-scaffold-grace", domaingc.DefaultScaffoldGrace,
+		"How old a half-built flow directory must be before it is reclaimed. Negative disables it.")
+	fs.DurationVar(&c.ReaderStallAfter, "reader-stall-after", 20*time.Second,
+		"Head-index inactivity after which the source gateway reports a reader that has never transferred a grain as not advancing.")
+	fs.Float64Var(&c.KubeAPIQPS, "kube-api-qps", 50,
+		"Sustained Kubernetes API request rate allowed before client-side throttling.")
+	fs.IntVar(&c.KubeAPIBurst, "kube-api-burst", 100,
+		"Burst ceiling of the Kubernetes API client rate limiter.")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+
+	for _, name := range strings.Split(providers, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		// fabrics.ParseProvider accepts concrete provider names only;
+		// the any sentinel has no parseable string form. "any" is its
+		// String() form, "auto" the pre-v1.1 libmxl-fabrics name.
+		if name == "any" || name == "auto" {
+			c.Providers = append(c.Providers, fabrics.ProviderAny)
+			continue
+		}
+		p, err := fabrics.ParseProvider(name)
+		if err != nil {
+			return nil, fmt.Errorf("--providers: %w", err)
+		}
+		c.Providers = append(c.Providers, p)
+	}
+
+	for _, cidr := range splitList(fabricCIDRs) {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("--fabric-cidr: %w", err)
+		}
+		c.FabricCIDRs = append(c.FabricCIDRs, prefix)
+	}
+	c.FabricDevices = splitList(fabricDevices)
+
+	if fabricMinLinkSpeed != "" {
+		q, err := resource.ParseQuantity(fabricMinLinkSpeed)
+		if err != nil {
+			return nil, fmt.Errorf("--fabric-min-link-speed: %w", err)
+		}
+		bits, ok := q.AsInt64()
+		if !ok || bits < 0 {
+			return nil, fmt.Errorf("--fabric-min-link-speed must be a non-negative whole number of bits per second, got %q", fabricMinLinkSpeed)
+		}
+		c.FabricMinLinkSpeed = uint64(bits)
+	}
+
+	var err error
+	if c.PortCapacities, err = ports.ParseCapacities(portCapacity); err != nil {
+		return nil, fmt.Errorf("--fabric-port-capacity: %w", err)
+	}
+	if c.Budgets, err = ports.ParseBudgets(budgets); err != nil {
+		return nil, fmt.Errorf("--fabric-shared-budget: %w", err)
+	}
+	if maxUtilization < 0 || maxUtilization > 100 {
+		return nil, fmt.Errorf("--fabric-max-utilization must be 0..100, got %d", maxUtilization)
+	}
+	c.MaxUtilizationPercent = int32(maxUtilization)
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// splitList parses a comma-separated flag value, dropping empty
+// entries so a trailing comma or an empty flag yields no entries.
+func splitList(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// Selector is the fabric interface selection this configuration
+// describes. The capability publisher and the mirror setup path both
+// take it, which is what keeps a node from advertising an interface it
+// would refuse to bind.
+func (c *Config) Selector() fabric.Selector {
+	return fabric.Selector{
+		CIDRs:        c.FabricCIDRs,
+		Devices:      c.FabricDevices,
+		MinLinkSpeed: c.FabricMinLinkSpeed,
+		BindAddress:  c.BindAddress,
+	}
+}
+
+// Validate checks required fields.
+func (c *Config) Validate() error {
+	if c.NodeName == "" {
+		return fmt.Errorf("--node-name (or $NODE_NAME) is required")
+	}
+	if c.DomainPath == "" {
+		return fmt.Errorf("--domain-path (or $MXL_DOMAIN) is required")
+	}
+	if c.DomainPath[0] != '/' {
+		return fmt.Errorf("--domain-path must be absolute, got %q", c.DomainPath)
+	}
+	if len(c.Providers) == 0 {
+		return fmt.Errorf("--providers must list at least one provider")
+	}
+	if c.PlacementWait < 0 {
+		return fmt.Errorf("--placement-wait must not be negative, got %v", c.PlacementWait)
+	}
+	if c.ProbePeriod < 0 {
+		return fmt.Errorf("--probe-period must not be negative, got %v", c.ProbePeriod)
+	}
+	if c.KubeAPIQPS <= 0 {
+		return fmt.Errorf("--kube-api-qps must be positive, got %v", c.KubeAPIQPS)
+	}
+	if c.KubeAPIBurst <= 0 {
+		return fmt.Errorf("--kube-api-burst must be positive, got %d", c.KubeAPIBurst)
+	}
+	switch c.MxlfsNumaMode {
+	case "", "off", "node":
+	case "flow":
+		if !c.Mxlfs {
+			return fmt.Errorf("--mxlfs-numa-placement-mode=flow needs --mxlfs")
+		}
+	default:
+		return fmt.Errorf("--mxlfs-numa-placement-mode %q is not one of off, node, flow", c.MxlfsNumaMode)
+	}
+	return nil
+}

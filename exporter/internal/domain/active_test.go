@@ -1,0 +1,281 @@
+package domain
+
+import (
+	"testing"
+	"time"
+
+	"github.com/qvest-digital/go-mxl/mxl"
+	"github.com/stretchr/testify/require"
+)
+
+const activeTestFlowDef = `{
+  "id": "5fbec3b1-1b0f-417d-9059-8b94a47197ed",
+  "format": "urn:x-nmos:format:video",
+  "tags": { "urn:x-nmos:tag:grouphint/v1.0": ["exporter probe:Video"] },
+  "label": "activity probe",
+  "media_type": "video/v210",
+  "grain_rate": { "numerator": 30000, "denominator": 1001 },
+  "frame_width": 16,
+  "frame_height": 16,
+  "interlace_mode": "progressive",
+  "colorspace": "BT709",
+  "components": [
+    { "name": "Y",  "width": 16, "height": 16, "bit_depth": 10 },
+    { "name": "Cb", "width": 8,  "height": 16, "bit_depth": 10 },
+    { "name": "Cr", "width": 8,  "height": 16, "bit_depth": 10 }
+  ]
+}`
+
+const activeTestFlowID = "5fbec3b1-1b0f-417d-9059-8b94a47197ed"
+
+// newObservedFlow opens a domain over a temp dir, writes one grain,
+// and returns the Domain with the flow scanned in.
+func newObservedFlow(t *testing.T) *Domain {
+	t.Helper()
+	return newObservedFlowWithLifetime(t, time.Minute)
+}
+
+// newObservedFlowWithLifetime is newObservedFlow with control over how
+// long the Domain keeps a flow that left it.
+func newObservedFlowWithLifetime(t *testing.T, lifetime time.Duration) *Domain {
+	t.Helper()
+	dir := t.TempDir()
+	inst, err := mxl.NewInstance(dir, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = inst.Close() })
+
+	w, _, err := inst.NewWriter(activeTestFlowDef)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	idx := mxl.CurrentIndex(w.Config().Common.GrainRate)
+	ga, err := w.OpenGrain(idx)
+	require.NoError(t, err)
+	require.NoError(t, ga.Commit(ga.TotalSlices, 0))
+
+	d, err := Open(dir, lifetime)
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	require.NoError(t, d.Scan())
+	return d
+}
+
+func TestObserveIsIdempotentWithinAScrape(t *testing.T) {
+	// Two collectors are registered against one Domain and Prometheus
+	// calls both inside a single scrape. While activity was a delta
+	// against the previous call, whichever collector ran first consumed
+	// the head advancement and the other reported the flow idle, so one
+	// scrape could carry an advancing head index and active=0. The
+	// order the registry walks its collectors is not fixed, which made
+	// mxl_flow_active a coin flip on every scrape of a healthy flow.
+	d := newObservedFlow(t)
+
+	first := d.Observe()
+	second := d.Observe()
+	require.Len(t, first, 1)
+	require.Len(t, second, 1)
+
+	require.Equal(t, first[0].Active, second[0].Active,
+		"back-to-back Observe calls must agree; a second caller in the "+
+			"same scrape must not be told the flow went idle because the "+
+			"first caller already consumed the sample")
+	require.True(t, first[0].Active,
+		"a flow written moments ago must read as active")
+}
+
+func TestObserveActivityFollowsTheFlowClock(t *testing.T) {
+	// Activity has to be a property of the flow, not of how often
+	// anything asks. A flow whose last write has aged past the window
+	// is inactive however many times it is observed, and a flow that is
+	// still being written stays active however rarely it is.
+	d := newObservedFlow(t)
+
+	obs := d.Observe()
+	require.Len(t, obs, 1)
+	require.Equal(t, activeTestFlowID, obs[0].ID)
+	require.True(t, obs[0].Active)
+	require.Less(t, obs[0].WriteAge, activityWindow(obs[0].Info.Config.Common),
+		"the write age is what decides activity, so it has to be inside "+
+			"the window for a flow just written")
+
+	// Nothing writes to the flow from here on, so it has to fall out of
+	// the window on its own, with no scrape cadence involved.
+	require.Eventually(t, func() bool {
+		o := d.Observe()
+		return len(o) == 1 && !o[0].Active
+	}, 5*time.Second, 20*time.Millisecond,
+		"a flow that stopped being written must go inactive once its "+
+			"last write ages past the window")
+}
+
+func TestActivityWindowFollowsTheFlowRate(t *testing.T) {
+	// A fixed window is wrong at both ends of the rate range: what is
+	// three grains at 25 fps is a fifth of a grain at 1 fps, where a
+	// healthy flow would read stalled between every frame.
+	slow := mxl.CommonFlowConfig{
+		Format:    mxl.FormatVideo,
+		GrainRate: mxl.Rational{Num: 1, Den: 1},
+	}
+	require.Equal(t, activeGrains*time.Second, activityWindow(slow),
+		"a 1 fps flow has to be allowed a full three seconds; anything "+
+			"shorter reports every healthy frame gap as a stall")
+
+	fast := mxl.CommonFlowConfig{
+		Format:    mxl.FormatVideo,
+		GrainRate: mxl.Rational{Num: 60, Den: 1},
+	}
+	require.Equal(t, minActivityWindow, activityWindow(fast),
+		"three grains at 60 fps is shorter than the jitter between two "+
+			"scrapes, so the floor has to take over")
+}
+
+func TestActivityWindowUsesCommitBatchForContinuousFlows(t *testing.T) {
+	// On a continuous flow the grain rate is the sample rate. Treating
+	// it as a write interval would give a 62 microsecond window at
+	// 48 kHz; writes actually land one commit batch apart.
+	audio := mxl.CommonFlowConfig{
+		Format:                 mxl.FormatAudio,
+		GrainRate:              mxl.Rational{Num: 48000, Den: 1},
+		MaxCommitBatchSizeHint: 480,
+	}
+	require.Equal(t, minActivityWindow, activityWindow(audio),
+		"three 10 ms batches is under the floor, so the floor applies")
+
+	sparse := audio
+	sparse.MaxCommitBatchSizeHint = 48000
+	require.Equal(t, activeGrains*time.Second, activityWindow(sparse),
+		"a flow committing one second of samples at a time must be "+
+			"allowed three seconds, not the floor")
+}
+
+func TestActivityWindowFallsBackOnAnUnusableRate(t *testing.T) {
+	require.Equal(t, minActivityWindow,
+		activityWindow(mxl.CommonFlowConfig{Format: mxl.FormatVideo}),
+		"a zero grain rate must not divide by zero or yield a zero window")
+}
+
+const activeTestAudioDef = `{
+  "id": "1f8e2c04-6f2a-4f3e-9d55-2c0d5a9b7e11",
+  "format": "urn:x-nmos:format:audio",
+  "tags": { "urn:x-nmos:tag:grouphint/v1.0": ["exporter probe:Audio"] },
+  "label": "activity probe, audio",
+  "media_type": "audio/float32",
+  "sample_rate": { "numerator": 48000, "denominator": 1 },
+  "channel_count": 2,
+  "bit_depth": 32
+}`
+
+const activeTestAudioID = "1f8e2c04-6f2a-4f3e-9d55-2c0d5a9b7e11"
+
+func TestObserveJudgesAContinuousFlowByItsHead(t *testing.T) {
+	// libmxl stamps runtime.lastWriteTime in PosixDiscreteFlowWriter's
+	// commit path only; PosixContinuousFlowWriter::commit advances
+	// headIndex and leaves lastWriteTime holding whatever flow creation
+	// wrote. A window measured against that field expires once and then
+	// reports every audio flow stalled for the rest of its life, however
+	// healthy the writer.
+	dir := t.TempDir()
+	inst, err := mxl.NewInstance(dir, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = inst.Close() })
+
+	w, _, err := inst.NewWriter(activeTestAudioDef)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	d, err := Open(dir, time.Minute)
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	require.NoError(t, d.Scan())
+
+	rate := w.Config().Common.GrainRate
+	commit := func() {
+		sa, err := w.OpenSamples(mxl.CurrentIndex(rate), 48)
+		require.NoError(t, err)
+		require.NoError(t, sa.Commit())
+	}
+
+	commit()
+	obs := d.Observe()
+	require.Len(t, obs, 1)
+	require.Equal(t, activeTestAudioID, obs[0].ID)
+	require.False(t, obs[0].HaveWriteAge,
+		"libmxl maintains no last write time for a continuous flow, so "+
+			"the exporter must not report an age derived from one")
+
+	// Past the window a lastWriteTime-derived answer would have expired
+	// at: the flow was created once and the writer has been committing
+	// ever since, which is the shape that read stalled on sc and on a
+	// freshly started kind cluster.
+	require.Greater(t, 300*time.Millisecond,
+		activityWindow(obs[0].Info.Config.Common),
+		"the sleep below has to outlast the window this flow would have "+
+			"been judged by, or it proves nothing")
+	time.Sleep(300 * time.Millisecond)
+	commit()
+
+	obs = d.Observe()
+	require.Len(t, obs, 1)
+	require.True(t, obs[0].Active,
+		"an audio flow whose head is tracking the clock is active however "+
+			"long ago the flow was created")
+
+	// A head that stops advancing still has to fall out on its own,
+	// which is what makes the reading about the flow and not about the
+	// fact that it is continuous.
+	require.Eventually(t, func() bool {
+		o := d.Observe()
+		return len(o) == 1 && !o[0].Active
+	}, 10*time.Second, 50*time.Millisecond,
+		"a continuous flow whose writer stopped must go inactive once the "+
+			"clock outruns its head by the span a reader could still reach")
+}
+
+const activeTestEventDef = `{
+  "id": "8d0f6a52-3c1e-4b7a-9f2d-61c4e0a9b7d3",
+  "format": "urn:x-nmos:format:event",
+  "tags": { "urn:x-nmos:tag:grouphint/v1.0": ["exporter probe:Event"] },
+  "label": "activity probe, events",
+  "grain_rate": { "numerator": 1000, "denominator": 1 }
+}`
+
+func TestObserveJudgesAnEventFlowByItsLastWrite(t *testing.T) {
+	// An event flow's head index is a queue position: libmxl leaves it
+	// at MXL_UNDEFINED_INDEX until the first commit and then steps it
+	// once per event, however far apart they arrive. Read as a clock
+	// index it puts every event flow about 1.8e12 grains behind at
+	// 1000/s and reports it stalled for good. The event writer stamps
+	// lastWriteTime on every commit, as the discrete one does, and flow
+	// creation stamps it too, so a flow just created is as fresh as
+	// one just written.
+	dir := t.TempDir()
+	inst, err := mxl.NewInstance(dir, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = inst.Close() })
+
+	w, _, err := inst.NewWriter(activeTestEventDef)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+	require.Equal(t, mxl.FormatEvent, w.Config().Common.Format)
+
+	d, err := Open(dir, time.Minute)
+	require.NoError(t, err)
+	t.Cleanup(func() { d.Close() })
+	require.NoError(t, d.Scan())
+
+	obs := d.Observe()
+	require.Len(t, obs, 1)
+	require.True(t, obs[0].HaveWriteAge,
+		"an event flow stamps its last write time, so its age is a reading")
+	require.Zero(t, obs[0].LatencyGrains,
+		"an event flow's head does not follow the clock, so it has no latency")
+	require.True(t, obs[0].Active,
+		"an event flow written moments ago must read as active")
+
+	require.Eventually(t, func() bool {
+		o := d.Observe()
+		return len(o) == 1 && !o[0].Active
+	}, 5*time.Second, 20*time.Millisecond,
+		"an event flow nothing writes to must go inactive once its last "+
+			"write ages past the window")
+}

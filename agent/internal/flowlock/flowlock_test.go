@@ -1,0 +1,242 @@
+package flowlock
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+)
+
+const flowID = "11111111-2222-3333-4444-555555555555"
+
+// makeFlowDir builds the directory libmxl would have renamed into
+// place, with the entries a flow of the given shape carries. Only the
+// data file matters to the probe; the rest are there so the fixture
+// cannot accidentally pass by looking at the wrong name.
+func makeFlowDir(t *testing.T, domain, id string, extra ...string) string {
+	t.Helper()
+	dir := filepath.Join(domain, id+flowDirSuffix)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "flow_def.json"),
+		[]byte(`{"id":"`+id+`"}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, dataFileName), nil, 0o644))
+	for _, e := range extra {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, e), nil, 0o644))
+	}
+	return dir
+}
+
+// holdShared takes the lock libmxl's writer holds for as long as it is
+// attached, and releases it when the test ends. flock is owned by the
+// open file description rather than by the process, so the exclusive
+// probe conflicts with it even from the same test binary.
+func holdShared(t *testing.T, dir string) {
+	t.Helper()
+	fd, err := syscall.Open(filepath.Join(dir, dataFileName),
+		syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+	require.NoError(t, err)
+	require.NoError(t, syscall.Flock(fd, syscall.LOCK_SH|syscall.LOCK_NB))
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+}
+
+func TestWriterAttached_SharedLockHeld(t *testing.T) {
+	domain := t.TempDir()
+	dir := makeFlowDir(t, domain, flowID)
+	holdShared(t, dir)
+
+	attached, err := WriterAttached(domain, flowID)
+	require.NoError(t, err)
+	assert.True(t, attached,
+		"a writer holds a shared lock on the data file for as long as it "+
+			"is attached; that is libmxl's own definition of a live flow")
+}
+
+func TestWriterAttached_NoLockHeld(t *testing.T) {
+	domain := t.TempDir()
+	makeFlowDir(t, domain, flowID)
+
+	attached, err := WriterAttached(domain, flowID)
+	require.NoError(t, err)
+	assert.False(t, attached,
+		"the directory outlives the writer by up to one domain sweep, so "+
+			"an unlocked data file is a copy nothing feeds")
+}
+
+// The three media types differ in the entries beside the data file --
+// grains and access for discrete video and ANC, channels for
+// continuous audio -- and not in the file the lock is taken on. A
+// probe that keyed on any of the others would answer for one type and
+// silently misreport the other two.
+func TestWriterAttached_SameAnswerForEveryMediaType(t *testing.T) {
+	cases := map[string][]string{
+		"video": {"access", "grains"},
+		"audio": {"channels"},
+		"data":  {"access", "grains"},
+	}
+	for name, extra := range cases {
+		t.Run(name, func(t *testing.T) {
+			domain := t.TempDir()
+			dir := makeFlowDir(t, domain, flowID, extra...)
+			holdShared(t, dir)
+
+			attached, err := WriterAttached(domain, flowID)
+			require.NoError(t, err)
+			assert.True(t, attached)
+		})
+	}
+}
+
+func TestWriterAttached_MissingDataFile(t *testing.T) {
+	domain := t.TempDir()
+	dir := filepath.Join(domain, flowID+flowDirSuffix)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+
+	attached, err := WriterAttached(domain, flowID)
+	require.NoError(t, err)
+	assert.False(t, attached,
+		"libmxl creates the data file before it allocates anything, so its "+
+			"absence means nothing ever got as far as attaching")
+}
+
+func TestWriterAttached_MissingFlowDir(t *testing.T) {
+	attached, err := WriterAttached(t.TempDir(), flowID)
+	require.NoError(t, err)
+	assert.False(t, attached)
+}
+
+// A probe that cannot open the file has to report a writer. Reading
+// "cannot tell" as "abandoned" demotes a live producer's location and
+// costs every consumer of that flow its source; reading it the other
+// way costs one more pass.
+func TestWriterAttached_UnreadableDataFileReportsAttached(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the mode bits this case turns on")
+	}
+	domain := t.TempDir()
+	dir := makeFlowDir(t, domain, flowID)
+	require.NoError(t, os.Chmod(filepath.Join(dir, dataFileName), 0o000))
+
+	attached, err := WriterAttached(domain, flowID)
+	assert.Error(t, err)
+	assert.True(t, attached)
+}
+
+func TestParseLocksKeepsOnlyWritersLocks(t *testing.T) {
+	const locks = `1: FLOCK  ADVISORY  READ 514830 00:2a:1234 0 EOF
+2: FLOCK  ADVISORY  READ 42 00:2a:1234 0 EOF
+2: FLOCK  ADVISORY  READ 42 00:2a:1234 0 EOF
+3: FLOCK  ADVISORY  READ 7 00:2a:9999 0 EOF
+4: POSIX  ADVISORY  READ 9 00:2a:1234 0 EOF
+5: FLOCK  ADVISORY  READ 0 00:2a:1234 0 EOF
+5: -> FLOCK  ADVISORY  WRITE 11 00:2a:1234 0 EOF
+6: FLOCK  ADVISORY  WRITE 13 00:2a:1234 0 EOF
+`
+	// 7 holds another file, 9 a POSIX lock, 0 is a holder outside this
+	// pid namespace and 11 only waits. 13 holds the exclusive lock of a
+	// probe for whether the flow is active, which a reader runs as
+	// readily as a writer: taken for a writer it reads as a producer.
+	// 42 holds the file twice, as the gateway does, and is one writer.
+	got, err := parseLocks(strings.NewReader(locks))
+	require.NoError(t, err)
+	require.Equal(t, Locks{"00:2a:1234": {514830, 42}, "00:2a:9999": {7}}, got)
+}
+
+// A writer's shared flock, taken here, is listed under this process.
+func TestWriterPIDsListsTheHolder(t *testing.T) {
+	domain := t.TempDir()
+	pids := func() []int32 {
+		t.Helper()
+		l, err := ReadLocks()
+		require.NoError(t, err)
+		p, err := l.WriterPIDs(domain, flowID)
+		require.NoError(t, err)
+		return p
+	}
+	require.Empty(t, pids(), "a flow that is not there has no writer")
+
+	dir := makeFlowDir(t, domain, flowID)
+	require.Empty(t, pids())
+
+	holdShared(t, dir)
+	require.Equal(t, []int32{int32(os.Getpid())}, pids())
+}
+
+// lookups records every by-name lookup of a flow's data file the probes
+// make, through the seams, for the test's duration.
+func lookups(t *testing.T) *[]string {
+	t.Helper()
+	var looked []string
+	open, stat := openData, statData
+	openData = func(path string, mode int, perm uint32) (int, error) {
+		looked = append(looked, path)
+		return open(path, mode, perm)
+	}
+	statData = func(path string, st *unix.Stat_t) error {
+		looked = append(looked, path)
+		return stat(path, st)
+	}
+	t.Cleanup(func() { openData, statData = open, stat })
+	return &looked
+}
+
+// On mxlfs a lookup by name of a flow directory that is gone waits for
+// it to come back. The probes run once per flow on every rescan and
+// renew tick, between API calls that leave time for a flow listed at
+// the start of the pass to go, so each looks a flow up only once a
+// fresh listing has returned it.
+func TestProbesLookUpOnlyListedFlows(t *testing.T) {
+	domain := t.TempDir()
+	looked := lookups(t)
+
+	attached, err := WriterAttached(domain, flowID)
+	require.NoError(t, err)
+	assert.False(t, attached)
+	pids, err := Locks{}.WriterPIDs(domain, flowID)
+	require.NoError(t, err)
+	assert.Empty(t, pids)
+	assert.Empty(t, *looked, "a flow the listing did not return was looked up by name")
+
+	dir := makeFlowDir(t, domain, flowID)
+	holdShared(t, dir)
+	attached, err = WriterAttached(domain, flowID)
+	require.NoError(t, err)
+	assert.True(t, attached)
+	_, err = Locks{}.WriterPIDs(domain, flowID)
+	require.NoError(t, err)
+	data := filepath.Join(dir, dataFileName)
+	assert.Equal(t, []string{data, data}, *looked)
+}
+
+// A domain that cannot be listed cannot tell either, and reads as a
+// writer attached, like a data file that cannot be opened.
+func TestWriterAttached_UnlistableDomainReportsAttached(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the mode bits this test turns on")
+	}
+	domain := t.TempDir()
+	makeFlowDir(t, domain, flowID)
+	require.NoError(t, os.Chmod(domain, 0o300))
+	t.Cleanup(func() { _ = os.Chmod(domain, 0o755) })
+
+	attached, err := WriterAttached(domain, flowID)
+	assert.Error(t, err)
+	assert.True(t, attached)
+}
+
+// A domain that is not there holds no flow, so nothing writes to it.
+// Read as "cannot tell", it would keep every location of a removed
+// domain published.
+func TestWriterAttached_MissingDomain(t *testing.T) {
+	domain := filepath.Join(t.TempDir(), "absent")
+	attached, err := WriterAttached(domain, flowID)
+	require.NoError(t, err)
+	assert.False(t, attached)
+	pids, err := Locks{}.WriterPIDs(domain, flowID)
+	require.NoError(t, err)
+	assert.Empty(t, pids)
+}

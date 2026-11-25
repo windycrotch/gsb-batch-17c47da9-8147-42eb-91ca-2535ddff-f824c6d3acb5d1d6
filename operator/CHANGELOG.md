@@ -1,0 +1,111 @@
+# Changelog
+
+Frozen at 1.0.0-rc.13. operator, agent, gateway, shim and the
+chart now release together under one repository version; entries
+from 1.0.0-rc.14 on are in the repository CHANGELOG.md.
+
+## [1.0.0-rc.7](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.6...operator/v1.0.0-rc.7) (2026-07-28)
+
+
+### Bug Fixes
+
+* **gateway:** demote a target that never receives a grain ([52b9056](https://github.com/qvest-digital/mxl-k8s/commit/52b9056708b065f21a33e7aa1e6b012903864eb6))
+* **operator:** prune MxlFlow locations for departed nodes ([#191](https://github.com/qvest-digital/mxl-k8s/issues/191)) ([52b9056](https://github.com/qvest-digital/mxl-k8s/commit/52b9056708b065f21a33e7aa1e6b012903864eb6))
+
+
+### Dependencies
+
+* **api:** bump api module to v1.0.0-rc.6 ([#197](https://github.com/qvest-digital/mxl-k8s/issues/197)) ([8026ae2](https://github.com/qvest-digital/mxl-k8s/commit/8026ae27609106fa7e4941f4e1ffad01c574be05))
+
+## [1.0.0-rc.6](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.5...operator/v1.0.0-rc.6) (2026-07-27)
+
+
+### Features
+
+* **api:** share MirrorName and DefaultLeaseDuration ([b3ba4df](https://github.com/qvest-digital/mxl-k8s/commit/b3ba4df1def925b50b3659359c68a0ee218fe5c7))
+
+
+### Bug Fixes
+
+* **agent:** repoint intent mirrors when the flow origin moves ([b3ba4df](https://github.com/qvest-digital/mxl-k8s/commit/b3ba4df1def925b50b3659359c68a0ee218fe5c7))
+* **agent:** report a stale Origin distinctly from an unknown flow ([b3ba4df](https://github.com/qvest-digital/mxl-k8s/commit/b3ba4df1def925b50b3659359c68a0ee218fe5c7))
+* **gateway:** reap mirror finalizers orphaned by node removal ([#176](https://github.com/qvest-digital/mxl-k8s/issues/176)) ([b3ba4df](https://github.com/qvest-digital/mxl-k8s/commit/b3ba4df1def925b50b3659359c68a0ee218fe5c7))
+* **operator:** stop the receiver adopting a terminating mirror ([#177](https://github.com/qvest-digital/mxl-k8s/issues/177)) ([7a7b510](https://github.com/qvest-digital/mxl-k8s/commit/7a7b51089aa2b2903b2968786596c29880675960))
+
+
+### Dependencies
+
+* **api:** bump api module to v1.0.0-rc.5 ([#183](https://github.com/qvest-digital/mxl-k8s/issues/183)) ([7487fa2](https://github.com/qvest-digital/mxl-k8s/commit/7487fa2e5b8350b0e888f995fae583921ea53669))
+* **gomod:** update go modules to v0.36.3 ([#174](https://github.com/qvest-digital/mxl-k8s/issues/174)) ([594fb72](https://github.com/qvest-digital/mxl-k8s/commit/594fb72a4d43fa06db11ce08cc9c49b91fea678c))
+
+## [1.0.0-rc.5](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.4...operator/v1.0.0-rc.5) (2026-07-21)
+
+
+### Features
+
+* resolve mirror provider from node capabilities instead of stamping auto ([#154](https://github.com/qvest-digital/mxl-k8s/issues/154)) ([731b245](https://github.com/qvest-digital/mxl-k8s/commit/731b245d152960b1da8aba5c9ef89bbb1a3fd4a7))
+
+
+### Dependencies
+
+* **api:** bump api module to v1.0.0-rc.4 ([#159](https://github.com/qvest-digital/mxl-k8s/issues/159)) ([2afcadb](https://github.com/qvest-digital/mxl-k8s/commit/2afcadb10ef8c11741ac43d3cf9ee297cd1ae71e))
+* **api:** update module github.com/qvest-digital/mxl-k8s/api to v1.0.0-rc.3 ([#139](https://github.com/qvest-digital/mxl-k8s/issues/139)) ([5444825](https://github.com/qvest-digital/mxl-k8s/commit/54448254f61ada511bd3c75dd1019ce610cfb477))
+* **gomod:** update k8s.io/utils digest to cf1189d ([#150](https://github.com/qvest-digital/mxl-k8s/issues/150)) ([eedbbc5](https://github.com/qvest-digital/mxl-k8s/commit/eedbbc570571f754240b96437ced73ff4fbdbfe8))
+
+
+### Build System
+
+* **deps:** bump golang.org/x/net from 0.49.0 to 0.55.0 in /api and operator ([#148](https://github.com/qvest-digital/mxl-k8s/issues/148)) ([8dbbbbe](https://github.com/qvest-digital/mxl-k8s/commit/8dbbbbe1dbb4959b73555279b73093d1698ca077))
+
+## [1.0.0-rc.4](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.3...operator/v1.0.0-rc.4) (2026-07-01)
+
+
+### Dependencies
+
+* **gomod:** update go modules ([#123](https://github.com/qvest-digital/mxl-k8s/issues/123)) ([811033d](https://github.com/qvest-digital/mxl-k8s/commit/811033d8144c8c9bc5414322256338dac436dbce))
+
+## [1.0.0-rc.3](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.2...operator/v1.0.0-rc.3) (2026-06-02)
+
+
+### Miscellaneous
+
+* **deps:** update k8s.io/utils digest to ff6756f ([#110](https://github.com/qvest-digital/mxl-k8s/issues/110)) ([c60f82d](https://github.com/qvest-digital/mxl-k8s/commit/c60f82d51f842646a2bc9121d9d04cd663edad87))
+* **deps:** update module github.com/qvest-digital/mxl-k8s/api to v1.0.0-rc.2 ([#105](https://github.com/qvest-digital/mxl-k8s/issues/105)) ([6652a9f](https://github.com/qvest-digital/mxl-k8s/commit/6652a9f297fb8eb84d0a2f149f0788b8362a79ef))
+
+## [1.0.0-rc.2](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.1...operator/v1.0.0-rc.2) (2026-05-27)
+
+
+### Features
+
+* **operator,gateway,agent:** harden MxlFlowMirror lifecycle ([#79](https://github.com/qvest-digital/mxl-k8s/issues/79)) ([a8aa3e3](https://github.com/qvest-digital/mxl-k8s/commit/a8aa3e306ea77e8856008d0dad57a0052331db3b))
+
+
+### Bug Fixes
+
+* **operator:** refcount shared mirrors via OwnerReferences ([#86](https://github.com/qvest-digital/mxl-k8s/issues/86)) ([48f27c2](https://github.com/qvest-digital/mxl-k8s/commit/48f27c29af6162fe071891305f45e79abd6e0513))
+* **operator:** require LabelCreatedByReceiverNamespace on cross-ns adopt ([8fd6dc1](https://github.com/qvest-digital/mxl-k8s/commit/8fd6dc1634211c7e368ef703cbf9e6b0e03a1431))
+* **operator:** scrub mirror owner refs to dead receivers ([8fd6dc1](https://github.com/qvest-digital/mxl-k8s/commit/8fd6dc1634211c7e368ef703cbf9e6b0e03a1431))
+* **operator:** scrub mirror refs to dead receivers ([#90](https://github.com/qvest-digital/mxl-k8s/issues/90)) ([8fd6dc1](https://github.com/qvest-digital/mxl-k8s/commit/8fd6dc1634211c7e368ef703cbf9e6b0e03a1431))
+
+## [1.0.0-rc.1](https://github.com/qvest-digital/mxl-k8s/compare/operator/v1.0.0-rc.0...operator/v1.0.0-rc.1) (2026-05-18)
+
+
+### Features
+
+* **operator:** implement MxlReceiver reconciler ([2f46c6f](https://github.com/qvest-digital/mxl-k8s/commit/2f46c6fc3992b0e01de14bc538d9fac1a7bcdf33))
+* **operator:** scaffold controller-manager with observe-only reconcilers ([5cb2306](https://github.com/qvest-digital/mxl-k8s/commit/5cb23065f771bb34cf4e81a0ff83525f9666bba5))
+
+
+### Bug Fixes
+
+* **operator:** re-reconcile receivers on bound mirror changes ([2ad6ff1](https://github.com/qvest-digital/mxl-k8s/commit/2ad6ff122c461f9d26fa8c0e723e83c44b2ddf01))
+
+
+### Build System
+
+* **deps:** bump in-repo api dependency to 1.0.0-rc.1 ([#32](https://github.com/qvest-digital/mxl-k8s/issues/32)) ([2c4f802](https://github.com/qvest-digital/mxl-k8s/commit/2c4f80248cb05a0fe36aceb50db545096363b4b8))
+
+
+### Miscellaneous
+
+* scaffold multi-module go workspace and CI ([11f4159](https://github.com/qvest-digital/mxl-k8s/commit/11f41597db99c5de1b47dfa7a5060ecc3090cebf))

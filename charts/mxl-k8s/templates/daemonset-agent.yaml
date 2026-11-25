@@ -1,0 +1,209 @@
+{{- if and .Values.mxlfs.enabled (not .Values.agent.enabled) }}
+{{- fail "mxlfs.enabled requires agent.enabled: the agent mounts mxlfs and writes the ready marker the gateway and exporter wait for" }}
+{{- end }}
+{{- if .Values.agent.enabled }}
+{{- if and .Values.agent.csi.enabled (not .Values.mxlfs.enabled) }}
+{{- fail "agent.csi.enabled requires mxlfs.enabled" }}
+{{- end }}
+{{- if and .Values.mxlfs.enabled (not .Values.agent.hostPID) }}
+{{- fail "mxlfs.enabled requires agent.hostPID: the agent finds the pod of each process opening a placeholder, and the readers of each redundancy set output, through /proc" }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Chart.Name }}-agent
+  namespace: {{ include "mxlk8s.namespace" . }}
+  labels:
+    {{- include "mxlk8s.componentLabels" (dict "Context" . "component" "agent") | nindent 4 }}
+  {{- with .Values.global.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mxlk8s.selectorLabels" (dict "Context" . "component" "agent") | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.agent.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mxlk8s.componentLabels" (dict "Context" . "component" "agent") | nindent 8 }}
+        {{- with .Values.agent.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.agent.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "mxlk8s.serviceAccountName" (dict "Context" . "component" "agent" "values" .Values.agent) }}
+      hostPID: {{ .Values.agent.hostPID }}
+      {{- with .Values.global.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.agent.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $moduleWait := and .Values.mxlfs.enabled (gt (int .Values.mxlfs.moduleWaitSeconds) 0) }}
+      {{- if or $moduleWait .Values.agent.initContainers }}
+      initContainers:
+        {{- if $moduleWait }}
+        {{- include "mxlk8s.mxlfs.moduleWaitContainer" . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.agent.initContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "mxlk8s.image" (dict "Context" . "image" .Values.agent.image) }}
+          imagePullPolicy: {{ include "mxlk8s.imagePullPolicy" (dict "global" .Values.global "image" .Values.agent.image) }}
+          args:
+            {{- include "mxlk8s.flags.render" (dict "flags" .Values.agent.flags "keepEmpty" (list "shimPath")) | nindent 12 }}
+            {{- if .Values.mxlfs.enabled }}
+            - --mxlfs
+            {{- with .Values.mxlfs.huge }}
+            - --mxlfs-huge={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- $numa := include "mxlk8s.numa.mode" . }}
+            {{- $placement := .Values.mxlfs.numa.placement }}
+            {{- if ne $numa "off" }}
+            - --mxlfs-numa-placement-mode={{ $numa }}
+            {{- end }}
+            {{- if eq $numa "node" }}
+            - --mxlfs-numa-placement-node-default={{ $placement.node.default | default "auto" }}
+            {{- end }}
+            {{- if eq $numa "flow" }}
+            - --mxlfs-numa-placement-flow-default={{ $placement.flow.default | default "local" }}
+            - --mxlfs-numa-placement-flow-release-period={{ $placement.flow.release.period }}
+            - --mxlfs-numa-placement-flow-release-delay={{ $placement.flow.release.delay }}
+            - --mxlfs-numa-placement-flow-release-rate={{ $placement.flow.release.rate }}
+            {{- end }}
+            {{- if .Values.agent.csi.enabled }}
+            - --csi-endpoint=unix:///csi/csi.sock
+            {{- end }}
+            {{- with .Values.agent.args }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- with .Values.agent.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: probe
+              containerPort: 8081
+            - name: metrics
+              containerPort: 8080
+          {{- with .Values.agent.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.agent.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.mxlfs.enabled }}
+          # Bidirectional mount propagation is only granted to a
+          # privileged container.
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            readOnlyRootFilesystem: true
+          {{- else }}
+          {{- with .Values.agent.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+          volumeMounts:
+            - name: mxl-run
+              mountPath: {{ .Values.agent.hostPath.run }}
+              {{- if .Values.mxlfs.enabled }}
+              # The mxlfs the agent mounts on each domain has to reach
+              # the host, and every pod that mounts the domain from it.
+              mountPropagation: Bidirectional
+              {{- end }}
+            {{- if .Values.agent.csi.enabled }}
+            - name: csi-socket
+              mountPath: /csi
+            - name: kubelet-pods
+              mountPath: {{ .Values.agent.csi.kubeletDir }}/pods
+              mountPropagation: Bidirectional
+            {{- end }}
+            {{- with .Values.agent.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- if .Values.agent.csi.enabled }}
+        - name: csi-registrar
+          image: "{{ .Values.agent.csi.registrar.image.repository }}:{{ .Values.agent.csi.registrar.image.tag }}"
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ .Values.agent.csi.kubeletDir }}/plugins/mxl.qvest-digital.com/csi.sock
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.agent.csi.registrar.resources | nindent 12 }}
+          volumeMounts:
+            - name: csi-socket
+              mountPath: /csi
+            - name: registration
+              mountPath: /registration
+        {{- end }}
+        {{- with .Values.agent.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: mxl-run
+          hostPath:
+            path: {{ .Values.agent.hostPath.run }}
+            type: {{ .Values.agent.hostPath.type }}
+        {{- if .Values.agent.csi.enabled }}
+        - name: csi-socket
+          hostPath:
+            path: {{ .Values.agent.csi.kubeletDir }}/plugins/mxl.qvest-digital.com
+            type: DirectoryOrCreate
+        - name: registration
+          hostPath:
+            path: {{ .Values.agent.csi.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: kubelet-pods
+          hostPath:
+            path: {{ .Values.agent.csi.kubeletDir }}/pods
+            type: Directory
+        {{- end }}
+        {{- with .Values.agent.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

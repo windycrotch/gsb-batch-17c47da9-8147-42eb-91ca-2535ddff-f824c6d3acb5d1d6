@@ -1,0 +1,123 @@
+package v1alpha1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// MxlReceiverPhase is the lifecycle state of a receiver.
+// +kubebuilder:validation:Enum=Pending;Bound;Failed
+type MxlReceiverPhase string
+
+const (
+	// MxlReceiverPending means the receiver is not served yet: no
+	// target pod is scheduled, the flow has no source to mirror it
+	// from, or a mirror it needs cannot be created yet.
+	MxlReceiverPending MxlReceiverPhase = "Pending"
+	// MxlReceiverBound means every target node has what it reads the
+	// flow from: the node that produces the flow reads it there, and
+	// every other node through an MxlFlowMirror, whose own status
+	// reports materialization progress. A flow with no Origin location
+	// that is the output of an MxlFlowRedundancySet Valid at its
+	// current generation gets no mirror: the gateway merges it on each
+	// node it is read on.
+	MxlReceiverBound MxlReceiverPhase = "Bound"
+	// MxlReceiverFailed is accepted by the schema. The operator does
+	// not set it.
+	MxlReceiverFailed MxlReceiverPhase = "Failed"
+)
+
+// MxlReceiverSpec declares that one or more Pods want a flow
+// available locally on their node.
+//
+// +kubebuilder:validation:XValidation:rule="(has(self.podSelector)?1:0)+(has(self.podRef)?1:0)==1",message="exactly one of podSelector or podRef must be set"
+type MxlReceiverSpec struct {
+	// FlowID is the MXL flow the consumer wants to read.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`
+	FlowID string `json:"flowID"`
+
+	// Domain is the MxlDomain the flow belongs to, one without a
+	// spec.directory, whose flows live at domains/<id>. Empty is the
+	// primary domain, the one the agent's --domain-path names, and the
+	// only spelling of it; every object written before domains existed
+	// carries none. Immutable: the same id in another domain is another
+	// flow.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="domain is immutable"
+	Domain string `json:"domain,omitempty"`
+
+	// PodSelector matches the consumer Pods in this namespace whose
+	// nodes should have the flow materialized. Exactly one of
+	// podSelector / podRef must be set.
+	// +optional
+	PodSelector *metav1.LabelSelector `json:"podSelector,omitempty"`
+
+	// PodRef pins this receiver to a single Pod in this namespace.
+	// Exactly one of podSelector / podRef must be set.
+	// +optional
+	PodRef *PodRef `json:"podRef,omitempty"`
+
+	// Provider selects the libmxl-fabrics provider used to move
+	// grains. Defaults to auto.
+	// +kubebuilder:default=auto
+	// +optional
+	Provider MxlFabricsProvider `json:"provider,omitempty"`
+}
+
+// MxlReceiverStatus reports the runtime state of a receiver.
+type MxlReceiverStatus struct {
+	// BoundMirror names the first of the MxlFlowMirrors that satisfy
+	// this receiver. Empty on a receiver bound with no mirror.
+	// +optional
+	BoundMirror *MirrorRef `json:"boundMirror,omitempty"`
+
+	// Phase tracks the receiver lifecycle.
+	// +optional
+	Phase MxlReceiverPhase `json:"phase,omitempty"`
+
+	// ObservedGeneration is the spec generation last reconciled.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Conditions describes the current state of the receiver.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:resource:scope=Namespaced,shortName=mxlr
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name=Flow,type=string,JSONPath=`.spec.flowID`
+// +kubebuilder:printcolumn:name=Phase,type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name=Age,type=date,JSONPath=`.metadata.creationTimestamp`
+
+// MxlReceiver expresses a consumer Pod's intent to read an MXL flow.
+// The operator translates each MxlReceiver into one MxlFlowMirror per
+// distinct target node.
+//
+// If another receiver already targets the same (flowID, target node),
+// the existing MxlFlowMirror is reused and this receiver is appended
+// to its metadata.ownerReferences as a non-controller owner. Deleting
+// the receiver removes its owner ref from each mirror it shares; the
+// mirror is torn down by the operator only when its last owner ref
+// goes away. The owners on a mirror are visible via kubectl describe.
+type MxlReceiver struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   MxlReceiverSpec   `json:"spec,omitempty"`
+	Status MxlReceiverStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// MxlReceiverList is a list of MxlReceiver resources.
+type MxlReceiverList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []MxlReceiver `json:"items"`
+}

@@ -1,0 +1,181 @@
+suite: rbac
+templates:
+  - templates/rbac-operator.yaml
+  - templates/rbac-agent.yaml
+  - templates/rbac-gateway.yaml
+tests:
+  - it: rbac.create=false suppresses every ClusterRole and Binding
+    set:
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: disabling a component drops its ClusterRole regardless of rbac.create
+    set:
+      operator.enabled: false
+      agent.enabled: false
+    template: templates/rbac-operator.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: gateway rbac is present by default
+    template: templates/rbac-gateway.yaml
+    asserts:
+      - hasDocuments:
+          count: 4
+      - isKind:
+          of: ClusterRole
+        documentIndex: 0
+      - isKind:
+          of: ClusterRoleBinding
+        documentIndex: 1
+      - isKind:
+          of: Role
+        documentIndex: 2
+      - isKind:
+          of: RoleBinding
+        documentIndex: 3
+
+  - it: gateway writes mirror heartbeat Leases in its own namespace only
+    template: templates/rbac-gateway.yaml
+    release:
+      namespace: mxl-system
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: mxl-system
+        documentIndex: 2
+      - contains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [get, list, watch, create, update, patch, delete]
+        documentIndex: 2
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [coordination.k8s.io]
+            resources: [leases]
+            verbs: [get, list, watch, create, update, patch, delete]
+        documentIndex: 0
+
+  - it: gateway role can publish and read mirror target descriptors
+    template: templates/rbac-gateway.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [mxl.qvest-digital.com]
+            resources: [mxlflowmirrortargets]
+            verbs: [get, list, watch, create, update, patch]
+
+  - it: agent role can list pods so the intent dispatcher can resolve SO_PEERCRED PIDs
+    template: templates/rbac-agent.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [pods]
+            verbs: [get, list, watch]
+
+  - it: agent role can delete mirrors so it can drop one whose origin moved onto its node
+    template: templates/rbac-agent.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [mxl.qvest-digital.com]
+            resources: [mxlflowmirrors]
+            verbs: [get, list, watch, create, update, patch, delete]
+
+  - it: gateway role can get nodes so it can tell a reclaimed node from a live one
+    template: templates/rbac-gateway.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [nodes]
+            verbs: [get]
+
+  - it: gateway role can read MxlDomains to open a mirror's domain by its directory
+    template: templates/rbac-gateway.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [mxl.qvest-digital.com]
+            resources: [mxlflows, mxldomains]
+            verbs: [get, list, watch]
+
+  - it: operator role can watch nodes so it can prune locations of departed ones
+    template: templates/rbac-operator.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [nodes]
+            verbs: [get, list, watch]
+
+  - it: agent reads domains but writes only its status entry
+    template: templates/rbac-agent.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [mxl.qvest-digital.com]
+            resources: [mxldomains]
+            verbs: [get, list, watch]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: [nodes]
+            verbs: [get]
+
+  - it: operator can delete an MxlDomain left in the per-node shape
+    template: templates/rbac-operator.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [mxl.qvest-digital.com]
+            resources: [mxldomains]
+            verbs: [get, list, watch, delete]
+
+  - it: grants the agent claim status only when it writes status.io
+    template: templates/rbac-agent.yaml
+    documentIndex: 0
+    set:
+      agent.flags.claimStatusLabel: app.kubernetes.io/instance
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [dmf.qvest-digital.com]
+            resources: [mediafunctionclaims/status]
+            verbs: [patch]
+
+  - it: grants the agent nothing on claims by default
+    template: templates/rbac-agent.yaml
+    documentIndex: 0
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [dmf.qvest-digital.com]
+            resources: [mediafunctionclaims/status]
+            verbs: [patch]

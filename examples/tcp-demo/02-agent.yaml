@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mxl-domain-agent
+  namespace: mxl-system
+  labels:
+    app.kubernetes.io/name: mxl-domain-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mxl-domain-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mxl-domain-agent
+    spec:
+      serviceAccountName: mxl-domain-agent
+      # hostPID: the intent socket uses SO_PEERCRED to identify the
+      # caller, and resolves PID->Pod via /proc/<pid>/cgroup. Both
+      # require the agent's PID namespace and /proc view to match
+      # the host's.
+      hostPID: true
+      containers:
+        - name: agent
+          image: ghcr.io/qvest-digital/mxl-k8s/agent:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --domain-path=/run/mxl/domain
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # CAP_SYS_ADMIN: fanotify_init in FAN_CLASS_NOTIF mode.
+          securityContext:
+            capabilities:
+              add: ["SYS_ADMIN"]
+          ports:
+            - name: probe
+              containerPort: 8081
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probe
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probe
+            initialDelaySeconds: 2
+          # /run/mxl is mounted (rather than /run/mxl/domain only)
+          # so the intent socket the agent creates at
+          # /run/mxl/agent.sock lands on the host and consumer pods
+          # can bind-mount it.
+          volumeMounts:
+            - name: mxl-run
+              mountPath: /run/mxl
+      volumes:
+        - name: mxl-run
+          hostPath:
+            path: /run/mxl
+            type: DirectoryOrCreate

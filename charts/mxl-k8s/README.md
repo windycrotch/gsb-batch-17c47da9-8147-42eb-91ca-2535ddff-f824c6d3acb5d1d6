@@ -1,0 +1,440 @@
+# mxl-k8s
+
+Kubernetes control plane for MXL (Media eXchange Layer). Installs the operator, per-node agent and gateway, CRDs, and RBAC.
+
+![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
+
+## Prerequisites
+
+- Helm >= 3.14 (chart uses `values.schema.json`).
+- Kubernetes >= 1.28.
+- Kernel >= 5.17 on every node that runs the agent (`fanotify` with
+  `FAN_REPORT_DFID_NAME`).
+- Prometheus Operator CRDs (`monitoring.coreos.com`) optional, only
+  when `*.metrics.serviceMonitor.enabled=true`.
+- The [mxlfs](https://github.com/danielclasen/mxlfs) kernel module,
+  only when `mxlfs.enabled=true`. A node without it keeps plain domain
+  directories. `mxlfs.huge` needs mxlfs 0.1.0-rc.4 or later;
+  an older module gets the domain mounted without `huge=`.
+  `mxlfs.numa.placement.mode` `node` needs an mxlfs module with
+  `numa_node=`; an older one gets the domain mounted without it. `flow`
+  and `mxlfs.numa.metrics.enabled` need the module's NUMA ioctls; with
+  an older one the rings stay where they are and the NUMA series are
+  left out.
+
+## NUMA placement
+
+`mxlfs.numa.placement.mode` decides on which NUMA node the pages of the
+rings of mxlfs domains are allocated. `off` leaves it to the process
+that allocates them. `node` mounts every domain with
+`mxlfs.numa.placement.node.default` as `numa_node=`. `flow` places
+each ring by its use: the gateway holds the ring of every flow it
+registers with a NIC from before the registration until the last one
+ends, and moves it to the NICs' node first; a target's ring is
+allocated there. The agent moves a ring nothing holds to the node every
+local writer and reader of the flow is confined to, CPUs and memory,
+which needs CPU pinning, and only once it has stayed unheld for
+`mxlfs.numa.placement.flow.release.delay`. A process is confined to a
+node when every CPU its threads may run on is on that node and it may
+allocate from it; a flow with any other local writer or reader counts as
+`unpinned` in `mxl_agent_numa_release_flows`, and the agent never moves
+its ring. On a node whose RDMA devices report no single NUMA node,
+`flow` acts as `off` and the agent and gateway record a
+`MxlfsNumaFlowUnresolved` warning event on the Node.
+
+A page goes to the file's own node preference first, then to the
+mount's `numa_node=`, then to the allocating task's memory policy. A
+file has a preference only in `flow` mode: a moved ring keeps it, so
+its later pages follow it.
+
+## Install via Helm CLI
+
+<!-- x-release-please-start-version -->
+```sh
+helm install mxl oci://ghcr.io/qvest-digital/mxl-k8s/charts/mxl-k8s \
+  --version 1.1.0-rc.61 \
+  --namespace mxl-system --create-namespace
+```
+<!-- x-release-please-end -->
+
+The chart installs the CRDs from its `crds/` directory on first
+install. Helm itself never updates or removes them, and a `helm upgrade`
+of a release installed before a CRD existed does not create it either.
+`mxlfs.enabled=true` needs the `MxlFlowRedundancySet` CRD, without which
+the agent, gateway and operator refuse to start; on such a release,
+apply the chart's CRDs before enabling mxlfs:
+
+<!-- x-release-please-start-version -->
+```sh
+helm show crds oci://ghcr.io/qvest-digital/mxl-k8s/charts/mxl-k8s \
+  --version 1.1.0-rc.61 | kubectl apply --server-side -f -
+```
+<!-- x-release-please-end -->
+
+The FluxCD example below sets `upgrade.crds: CreateReplace`, which
+creates and updates them on every upgrade.
+
+## Install via FluxCD
+
+<!-- x-release-please-start-version -->
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: mxl-k8s
+  namespace: flux-system
+spec:
+  type: oci
+  interval: 1h
+  url: oci://ghcr.io/qvest-digital/mxl-k8s/charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: mxl-k8s
+  namespace: mxl-system
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: mxl-k8s
+      version: "1.1.0-rc.61"
+      sourceRef:
+        kind: HelmRepository
+        name: mxl-k8s
+        namespace: flux-system
+  install:
+    createNamespace: true
+    crds: Create
+  upgrade:
+    crds: CreateReplace
+  values: {}
+```
+<!-- x-release-please-end -->
+
+Track `:dev` instead of a semver range by setting `version: ">=0.0.0-0"`
+on the HelmRelease. The chart is published as `0.0.0-dev+sha.<short>`
+on every merge to `main`; Helm encodes the `+` as `_` in the OCI tag.
+
+## Upgrading
+
+Gateways are upgraded node by node, so a mirror's source and target can
+run different releases for a while. A gateway after 1.1.0-rc.25 sends a
+data grain with no valid slice as an empty one; a target gateway of
+1.1.0-rc.25 or earlier commits that grain as full, with whatever its
+slot held, until it is upgraded too.
+
+After 1.1.0-rc.45, the gateway ServiceMonitor copies a pod's
+`mxl.qvest-digital.com/gateway-variant` label to a `variant` label on
+every gateway series, `mxl_gateway_mirror_*` included. A gateway of a
+`gateway.variants` entry therefore starts new series once on that
+upgrade: the old label set ends and one with `variant` begins, which a
+`rate()` spanning the upgrade or a rule matching the full label set sees
+as two series. Pods of the base gateway carry no variant and keep their
+label sets.
+
+1.1.0-rc.57 publishes each mirror's target descriptor in an
+`MxlFlowMirrorTarget`, names it on the mirror by `status.targetInfoHash`,
+and moves each side's progress timestamp into a heartbeat Lease in
+`mxl-system`, beside the Origin Leases, renewed every five seconds while
+grains move. It still wrote `status.targetInfo`, `status.lastGrainAt`
+and `status.lastSentAt` for gateways and agents that predate it.
+
+1.1.0-rc.60 deprecates those three fields and no longer writes or
+reads them. They stay in the CRD, so a 1.1.0-rc.57 gateway on a node
+not yet upgraded is not rejected for writing them, but nothing fills
+them any more, and the first write of each side's manager removes what
+the previous release left there. Every gateway and agent must run 1.1.0-rc.57 or later
+before upgrading to it: an older source gateway dials only
+`status.targetInfo` and never reaches its target, an older target
+gateway reads the source's progress only from `status.lastSentAt` and
+rebuilds no wedged fabric side, and an older agent waits for
+`status.targetInfo` before it reports an on-demand mirror Ready. The
+gateway refuses to start where the cluster does not serve
+`MxlFlowMirrorTarget`, so the chart's CRDs have to be applied with it.
+Anything that reads a mirror's progress or descriptor reads the
+heartbeat Leases and the `MxlFlowMirrorTarget` instead.
+
+A release after 1.1.0-rc.60 removes the three fields from the
+`MxlFlowMirror` CRD; its changelog lists the removal as a breaking
+change. The API server rejects a server-side apply that names a field
+the schema does not declare, so a gateway still writing them has every
+descriptor, progress and phase write refused. Every gateway, agent and operator must run
+1.1.0-rc.60 or later before upgrading to the release that removes them.
+
+## Bundled image versions
+
+Operator, agent, and gateway are released together with this chart
+under one repository version, so a chart at `X` bundles the images
+published as `vX`. `<component>.image.tag` ships empty and resolves to
+`v{{ .Chart.AppVersion }}` at render time; there is no
+per-component pin to read or keep current.
+
+The bundled-versions table for each released chart appears in the
+GitHub release notes
+(`https://github.com/qvest-digital/mxl-k8s/releases/tag/v<X>`). The
+`:dev` chart published on every merge to `main` sets every tag to
+`dev` so it tracks main HEAD images.
+
+Overriding stays available per component: `--set
+<comp>.image.tag=<tag>` and `--set <comp>.image.digest=sha256:...`
+both win over the appVersion default, and a digest wins over a tag.
+
+## Common overrides
+
+### Minimal tcp deployment
+
+```yaml
+gateway:
+  flags:
+    providers: [tcp]
+  rdma:
+    enabled: false
+```
+
+### Full RDMA deployment (verbs + shm)
+
+```yaml
+operator:
+  replicaCount: 3
+  flags:
+    leaderElect: true
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+gateway:
+  flags:
+    providers: [verbs, shm]
+  rdma:
+    enabled: true
+    extraEnv:
+      - name: FI_VERBS_IFACE
+        value: net1
+```
+
+### Private registry with pinned digests
+
+```yaml
+global:
+  image:
+    registry: registry.internal.example.com/mxl-k8s
+    pullPolicy: Always
+    pullSecrets:
+      - name: registry-pull-secret
+operator:
+  image:
+    digest: sha256:<digest>
+agent:
+  image:
+    digest: sha256:<digest>
+gateway:
+  image:
+    digest: sha256:<digest>
+```
+
+### IRSA-style ServiceAccount bindings
+
+```yaml
+operator:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/mxl-operator
+```
+
+## Source Code
+
+* <https://github.com/qvest-digital/mxl-k8s>
+
+## Requirements
+
+Kubernetes: `>=1.28-0`
+
+## Values
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| agent | object | `{"affinity":{},"args":[],"containerSecurityContext":{"allowPrivilegeEscalation":false,"capabilities":{"add":["SYS_ADMIN"],"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":false},"csi":{"enabled":false,"kubeletDir":"/var/lib/kubelet","registrar":{"image":{"repository":"registry.k8s.io/sig-storage/csi-node-driver-registrar","tag":"v2.15.0"},"resources":{"limits":{},"requests":{"cpu":"5m","memory":"16Mi"}}}},"enabled":true,"extraContainers":[],"extraEnv":[],"extraVolumeMounts":[],"extraVolumes":[],"flags":{"claimStatusLabel":"","domainPath":"/run/mxl/domain","healthProbeBindAddress":":8081","intentApiBurst":100,"intentApiQps":50,"intentMirrorBurst":8,"intentMirrorBurstWindow":"10s","intentMirrorsPerNode":128,"intentMirrorsPerPod":64,"intentSocket":"/run/mxl/agent.sock","kubeApiBurst":100,"kubeApiQps":50,"materializeTimeout":"5s","metricsBindAddress":":8080","observedRefreshInterval":"5m","provider":"","resyncPeriod":"30s","shimPath":"/run/mxl/libmxl-intent.so","zapLogLevel":"info"},"hostPID":true,"hostPath":{"run":"/run/mxl","type":"DirectoryOrCreate"},"image":{"digest":"","pullPolicy":"","repository":"agent","tag":""},"initContainers":[],"livenessProbe":{"httpGet":{"path":"/healthz","port":"probe"},"initialDelaySeconds":5},"metrics":{"service":{"enabled":true,"port":8080,"type":"ClusterIP"},"serviceMonitor":{"enabled":false,"interval":"30s","labels":{},"metricRelabelings":[],"relabelings":[],"scrapeTimeout":"10s"}},"nodeSelector":{},"podAnnotations":{},"podLabels":{},"podSecurityContext":{},"priorityClassName":"","readinessProbe":{"httpGet":{"path":"/readyz","port":"probe"},"initialDelaySeconds":2},"resources":{"limits":{},"requests":{"cpu":"25m","memory":"32Mi"}},"serviceAccount":{"annotations":{},"automountServiceAccountToken":true,"create":true,"labels":{},"name":""},"tolerations":[],"topologySpreadConstraints":[],"updateStrategy":{"rollingUpdate":{"maxUnavailable":1},"type":"RollingUpdate"}}` | Agent: per-node DaemonSet that watches the MXL domain via fanotify, publishes flow state, and serves the LD_PRELOAD intent socket. |
+| agent.containerSecurityContext.runAsNonRoot | bool | `false` | fanotify on /run/mxl/domain reads host inodes, so the agent currently runs as root. PSA-restricted environments cannot host the agent without a policy exception. |
+| agent.csi | object | `{"enabled":false,"kubeletDir":"/var/lib/kubelet","registrar":{"image":{"repository":"registry.k8s.io/sig-storage/csi-node-driver-registrar","tag":"v2.15.0"},"resources":{"limits":{},"requests":{"cpu":"5m","memory":"16Mi"}}}}` | CSI node plugin that delivers the domain to pods as an inline ephemeral volume (driver mxl.qvest-digital.com), with the volume attributes domain (an MxlDomain name; empty for the primary domain) and access (read, the default, or write). Requires mxlfs.enabled. A publish is refused, and retried by the kubelet, until the agent has mounted the domain or left it plain. Write access is granted to any pod that asks for it in its volume attributes, and the domain directory is mode 0777, so a pod with write access can create, overwrite or remove any flow in the domain. |
+| agent.csi.kubeletDir | string | `"/var/lib/kubelet"` | The kubelet's root directory on the node. |
+| agent.flags.claimStatusLabel | string | `""` | Pod label naming a pod's dmf-k8s MediaFunctionClaim, in the pod's namespace. When set, the agent writes each such claim's status.io from the flows its pods on the node are observed to read and write, and gets RBAC for mediafunctionclaims. dmf-k8s names a function's Helm release after its claim, so app.kubernetes.io/instance names it. Empty disables. |
+| agent.flags.intentApiBurst | int | `100` | Client-side burst above intentApiQps. |
+| agent.flags.intentApiQps | int | `50` | Client-side request rate of a second API client, which serves pod lookups and on-demand mirrors: what a reader's open, or its wait on a missing flow, asks of the API server. Its limit is its own, so readers asking for many flows do not spend the rate flow publishing and Lease renewal run on. |
+| agent.flags.intentMirrorBurst | int | `8` | Most mirrors the agent creates on demand for one pod within intentMirrorBurstWindow, so a process opening every flow at once, as a glob over the domain does, gets only a few at a time. The history is the agent's memory and starts afresh when the agent restarts. 0 is unlimited. |
+| agent.flags.intentMirrorsPerNode | int | `128` | Most live mirrors the agent creates on demand onto its node, for all pods together, over their lifetimes. 0 is unlimited. |
+| agent.flags.intentMirrorsPerPod | int | `64` | Most live mirrors the agent creates on demand for one pod, the mirrors a process opening a flow absent here asks for. Such a mirror lives as long as the pod, read or not, so this is a cap on what the pod accumulates over its lifetime; intentMirrorBurst is what stops a glob. A refused request is logged and recorded as an event on the pod: a process waiting on the open gets ENOENT, and one that already opened the flow's placeholder on an mxlfs domain is asked for again while it runs if the burst limit refused it; a refusal by this count is final. Mirrors an MxlReceiver or a redundancy set declares are not counted; one the agent handed to the pod because it still reads it after its requestor went is. 0 is unlimited. |
+| agent.flags.kubeApiBurst | int | `100` | Client-side burst above kubeApiQps. 0 leaves the client-go default in place. |
+| agent.flags.kubeApiQps | int | `50` | Client-side request rate to the API server. A node holding many flows spends one Get and one Update per flow per renewal pass; at the client-go default of 5 the loop blocks rather than fails, stretching past the Lease duration it exists to keep fresh. 0 leaves the client-go default in place. |
+| agent.flags.observedRefreshInterval | string | `"5m"` | How old a flow location's lastObserved may grow before the agent stamps it again; must be positive. Each stamp is a write of the whole MxlFlow status. Flow directories appearing and vanishing are rescanned every 30s regardless, so 30s or less stamps on every rescan. |
+| agent.flags.provider | string | `""` | Explicit libmxl-fabrics provider stamped onto on-demand (intent-driven) mirrors, bypassing per-node resolution. Empty (or "auto") resolves a concrete provider from the source and target nodes' MxlNodeCapabilities; set a concrete value to force one cluster-wide. |
+| agent.flags.shimPath | string | `"/run/mxl/libmxl-intent.so"` | Where the agent drops the copy of libmxl-intent.so its image carries, on every start. A consumer that already mounts hostPath.run for the intent socket preloads the shim from there instead of copying it out of the carrier image with an initContainer. Keep the path under hostPath.run, or consumer pods cannot see it. Empty disables the drop. |
+| agent.hostPID | bool | `true` | Run the agent in the host PID namespace. Required for the intent socket's SO_PEERCRED-based pod identification: without it the connecting consumer pod's PID is not visible to the agent and the on-demand mirror materialization path silently fails. mxlfs.enabled requires it. |
+| agent.hostPath | object | `{"run":"/run/mxl","type":"DirectoryOrCreate"}` | hostPath layout. The agent mounts the whole /run/mxl so the intent socket lands on the host where consumer pods can see it. |
+| agent.image.tag | string | `""` | Image tag. Empty defaults to the chart appVersion prefixed with "v": the agent image is released under the chart version. Set this or image.digest. |
+| agent.podSecurityContext | object | `{}` | Pod-level security context, rendered into the pod spec as given. The agent mounts the same host run directory as the gateway and writes to it, so an SELinux-enabled node needs seLinuxOptions here for the reason documented on gateway.podSecurityContext. |
+| cleanup | object | `{"preDeleteDomainWipe":{"enabled":true,"guardImage":"bitnami/kubectl:1.31","image":"busybox:1.38","nodeCount":1,"podSecurityContext":{},"timeoutSeconds":120}}` | Pre-delete lifecycle hooks. The domain wipe removes stale .mxl-flow directories under gateway.flags.domainPath at chart uninstall, because they live on a hostPath and survive namespace and CRD teardown. |
+| cleanup.preDeleteDomainWipe.enabled | bool | `true` | Wipe stale .mxl-flow directories under gateway.flags.domainPath during helm uninstall, closing the cold-reinstall lifecycle bug where surviving hostPath state from a prior install causes the agent classifier to default the dirs to Origin on the next install (ghost source-side initiator).  Set to false if either applies:   - producers (libmxl writers) are still mmap-attached to files     under domainPath at uninstall time. rm -rf does not crash     producers (mmap regions survive unlink), but their writes     are orphaned from any new consumer. Drain producers first,     then uninstall.   - host state under domainPath is intentionally reused across     chart reinstalls (advanced; expect to clean up manually to     avoid the ghost-initiator bug). |
+| cleanup.preDeleteDomainWipe.guardImage | string | `"bitnami/kubectl:1.31"` | Image used by the nodecount-guard init-container. Must carry a kubectl binary on PATH. |
+| cleanup.preDeleteDomainWipe.image | string | `"busybox:1.38"` | Image used by the cleanup Job. Pinned tag (no :latest). |
+| cleanup.preDeleteDomainWipe.nodeCount | int | `1` | Effective node count for the agent DaemonSet. An under-set value yields a partial wipe; the nodecount-guard init-container fails the chart with a clear error in that case. |
+| cleanup.preDeleteDomainWipe.podSecurityContext | object | `{}` | Pod-level security context for the cleanup Job, rendered into the pod spec as given. The Job removes directories inside the domain hostPath, which is the same write an SELinux-enabled node denies the gateway, so it needs the seLinuxOptions documented on gateway.podSecurityContext. Carried separately because the Job is a helm hook and takes none of the gateway's pod settings. |
+| cleanup.preDeleteDomainWipe.timeoutSeconds | int | `120` | Per-pod completion timeout. |
+| crds | object | `{"skipInstall":false}` | CRD handling. The chart installs CRDs from its crds/ directory by default. Helm only installs them on first install and never deletes or upgrades them; Flux's HelmRelease.spec.{install,upgrade}.crds governs replace semantics. Set skipInstall=true when CRDs are managed by a separate Kustomization or operator framework. |
+| dashboards.annotations | object | `{"grafana_folder":"MXL"}` | Annotations on the ConfigMaps. grafana_folder places the dashboard when the sidecar runs with folderAnnotation set. |
+| dashboards.datasourceUid | string | `"prometheus"` | uid of the Prometheus datasource the panels query. The default is what kube-prometheus-stack names its own; a Grafana provisioned otherwise states its uid here. |
+| dashboards.enabled | bool | `false` | Ship the bundled dashboards. |
+| dashboards.labels | object | `{"grafana_dashboard":"1"}` | Labels the sidecar selects on. A deployment configured with a non-empty sidecar labelValue, or selecting on a release label, sets its own here. |
+| dashboards.namespace | string | `""` | Namespace to place the ConfigMaps in. Empty uses the release namespace. The sidecar's searchNamespace defaults to the namespace Grafana runs in, so a Grafana installed elsewhere needs either that setting widened or this pointed at it. |
+| domains | list | `[{"description":"","directory":"domain","historyDuration":"","id":"","label":"","name":"default","nodeSelector":{},"tags":{}}]` | MXL domains the chart creates as MxlDomain objects. Each one is materialised by the agent on every selected node as a directory under agent.hostPath.run carrying domain_def.json, the identity BCP-007-03 NMOS nodes publish as mxl_domain_id. Flows are tracked and mirrored between nodes in the domain whose directory is the base of agent.flags.domainPath and in every domain without a directory, which lives at domains/<id>; one in any other directory is materialised on each node but not mirrored. Set an empty list to manage MxlDomains outside the chart. |
+| domains[0].description | string | `""` | domain_def.json description. |
+| domains[0].directory | string | `"domain"` | Directory below the runtime root, immutable. The base of agent.flags.domainPath for the primary domain; empty places the domain at domains/<id>. |
+| domains[0].historyDuration | string | `""` | Ring depth libmxl gives new flows, written to options.json (e.g. "2s"). Empty leaves options.json alone. |
+| domains[0].id | string | `""` | Domain identity, a lowercase UUID. Empty keeps the id an existing object already has, and generates one on first install. Set it where it has to be known ahead of time or has to survive the object being deleted. Also set it wherever the chart is rendered without access to the cluster (helm template, helm diff, Argo CD, a GitOps render step): there the lookup finds nothing and every render generates a new id, which the API server then refuses as a change to an immutable field. |
+| domains[0].label | string | `""` | domain_def.json label. |
+| domains[0].name | string | `"default"` | Object name. |
+| domains[0].nodeSelector | object | `{}` | Nodes the domain is materialised on. Empty is every agent node. |
+| domains[0].tags | object | `{}` | domain_def.json tags, each an array of strings. |
+| exporter.affinity | object | `{}` |  |
+| exporter.args | list | `[]` | Extra raw args appended after the rendered flags. |
+| exporter.containerSecurityContext.allowPrivilegeEscalation | bool | `false` |  |
+| exporter.containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
+| exporter.containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
+| exporter.enabled | bool | `false` | Deploy the exporter DaemonSet. |
+| exporter.extraEnv | list | `[]` |  |
+| exporter.extraVolumeMounts | list | `[]` |  |
+| exporter.extraVolumes | list | `[]` |  |
+| exporter.flags.domainPath | string | `"/run/mxl/domain"` | Absolute path of the MXL domain directory to report on. Must resolve to the same domain the agent watches, below hostPath.run. |
+| exporter.flags.flowLifetime | string | `"5m"` | How long a departed flow keeps being exported with mxl_flow_present at 0, so a flow that ends between two scrapes leaves a record rather than a gap. One sweep of gateway.flags.domainGcInterval, so the metric set describes the domain as it is rather than as it was. |
+| exporter.flags.healthProbeBindAddress | string | `":8081"` |  |
+| exporter.flags.metricsBindAddress | string | `":8080"` |  |
+| exporter.flags.scanPeriod | string | `"5s"` | How often the domain directory is re-listed for flows that appeared or disappeared. Scrapes read the cache this maintains. |
+| exporter.flags.zapLogLevel | string | `"info"` |  |
+| exporter.hostPath | object | `{"run":"/run/mxl","type":"Directory"}` | hostPath layout. The exporter mounts the runtime root read-only; it opens libmxl flow readers and never writes into the domain. |
+| exporter.image.digest | string | `""` | Image digest. Wins over tag when set. @schema pattern: ^$|^sha256:[0-9a-f]{64}$ @schema |
+| exporter.image.pullPolicy | string | `""` |  |
+| exporter.image.repository | string | `"exporter"` |  |
+| exporter.image.tag | string | `""` | Image tag. Empty defaults to the chart appVersion prefixed with "v": the exporter image is released under the chart version. Set this or image.digest. |
+| exporter.livenessProbe.httpGet.path | string | `"/healthz"` |  |
+| exporter.livenessProbe.httpGet.port | string | `"probe"` |  |
+| exporter.livenessProbe.initialDelaySeconds | int | `5` |  |
+| exporter.livenessProbe.periodSeconds | int | `20` |  |
+| exporter.metrics.service.enabled | bool | `true` |  |
+| exporter.metrics.service.port | int | `8080` |  |
+| exporter.metrics.service.type | string | `"ClusterIP"` |  |
+| exporter.metrics.serviceMonitor.enabled | bool | `false` | Create a ServiceMonitor. Requires the monitoring.coreos.com CRDs to be installed cluster-wide. |
+| exporter.metrics.serviceMonitor.interval | string | `"30s"` |  |
+| exporter.metrics.serviceMonitor.labels | object | `{}` |  |
+| exporter.metrics.serviceMonitor.metricRelabelings | list | `[]` |  |
+| exporter.metrics.serviceMonitor.relabelings | list | `[]` |  |
+| exporter.metrics.serviceMonitor.scrapeTimeout | string | `"10s"` |  |
+| exporter.mirrorHeartbeats.enabled | bool | `true` | Publish mxl_mirror_heartbeat_age_seconds from the heartbeat Leases the gateways renew in the release namespace: seconds since each mirror side last made progress, reported by the exporter on the node of the gateway serving that side. Disabling it drops the metric and the exporter's read access to those Leases. Where the exporter cannot read them, as with rbac.create=false and no grant of its own, the metric stays empty and the rest is served. |
+| exporter.nodeSelector | object | `{}` |  |
+| exporter.podAnnotations | object | `{}` |  |
+| exporter.podLabels | object | `{}` |  |
+| exporter.podSecurityContext | object | `{}` | Pod-level security context, rendered into the pod spec as given. The exporter mounts the host run directory read-only and never writes into the domain, so it does not need the seLinuxOptions that gateway.podSecurityContext documents. |
+| exporter.priorityClassName | string | `""` |  |
+| exporter.readinessProbe.httpGet.path | string | `"/readyz"` |  |
+| exporter.readinessProbe.httpGet.port | string | `"probe"` |  |
+| exporter.readinessProbe.initialDelaySeconds | int | `2` |  |
+| exporter.readinessProbe.periodSeconds | int | `10` |  |
+| exporter.resources.limits | object | `{}` |  |
+| exporter.resources.requests.cpu | string | `"25m"` |  |
+| exporter.resources.requests.memory | string | `"64Mi"` |  |
+| exporter.serviceAccount.annotations | object | `{}` |  |
+| exporter.serviceAccount.automountServiceAccountToken | bool | `true` |  |
+| exporter.serviceAccount.create | bool | `true` |  |
+| exporter.serviceAccount.labels | object | `{}` |  |
+| exporter.serviceAccount.name | string | `""` | ServiceAccount name. Empty falls back to the generated name. |
+| exporter.tolerations | list | `[]` |  |
+| exporter.topology.enabled | bool | `true` | Publish mxl_flow_location_info from the MxlFlow CRs. That is what names the producing node (phase Origin), so dashboards do not need media functions to label themselves. Disabling it drops the metric and the exporter's API access to MxlFlow. |
+| exporter.updateStrategy.rollingUpdate.maxUnavailable | int | `1` |  |
+| exporter.updateStrategy.type | string | `"RollingUpdate"` |  |
+| gateway | object | `{"affinity":{},"args":[],"containerSecurityContext":{"allowPrivilegeEscalation":false,"capabilities":{"add":[],"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":false},"dnsPolicy":"ClusterFirstWithHostNet","enabled":true,"extraContainers":[],"extraEnv":[],"extraVolumeMounts":[],"extraVolumes":[],"flags":{"bindAddress":"$(POD_IP)","degradedAfter":"10s","domainGcGrace":"2m","domainGcInterval":"5m","domainGcScaffoldGrace":"10m","domainPath":"/run/mxl/domain","fabricCidr":[],"fabricDevice":[],"fabricMaxUtilization":0,"fabricMinLinkSpeed":"","fabricPortCapacity":[],"fabricSharedBudget":[],"healthProbeBindAddress":":8081","kubeApiBurst":100,"kubeApiQps":50,"metricsBindAddress":":8080","placementWait":"10s","pprofBindAddress":"","probePeriod":"5m","providers":["any"],"rdmaEnumerationGrace":"10m","rdmaEnumerationLiveness":false,"readerStallAfter":"20s","resyncPeriod":"60s","zapLogLevel":"info"},"hostNetwork":true,"hostPath":{"domain":"/run/mxl/domain","domains":"/run/mxl/domains","type":"DirectoryOrCreate"},"image":{"digest":"","pullPolicy":"","repository":"gateway","tag":""},"initContainers":[],"livenessProbe":{"httpGet":{"path":"/healthz","port":"probe"},"initialDelaySeconds":5},"metrics":{"service":{"enabled":true,"port":8080,"type":"ClusterIP"},"serviceMonitor":{"enabled":false,"interval":"30s","labels":{},"metricRelabelings":[],"relabelings":[],"scrapeTimeout":"10s"}},"nodeSelector":{},"podAnnotations":{},"podLabels":{},"podSecurityContext":{},"priorityClassName":"","rdma":{"enabled":false,"extraEnv":[],"infinibandHostPath":"/dev/infiniband","infinibandHostPathType":"Directory","mountInfiniband":true,"resourceName":"","verbsAckTimeout":14,"wait":{"driver":"","seconds":0}},"readinessProbe":{"httpGet":{"path":"/readyz","port":"probe"},"initialDelaySeconds":2},"resources":{"limits":{},"requests":{"cpu":"100m","memory":"128Mi"}},"serviceAccount":{"annotations":{},"automountServiceAccountToken":true,"create":true,"labels":{},"name":""},"tolerations":[],"topologySpreadConstraints":[],"updateStrategy":{"rollingUpdate":{"maxUnavailable":1},"type":"RollingUpdate"},"variants":{"efa":{"enabled":false,"flags":{"providers":["tcp","efa"]},"rdma":{"enabled":true,"mountInfiniband":false,"resourceName":"vpc.amazonaws.com/efa","wait":{"driver":"efa"}}},"tcp":{"enabled":false,"flags":{"providers":["tcp"]}},"verbs":{"enabled":false,"flags":{"providers":["tcp","verbs"]},"rdma":{"enabled":true,"mountInfiniband":false,"resourceName":""}}}}` | Gateway: per-node DaemonSet that owns libmxl-fabrics handles and moves grains across the wire. Runs with hostNetwork so the fabric endpoint binds the node interface. |
+| gateway.containerSecurityContext.capabilities.add | list | `[]` | Additional caps beyond what rdma.enabled implies. |
+| gateway.flags.bindAddress | string | `"$(POD_IP)"` | Bind address for libmxl-fabrics endpoints. Default uses the downward-API POD_IP so each gateway binds its node IP. It narrows the providers that name an interface by IP, tcp and verbs; efa names one by its EFA GID and shm by the host's name, and neither is held to it. An explicit empty string ("") emits `--bind-address=` (bare equals), which suppresses the POD_IP fallback so libfabric picks the interface; useful when the gateway runs on a Multus-attached NAD and the RDMA fabric is a secondary netdev. |
+| gateway.flags.degradedAfter | string | `"10s"` | Grain-commit inactivity after which the target gateway demotes a mirror to Degraded. Same threshold gates the Reconcile fast-path so a stale Ready status falls through to re-establish. |
+| gateway.flags.domainGcGrace | string | `"2m"` | How long after start the first reclaim sweep is held back. A restarted gateway has no writer attached to the mirror copies it was serving, and a consumer's reader does not protect them, so a sweep inside this window would delete flows consumers are still reading and the reconciler is about to re-establish. Must outlast the reconciler's re-establish path. |
+| gateway.flags.domainGcInterval | string | `"5m"` | How often libmxl reclaims flow directories no writer holds. The criterion is libmxl's own: a writer keeps a shared lock for as long as it is attached, so a live producer or mirror writer is never a candidate however long since its last grain. Set to 0 to disable reclaiming. |
+| gateway.flags.domainGcScaffoldGrace | string | `"10m"` | How old a half-built flow directory must be before it is reclaimed. libmxl builds a flow under a temporary name and renames it into place, removing it on every unwinding exit, so only a death that skips unwinding leaves one -- and libmxl's own collection walks published flows, so nothing sees it afterwards. A producer SIGKILLed part way through allocating its ring therefore leaves the whole allocation in the shared domain, at the node's expense rather than its own. Whether a writer still holds the scaffold is decided by the same lock libmxl uses; this only spans the moment between the data file being created and locked. Negative disables it. |
+| gateway.flags.fabricCidr | list | `[]` | CIDRs the fabric interfaces must fall inside. Empty considers every address libmxl-fabrics reports, which on a node with several NICs includes the ones carrying ST 2110 essence, cluster traffic, or out-of-band management. Set this to the subnet of the MXL fabric to keep mirrors off them. Applies to both what a node advertises and what a mirror binds. |
+| gateway.flags.fabricDevice | list | `[]` | Device names the fabric interfaces must match, as the provider names them (the kernel netdev name for tcp, the NIC name libfabric reports otherwise). Empty considers every device. Useful where the fabric shares a subnet with other traffic. |
+| gateway.flags.fabricMaxUtilization | int | `0` | Percent of an interface's or budget's capacity placement may commit on this gateway's nodes. 0 leaves it to operator.flags.placementMaxUtilization. |
+| gateway.flags.fabricMinLinkSpeed | string | `""` | Minimum link speed a fabric interface must report, as a quantity in bits per second (for example 25G). Empty imposes no floor. An interface whose provider reports no link speed is rejected when this is set, which includes interfaces with no physical NIC behind them. |
+| gateway.flags.fabricPortCapacity | list | `[]` | Capacity overrides for mirror placement, each `<match>=<quantity>` in bits per second, where match is a device name, an address or a CIDR and the first match wins. An interface no entry matches is planned at the link speed its provider reports; one reporting none is never counted full. |
+| gateway.flags.fabricSharedBudget | list | `[]` | Caps several fabric interfaces share, each `<scope>=<quantity>[:<mode>]` in bits per second. Scope `nic` makes one cap per PCI device over its functions, `host` one over every interface of the node. Mode `ingress` (the default) counts mirrors received, `egress` mirrors sent, `combined` both against one cap. Empty declares none. |
+| gateway.flags.kubeApiBurst | int | `100` | Client-side burst above kubeApiQps. 0 leaves the client-go default in place. |
+| gateway.flags.kubeApiQps | int | `50` | Client-side request rate to the API server. A node holding many flows spends one Get and one Update per flow per renewal pass; at the client-go default of 5 the loop blocks rather than fails, stretching past the Lease duration it exists to keep fresh. 0 leaves the client-go default in place. |
+| gateway.flags.placementWait | string | `"10s"` | How long the target side of a mirror the operator has not placed waits before binding the first interface, on a node offering more than one. The operator places within its own reconcile, so a running operator adds no delay; this bounds the wait when it is down or slow. |
+| gateway.flags.pprofBindAddress | string | `""` | Bind address for the net/http/pprof endpoint. Empty disables; otherwise must be a loopback bind (127.0.0.1: or localhost:). Use kubectl port-forward to reach the endpoint; see docs/diagnostics/perf-shortfall.md for the capture recipe. |
+| gateway.flags.probePeriod | string | `"5m"` | Shortest interval between two libmxl-fabrics interface enumerations. Status still refreshes every resyncPeriod from the last result. Each enumeration sweeps every provider libfabric was built with and warns about those it finds no device for. |
+| gateway.flags.providers | list | `["any"]` | Upper bound on the libmxl-fabrics providers a gateway may advertise and use. Each node publishes this list intersected with what libmxl-fabrics finds on it, so `any` advertises the hardware that is present and nothing else. Narrow it to keep a provider out of consideration on every node. |
+| gateway.flags.rdmaEnumerationGrace | string | `"10m"` | How long that discrepancy holds before the probe fails. Measured across consecutive enumerations, so it spans several probePeriod rather than letting one decide it. |
+| gateway.flags.rdmaEnumerationLiveness | bool | `false` | Fail the liveness probe while the host exposes RDMA devices that no enumerated provider accounts for. libfabric fixes a provider's device list at the first enumeration, so a gateway that started before the hardware was usable never revisits it and only a restart does. Off by default: a node whose devices the built providers cannot drive reports the same discrepancy, and there a restart loops instead of recovering. The RDMADevicesEnumerated condition reports the state either way. |
+| gateway.flags.readerStallAfter | string | `"20s"` | How long a source-side reader may report an unchanged head index, having never transferred a grain, before SourceProgress reports ReaderNotAdvancing. |
+| gateway.flags.resyncPeriod | string | `"60s"` | How often the gateway refreshes MxlNodeCapabilities. Every pass reads each RDMA port state out of sysfs; on irdma that read takes the kernel global rtnl lock, so this is also how often a node contends for it against pod sandbox setup. |
+| gateway.hostNetwork | bool | `true` | hostNetwork is required because the libmxl-fabrics TargetInfo embeds the host:port a peer dials; a CNI overlay IP would not be reachable cross-node. |
+| gateway.hostPath.domains | string | `"/run/mxl/domains"` | Where every MxlDomain without a directory lives, one subdirectory per id. Must be domains/ below the runtime root the primary domain sits in. |
+| gateway.image.tag | string | `""` | Image tag. Empty defaults to the chart appVersion prefixed with "v": the gateway image is released under the chart version. Set this or image.digest. |
+| gateway.podSecurityContext | object | `{}` | Pod-level security context, rendered into the pod spec as given.  An SELinux-enabled node needs seLinuxOptions here. The domain is a hostPath, and Kubernetes never relabels one: the hostPath volume plugin reports SELinuxRelabel false and declines SELinux context mounts, so the directory keeps the type the host gives it. Under /run that is usually run_t, while the container is confined to a pod type, and every write to the domain is denied.  seLinuxOptions labels the container process rather than the directory, which makes it the only lever available from a chart. Which type is accepted depends on the policy loaded on the node, so no value is correct everywhere and this stays empty.  In permissive mode the write still succeeds and each denial only emits an audit record set, so the cost is invisible until the node's audit backlog overruns and records are lost. |
+| gateway.rdma.enabled | bool | `false` | Add the capability the verbs/efa providers need: IPC_LOCK, which exempts their memory registrations from RLIMIT_MEMLOCK. |
+| gateway.rdma.infinibandHostPathType | string | `"Directory"` | hostPath type for the InfiniBand mount. `Directory` holds the pod in ContainerCreating on a node where the path is absent, which is a deliberate failure on a DaemonSet that is only meant to run on RDMA-capable nodes, and a hang on one that is not. |
+| gateway.rdma.mountInfiniband | bool | `true` | Bind-mount the host's InfiniBand device directory into the gateway. Only consulted when rdma.enabled is set. A bind mount alone does not pass the cgroup-v2 device controller, so a node whose devices come from a device plugin wants this off and `resourceName` set instead. |
+| gateway.rdma.resourceName | string | `""` | Extended-resource name advertised by a Kubernetes device plugin. `devic.es/rdma` from generic-device-plugin and `rdma/hca_shared_devices` from k8s-rdma-shared-dev-plugin cover on-prem verbs; `vpc.amazonaws.com/efa` from aws-efa-k8s-device-plugin covers EFA; a site may advertise something else entirely. When non-empty, the gateway container gets `<resourceName>: 1` on both requests and limits. Empty disables the request.  The request is what grants the container its cgroup device permissions, and it also makes the pod unschedulable on any node not advertising the resource -- which is why a cluster with mixed hardware needs `gateway.variants` rather than one DaemonSet. |
+| gateway.rdma.verbsAckTimeout | int | `14` | Local ACK timeout of the verbs provider's RC queue pairs, as the exponent n of 4.096us x 2^n: 14 is 67ms. 1 to 31, or -1. Set as FI_VERBS_ACK_TIMEOUT when rdma.enabled and the providers include verbs (or any). Only the libfabric patch carried by the go-mxl image reads it. -1 leaves it unset, and a queue pair keeps the timeout RDMA-CM computes. No effect on a device whose driver does not program a queue pair's ACK timeout, such as irdma. |
+| gateway.rdma.wait.driver | string | `""` | Driver of the device's bus device the wait accepts, the basename of /sys/class/infiniband/<device>/device/driver: efa for the AWS Elastic Fabric Adapter, mlx5_core for a ConnectX, whose RDMA module mlx5_ib is not what that link names. Empty accepts any device, so on a node whose boot already brings up another RDMA device with an ACTIVE port the wait ends at once; set the driver there. Only consulted when rdma.wait.seconds is above 0. |
+| gateway.rdma.wait.seconds | int | `0` | Off by default. Only for an RDMA driver loaded after the gateway pod starts, as the Kernel Module Management operator loads it on Ubuntu or Debian nodes, from a pod of its own once the kubelet runs; a driver loaded at boot needs none. libfabric fixes a provider's device list when the gateway first enumerates, so a gateway that starts before its device is usable advertises no RDMA for the life of the process, and every mirror created meanwhile resolves to a non-RDMA provider. A value above 0 adds an init container to the gateway that checks /sys/class/infiniband once a second for a device with an ACTIVE port, and ends as soon as one is there, or at the latest at the first check after this many seconds, exiting 0 either way: the gateway then starts, enumerates and falls back as it does with 0. Only consulted when rdma.enabled is set. 0 renders no init container. |
+| gateway.updateStrategy | object | `{"rollingUpdate":{"maxUnavailable":1},"type":"RollingUpdate"}` | DaemonSet update strategy. With mxlfs one gateway per node is assumed: a gateway clears every placeholder marker in a domain as it opens it, so a second gateway on the node would clear the markers of the first one's placeholders. With mxlfs.enabled the chart refuses a rollingUpdate.maxSurge other than 0. |
+| gateway.variants | object | `{"efa":{"enabled":false,"flags":{"providers":["tcp","efa"]},"rdma":{"enabled":true,"mountInfiniband":false,"resourceName":"vpc.amazonaws.com/efa","wait":{"driver":"efa"}}},"tcp":{"enabled":false,"flags":{"providers":["tcp"]}},"verbs":{"enabled":false,"flags":{"providers":["tcp","verbs"]},"rdma":{"enabled":true,"mountInfiniband":false,"resourceName":""}}}` | Render the gateway DaemonSet once per enabled entry instead of once, for a cluster whose nodes do not all carry the same fabric hardware. With nothing enabled -- the default -- exactly one DaemonSet renders from the values above, which is what a uniform cluster wants.  Keys name the variant and suffix the DaemonSet name, so they have to be DNS-1123 labels. Entries beyond the three below are allowed; each may override any key under `gateway`, with maps merging key by key against the values above and lists replacing wholesale.  Placement is deliberately unset on every entry. Which label marks a node's fabric is a site's choice, and a default here would not be replaced by a downstream override but merged with it, leaving a nodeSelector that demands both labels and matches no node.  Enabling two or more entries means declaring their placement, and the placements have to be complementary: two gateways on one node open the same MXL domain, reconcile the same mirrors, and write the same MxlNodeCapabilities, which is named after the node. Helm cannot read node labels, so it rejects only the combinations that guarantee overlap. Keying every variant on a distinct value of one label is what makes overlap impossible; a class defined by the absence of that label needs `affinity` with `DoesNotExist`, which a nodeSelector cannot express. See docs/RDMA.md. |
+| global | object | `{"commonAnnotations":{},"commonLabels":{},"image":{"pullPolicy":"IfNotPresent","pullSecrets":[],"registry":"ghcr.io/qvest-digital/mxl-k8s"}}` | Global settings inherited by every component unless overridden. |
+| global.commonAnnotations | object | `{}` | Annotations added to every object the chart renders. |
+| global.commonLabels | object | `{}` | Labels added to every object the chart renders. |
+| global.image.pullPolicy | string | `"IfNotPresent"` | Default imagePullPolicy. Per-component override wins. @schema enum: ["Always", "IfNotPresent", "Never"] @schema |
+| global.image.pullSecrets | list | `[]` | Image pull secrets, applied to every Pod. |
+| global.image.registry | string | `"ghcr.io/qvest-digital/mxl-k8s"` | Container registry prefix. Per-component image.repository is appended to this. |
+| mxlfs | object | `{"enabled":false,"huge":"","moduleWaitSeconds":0,"numa":{"metrics":{"enabled":false},"placement":{"flow":{"default":"local","release":{"delay":"60s","period":"30s","rate":"512Mi"}},"mode":"off","node":{"default":"auto"}}},"waitImage":"busybox:1.38","waitResources":{"limits":{},"requests":{"cpu":"1m","memory":"4Mi"}}}` | mxlfs, a memory filesystem for MXL domains, on every domain. Off, every domain is a plain directory and the chart renders none of the following.  On, the agent mounts an mxlfs (mode=0777,wait=5000) on each domain directory it materialises, before writing into it, and runs privileged for Bidirectional propagation of the runtime root. A directory that is already an mxlfs is left alone. Where the mount fails, as on a node whose kernel has no mxlfs module, or where the directory already holds flows, the domain stays a plain directory: the agent logs the error and records a MxlfsUnavailable warning event on the Node.  The agent, gateway and operator run with --mxlfs, which adds placeholders for flows absent on a node, lazy ring allocation and MxlFlowRedundancySets, with the RBAC they need; the CRD must be installed. The gateway runs in the host PID namespace, so it sees the flocks of local producers through /proc/locks. The gateway and the exporter wait in an init container for mxlfs.ready, which the agent writes to the runtime root once it has mounted or left plain the domains known at its start, and see later mounts through HostToContainer propagation. agent.csi.enabled requires this.  MXL pods take the domain through the agent's CSI volume (agent.csi.enabled), which is published only once the agent has mounted the domain or left it plain. A pod that mounts the domain directory as a hostPath can start before the agent, as after a node restart, and create a flow in the plain directory; the agent then leaves that domain plain and records the MxlfsUnavailable event.  A placeholder is a libmxl writer the gateway holds open, one per flow with no copy on the node, and libmxl maps every grain of a discrete flow on its own: a video or data flow costs the gateway its grain count plus two memory mappings (250 + 2 for 5s of history at 50 fps), an audio flow two. Mirrors and merged outputs in the gateway add their own. The kernel caps mappings per process at vm.max_map_count, 65530 by default, which at that history is about 250 such flows across the node's mxlfs domains; past it, creating a placeholder or a mirror fails. Raise vm.max_map_count on the nodes for more. |
+| mxlfs.huge | string | `""` | huge= mount option of every mxlfs domain, as tmpfs's: within_size gives a file folios that end by EOF; always gives a file of at least 2 MiB one 2 MiB folio for its last partial 2 MiB, so a NIC maps a registered grain with one translation per 2 MiB instead of a page size the smallest tail folio sets, at up to 2 MiB more memory per such file (736 KiB for a 1080p v210 grain). Empty leaves the option out. An mxlfs module without it refuses a mount that names it; the agent then mounts the domain without huge= and records a MxlfsHugeRefused warning event on the Node. A change applies to a domain only when it is mounted again, at the next node reboot. @schema enum: ["", "within_size", "always"] @schema |
+| mxlfs.moduleWaitSeconds | int | `0` | Off by default. Only for an mxlfs module loaded after the agent pod starts, as the Kernel Module Management operator loads it on Ubuntu or Debian nodes, from a pod of its own once the kubelet runs; a module loaded at boot needs none. The agent decides each domain once: a mount that finds no mxlfs leaves the domain plain for the life of the agent process and records a MxlfsUnavailable warning event on the Node. A value above 0 adds an init container to the agent that checks /proc/filesystems for mxlfs once a second and ends as soon as it is listed, or at the latest at the first check after this many seconds, exiting 0 either way: the agent then starts and mounts or falls back to a plain directory as it does with 0. The gateway and the exporter wait for the agent's mxlfs.ready, and the agent publishes its CSI volume only once it has decided the domain, so all of them start that much later too: by up to this many seconds on a node whose module never loads. Needs mxlfs.enabled. 0 renders no init container. |
+| mxlfs.numa.metrics.enabled | bool | `false` | Export the NUMA counters of every mxlfs domain from the exporter, in every placement mode: the domain's and each flow ring's pages per NUMA node, allocations that fell back to another node, and the moves. Read on every exporter scan, never on a scrape. Needs an mxlfs module with the NUMA ioctls; with an older one the series are left out. |
+| mxlfs.numa.placement.flow.default | string | `"local"` | flow mode's numa_node= for pages nothing placed: nic mounts every domain with the NICs' node, local leaves it to the allocating process. Empty is local. @schema enum: ["", "nic", "local"] @schema |
+| mxlfs.numa.placement.flow.release.delay | string | `"60s"` | How long a ring stays unheld, counted from when the agent first saw it so, before it moves; a pass that finds it held or cannot see its holds starts the count over. Covers a gateway restart, which drops the holds until its mirrors are attached again. @schema type: string pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$ @schema |
+| mxlfs.numa.placement.flow.release.period | string | `"30s"` | How often the agent looks for rings to move in flow mode. @schema type: string pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$ @schema |
+| mxlfs.numa.placement.flow.release.rate | string | `"512Mi"` | Bytes a second the agent moves, a quantity. @schema type: string pattern: ^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$ @schema |
+| mxlfs.numa.placement.mode | string | `"off"` | On which NUMA node the pages of the rings of mxlfs domains are allocated. off leaves it to the process that allocates them. node mounts every domain with placement.node.default as numa_node=. flow places each ring by its use: the gateway holds the ring of every flow it registers with a NIC and moves it to the NICs' node first, a target's ring is allocated there, and the agent moves a ring nothing holds to the node all local writers and readers of the flow are confined to: every CPU their threads may run on is on that node, and they may allocate from it. A flow with any other local writer or reader counts as unpinned and the agent never moves its ring, so this needs CPU pinning. A page goes to the file's own preference first, then to the mount's numa_node=, then to the allocating task's memory policy; a file has a preference only in flow mode, where a moved ring keeps it so its later pages follow it. flow needs mxlfs.enabled and gives the gateway CAP_SYS_NICE. On a node whose RDMA devices report no single NUMA node it acts as off, and the agent and gateway record a MxlfsNumaFlowUnresolved warning event on the Node. Empty is off. A change of the mount option applies to a domain only when it is mounted again, at the next node reboot. @schema enum: ["", "off", "node", "flow"] @schema |
+| mxlfs.waitImage | string | `"busybox:1.38"` | Image of the init containers that wait for mxlfs.ready, for the mxlfs module and for an RDMA device (gateway.rdma.wait). Needs a POSIX sh, test, sleep, date, awk, grep and readlink. |
+| mxlfs.waitResources | object | `{"limits":{},"requests":{"cpu":"1m","memory":"4Mi"}}` | Resources of those init containers. |
+| namespace | object | `{"create":false,"name":""}` | Namespace handling. Most Flux users set createNamespace on the HelmRelease and leave namespace.create=false here. |
+| namespace.name | string | `""` | Namespace the chart's namespaced resources land in. Falls back to .Release.Namespace when empty. |
+| operator | object | `{"affinity":{},"args":[],"containerSecurityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"readOnlyRootFilesystem":true,"runAsNonRoot":true},"enabled":true,"extraContainers":[],"extraEnv":[],"extraVolumeMounts":[],"extraVolumes":[],"flags":{"gcGracePeriod":"5m","healthProbeBindAddress":":8081","leaderElect":false,"metricsBindAddress":":8080","placementDemandWait":"5s","placementMaxUtilization":80,"placementOvercommit":"place","placementPairing":"prefer-same-subnet","placementProtocolOverhead":5,"placementProvisionalDemand":"0","zapDevel":false,"zapLogLevel":"info"},"image":{"digest":"","pullPolicy":"","repository":"operator","tag":""},"initContainers":[],"livenessProbe":{"httpGet":{"path":"/healthz","port":"probe"},"initialDelaySeconds":5},"metrics":{"service":{"enabled":true,"port":8080,"type":"ClusterIP"},"serviceMonitor":{"enabled":false,"interval":"30s","labels":{},"metricRelabelings":[],"relabelings":[],"scrapeTimeout":"10s"}},"nodeSelector":{},"podAnnotations":{},"podDisruptionBudget":{"enabled":false,"minAvailable":1},"podLabels":{},"podSecurityContext":{},"priorityClassName":"","readinessProbe":{"httpGet":{"path":"/readyz","port":"probe"},"initialDelaySeconds":2},"replicaCount":1,"resources":{"limits":{},"requests":{"cpu":"50m","memory":"64Mi"}},"serviceAccount":{"annotations":{},"automountServiceAccountToken":true,"create":true,"labels":{},"name":""},"tolerations":[],"topologySpreadConstraints":[]}` | Operator: cluster-wide reconciler for MxlReceiver, MxlFlowMirror, and related CRDs. Single Deployment. |
+| operator.args | list | `[]` | Extra raw args appended after the structured flags. |
+| operator.flags.gcGracePeriod | string | `"5m"` | How long an MxlFlow must have no live copy, and an MxlFlowMirror no source it could pull from, before it is deleted. Has to outlast a producer rolling over: the flow has no Origin between the old pod releasing it and the new one publishing again, and collecting inside that window costs the stream a re-materialization for no reason. It does not gate an unclaimed mirror, which goes at once, or after a 30s handover window when its requestor pod has gone. |
+| operator.flags.leaderElect | bool | `false` | Enable leader election. Required for replicaCount > 1. |
+| operator.flags.placementDemandWait | string | `"5s"` | How long after its creation a mirror waits for its flow's payload rate before it is placed on the provisional demand. |
+| operator.flags.placementMaxUtilization | int | `80` | Percent of a fabric interface's or shared budget's capacity mirror placement may commit, on nodes whose gateway sets no gateway.flags.fabricMaxUtilization. Grains leave as line-rate bursts, so a receiver overflows before its average load reaches the link speed. |
+| operator.flags.placementOvercommit | string | `"place"` | What happens to a mirror no interface pair has room for. place puts it on the pair with the most headroom left and reports it Overcommitted; hold leaves it unplaced and unset up, and reports it Held. |
+| operator.flags.placementPairing | string | `"prefer-same-subnet"` | How a source interface is paired with a target interface. prefer-same-subnet keeps pairs whose addresses share a subnet when any does; same-subnet keeps only those; any keeps every pair. With every fabric port in one subnet all pairs qualify and the setting changes nothing; it matters where ports sit in separate subnets. |
+| operator.flags.placementProtocolOverhead | int | `5` | Percent added to a flow's published payload rate for protocol framing when it is charged to an interface. |
+| operator.flags.placementProvisionalDemand | string | `"0"` | Rate in bits per second charged for a flow that has not published its payload rate within placementDemandWait, as a quantity. "0" places such mirrors by mirror count alone. |
+| operator.image.digest | string | `""` | Image digest. Wins over tag when set. @schema pattern: ^$|^sha256:[0-9a-f]{64}$ @schema |
+| operator.image.pullPolicy | string | `""` | imagePullPolicy override. Empty falls back to global. @schema enum: ["", "Always", "IfNotPresent", "Never"] @schema |
+| operator.image.tag | string | `""` | Image tag. Empty defaults to the chart appVersion prefixed with "v": the operator image is released under the chart version. Set this or image.digest. |
+| operator.metrics.serviceMonitor.enabled | bool | `false` | Render a Prometheus Operator ServiceMonitor. Requires the monitoring.coreos.com CRDs to be installed cluster-wide. |
+| operator.serviceAccount.name | string | `""` | ServiceAccount name. Empty falls back to a generated name. |
+| rbac | object | `{"create":true}` | ClusterRoles and ClusterRoleBindings for every enabled component. Set to false when RBAC is centrally managed. |
+
+## Uninstall
+
+Helm leaves the CRDs installed when the chart is uninstalled (they
+live in `crds/`, not `templates/`). Delete them by hand if you want
+them gone:
+
+```sh
+kubectl delete crd \
+  mxldomains.mxl.qvest-digital.com \
+  mxlflows.mxl.qvest-digital.com \
+  mxlflowmirrors.mxl.qvest-digital.com \
+  mxlflowmirrortargets.mxl.qvest-digital.com \
+  mxlflowredundancysets.mxl.qvest-digital.com \
+  mxlnodecapabilities.mxl.qvest-digital.com \
+  mxlreceivers.mxl.qvest-digital.com
+```
+

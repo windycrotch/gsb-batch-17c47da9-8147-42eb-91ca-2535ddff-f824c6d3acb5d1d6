@@ -1,0 +1,1728 @@
+package merge
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
+	"github.com/qvest-digital/go-mxl/mxl"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
+
+	mxlv1alpha1 "github.com/qvest-digital/mxl-k8s/api/v1alpha1"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/mxlfs"
+)
+
+// These run against a real mxlfs (MXLFS_TEST_DIR), where views exist;
+// elsewhere they are skipped. Two members are written with staggered
+// outages that never overlap, so every grain, and every sample, exists
+// in one member, and a reader of the output must get all of it.
+
+const (
+	memberA = "11111111-1111-4111-8111-111111111111"
+	memberB = "22222222-2222-4222-8222-222222222222"
+	output  = "33333333-3333-4333-8333-333333333333"
+)
+
+func mxlfsDomain(t *testing.T) string {
+	t.Helper()
+	dir := os.Getenv("MXLFS_TEST_DIR")
+	if dir == "" {
+		t.Skip("MXLFS_TEST_DIR not set")
+	}
+	d, err := os.MkdirTemp(dir, "merge-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	require.NoError(t, os.WriteFile(filepath.Join(d, "options.json"),
+		[]byte(`{"urn:x-mxl:option:history_duration/v1.0": 400000000}`), 0o644))
+	return d
+}
+
+// lazily makes this process allocate lazily from here on, as the
+// gateway does on mxlfs: what the engine creates must still be backed.
+func lazily(t *testing.T, domain string) {
+	t.Helper()
+	require.NoError(t, mxlfs.SetLazy(domain, true))
+	t.Cleanup(func() { _ = mxlfs.SetLazy(domain, false) })
+}
+
+func videoDef(id string) string {
+	return `{"description":"merge test","id":"` + id + `","tags":{"urn:x-nmos:tag:grouphint/v1.0":["merge-test:Video"]},
+"format":"urn:x-nmos:format:video","label":"merge test","parents":[],"media_type":"video/v210",
+"grain_rate":{"numerator":50,"denominator":1},"frame_width":320,"frame_height":180,"interlace_mode":"progressive",
+"colorspace":"BT709","components":[{"name":"Y","width":320,"height":180,"bit_depth":10},
+{"name":"Cb","width":160,"height":180,"bit_depth":10},{"name":"Cr","width":160,"height":180,"bit_depth":10}]}`
+}
+
+func dataDef(id string) string {
+	return `{"description":"merge test","id":"` + id + `","tags":{"urn:x-nmos:tag:grouphint/v1.0":["merge-test:Data"]},
+"format":"urn:x-nmos:format:data","label":"merge test","parents":[],"media_type":"video/smpte291",
+"grain_rate":{"numerator":50,"denominator":1}}`
+}
+
+func audioDef(id string) string {
+	return `{"description":"merge test","id":"` + id + `","tags":{"urn:x-nmos:tag:grouphint/v1.0":["merge-test:Audio"]},
+"format":"urn:x-nmos:format:audio","label":"merge test","parents":[],"media_type":"audio/float32",
+"sample_rate":{"numerator":48000},"channel_count":2,"bit_depth":32}`
+}
+
+// outage reports whether member m skips grain or batch i: member A is out
+// for 40 of every 100, member B for the other half of the period.
+func outage(m int, i uint64) bool { return (i+uint64(m)*50)%100 < 40 }
+
+func writeGrains(t *testing.T, inst *mxl.Instance, def string, member int, data bool, stop <-chan struct{}) {
+	w, _, err := inst.NewWriter(def)
+	require.NoError(t, err)
+	defer w.Close()
+	rate := w.Config().Common.GrainRate
+	for i := mxl.CurrentIndex(rate); ; i++ {
+		select {
+		case <-stop:
+			return
+		case <-time.After(time.Duration(mxl.NsUntilIndex(i, rate))):
+		}
+		if outage(member, i) {
+			continue
+		}
+		g, err := w.OpenGrain(i)
+		require.NoError(t, err)
+		binary.LittleEndian.PutUint64(g.Payload, uint64(member)<<56|i)
+		valid := g.TotalSlices
+		if data {
+			valid = 64 // a data grain's valid slices are its length
+		}
+		require.NoError(t, g.Commit(valid, 0))
+	}
+}
+
+func runDiscrete(t *testing.T, def func(string) string, data bool) {
+	domain := mxlfsDomain(t)
+	inst, err := mxl.NewInstance(domain, "")
+	require.NoError(t, err)
+	defer inst.Close()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for m, id := range []string{memberA, memberB} {
+		wg.Add(1)
+		go func() { defer wg.Done(); writeGrains(t, inst, def(id), m, data, stop) }()
+	}
+	defer func() { close(stop); wg.Wait() }()
+	time.Sleep(300 * time.Millisecond)
+
+	lazily(t, domain)
+	e, err := Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+		Skew: 40 * time.Millisecond, Ordered: true}, logr.Discard())
+	require.NoError(t, err)
+	defer e.Close()
+
+	r, err := inst.NewReader(output)
+	require.NoError(t, err)
+	defer r.Close()
+	rate := mxl.Rational{Num: 50, Den: 1}
+	start := mxl.CurrentIndex(rate) + 2
+	for i := start; i < start+250; i++ {
+		var g mxl.Grain
+		if data {
+			g, err = r.GetGrainSlice(i, 0, time.Second)
+		} else {
+			g, err = r.GetGrain(i, time.Second)
+		}
+		require.NoError(t, err, "grain %d", i)
+		require.False(t, g.Invalid(), "grain %d is INVALID though a member had it", i)
+		v := binary.LittleEndian.Uint64(g.Payload)
+		require.Equal(t, i, v&(1<<56-1), "grain %d shows grain %d", i, v&(1<<56-1))
+		require.False(t, outage(int(v>>56), i), "grain %d shown from member %d, which skipped it", i, v>>56)
+	}
+}
+
+func TestEngineMergesVideo(t *testing.T) { runDiscrete(t, videoDef, false) }
+
+func TestEngineMergesANCData(t *testing.T) { runDiscrete(t, dataDef, true) }
+
+func TestEngineMergesAudio(t *testing.T) {
+	domain := mxlfsDomain(t)
+	inst, err := mxl.NewInstance(domain, "")
+	require.NoError(t, err)
+	defer inst.Close()
+	const batch = 480
+	rate := mxl.Rational{Num: 48000, Den: 1}
+	var e *Engine
+	var mu sync.Mutex
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for m, id := range []string{memberA, memberB} {
+		w, _, err := inst.NewWriter(audioDef(id))
+		require.NoError(t, err)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer w.Close()
+			for end := (mxl.CurrentIndex(rate)/batch + 1) * batch; ; end += batch {
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Duration(mxl.NsUntilIndex(end, rate))):
+				}
+				if outage(m, end/batch/10) { // outages of 10-batch blocks
+					continue
+				}
+				s, err := w.OpenSamples(end, batch)
+				require.NoError(t, err)
+				for ch := uint64(0); ch < 2; ch++ {
+					f1, f2, err := s.ChannelFragments(ch)
+					require.NoError(t, err)
+					idx := end - batch
+					for _, f := range [][]byte{f1, f2} {
+						for o := 0; o+4 <= len(f); o += 4 {
+							binary.LittleEndian.PutUint32(f[o:], 0x80000000|uint32(m)<<28|uint32(idx&0x0fffffff))
+							idx++
+						}
+					}
+				}
+				require.NoError(t, s.Commit())
+				mu.Lock()
+				if e != nil {
+					e.Committed(m, end-batch, end)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	defer func() { close(stop); wg.Wait() }()
+	time.Sleep(300 * time.Millisecond)
+
+	lazily(t, domain)
+	mu.Lock()
+	e, err = Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+		Skew: 40 * time.Millisecond, Ordered: true}, logr.Discard())
+	mu.Unlock()
+	require.NoError(t, err)
+	defer e.Close()
+
+	r, err := inst.NewReader(output)
+	require.NoError(t, err)
+	defer r.Close()
+	first := (mxl.CurrentIndex(rate)/batch + 4) * batch
+	for end := first; end < first+400*batch; end += batch {
+		v, err := r.GetSamples(end, batch, time.Second)
+		require.NoError(t, err, "samples up to %d", end)
+		for ch := uint64(0); ch < 2; ch++ {
+			buf, err := v.CopyChannel(ch)
+			require.NoError(t, err)
+			for o := 0; o < len(buf); o += 4 {
+				s := binary.LittleEndian.Uint32(buf[o:])
+				idx := end - batch + uint64(o/4)
+				require.NotZero(t, s, "sample %d of channel %d is silence", idx, ch)
+				require.Equal(t, uint32(idx&0x0fffffff), s&0x0fffffff, fmt.Sprintf("sample %d", idx))
+			}
+		}
+	}
+}
+
+// Every slot and page of an output starts on the INVALID grain or on
+// silence, and a reader maps all of it. The gateway allocates lazily,
+// so whatever backs those must be allocated outright, or touching an
+// unwritten page faults SIGBUS in the reader.
+func TestEngineBacksWhatNoMemberHolds(t *testing.T) {
+	for _, tc := range []struct {
+		def  func(string) string
+		file string
+	}{{videoDef, "grains/data.0"}, {audioDef, "channels"}} {
+		domain := mxlfsDomain(t)
+		inst, err := mxl.NewInstance(domain, "")
+		require.NoError(t, err)
+		defer inst.Close()
+		for _, id := range []string{memberA, memberB} {
+			w, _, err := inst.NewWriter(tc.def(id))
+			require.NoError(t, err)
+			defer w.Close()
+		}
+		lazily(t, domain)
+		e, err := Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+			Skew: 40 * time.Millisecond, Ordered: true}, logr.Discard())
+		require.NoError(t, err)
+		defer e.Close()
+
+		f, err := os.Open(filepath.Join(flowDir(domain, output), tc.file))
+		require.NoError(t, err)
+		defer f.Close()
+		st, err := f.Stat()
+		require.NoError(t, err)
+		mem, err := unix.Mmap(int(f.Fd()), 0, int(st.Size()), unix.PROT_READ, unix.MAP_SHARED)
+		require.NoError(t, err)
+		var sum int
+		for o := 0; o < len(mem); o += 4096 {
+			sum += int(mem[o])
+		}
+		_ = unix.Munmap(mem)
+		t.Logf("%s: %d bytes mapped and read, first bytes of each page sum to %d", tc.file, st.Size(), sum)
+	}
+}
+
+// The gateway reports an audio arrival by flow id, and the directory at
+// that id may no longer hold the ring the engine mapped: a placeholder
+// is retired for a ring of another geometry and created again, and a
+// mirror fills the new one. The mapped ring then never got the samples
+// and, held lazily, has no pages, so a page of the output selected to it
+// faults SIGBUS in every reader. It runs without mxlfs: the decision is
+// the engine's, from the mapped ring's own head.
+func TestEngineCountsOnlyWhatTheMappedRingHolds(t *testing.T) {
+	const pages = 4
+	e := &Engine{audio: NewAudio(2, pages, 2)}
+	for range 2 {
+		path := filepath.Join(t.TempDir(), "data")
+		require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0o644))
+		h, f, err := mapHeader(path, true)
+		require.NoError(t, err)
+		e.members, e.files = append(e.members, h), append(e.files, f)
+	}
+	t.Cleanup(e.release)
+	setHead := func(m int, head uint64) {
+		atomic.StoreUint64((*uint64)(unsafe.Pointer(&e.members[m].info.runtime.headIndex)), head)
+	}
+
+	// Member 0's mapped ring was replaced before anything was written to
+	// it; member 1's mapped ring holds what it reports.
+	const start, end = PageSamples, 3 * PageSamples
+	setHead(1, end)
+	e.Committed(0, start, end)
+	e.Committed(1, start, end)
+	now := time.Now()
+	sel, head, wait := e.audio.Step(now)
+	if wait > 0 { // member 0, the first, is waited for
+		var more []PageSelect
+		more, head, _ = e.audio.Step(now.Add(wait))
+		sel = append(sel, more...)
+	}
+	sel = append(sel, e.audio.Retire(end)...)
+	for _, s := range sel {
+		require.NotEqual(t, 0, s.Source, "page %d selected to a ring that holds none of it", s.Page)
+	}
+	require.Contains(t, sel, PageSelect{Page: 1, Source: 1})
+	require.Equal(t, uint64(end), head)
+}
+
+// The engine's loop is what looks at the members' heads; a stall found
+// anywhere else would not reach the set within seconds, nor a recovery
+// within seconds of RecoverAfter. It runs without mxlfs: the loop reads
+// the members' headers, which tmpfs maps as well.
+func TestEngineLoopFindsAStalledMember(t *testing.T) {
+	e := &Engine{spec: Spec{Members: []string{memberA, memberB}}, audio: NewAudio(2, 4, 2), done: make(chan struct{})}
+	for range 3 {
+		path := filepath.Join(t.TempDir(), "data")
+		require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0o644))
+		h, f, err := mapHeader(path, true)
+		require.NoError(t, err)
+		if e.out == nil {
+			e.out, e.outFile = h, f
+			continue
+		}
+		e.members, e.files = append(e.members, h), append(e.files, f)
+	}
+	t.Cleanup(e.release)
+	setHead := func(m int, head uint64) {
+		atomic.StoreUint64((*uint64)(unsafe.Pointer(&e.members[m].info.runtime.headIndex)), head)
+	}
+	// A stalled member counts as moving again only after RecoverAfter
+	// of moves no half window apart, as the loop observes them. A delay
+	// of half the window in the loop or in the goroutine moving the
+	// heads restarts RecoverAfter, so the test keeps the shortest window
+	// the engine uses.
+	const window = StallAfter
+	e.progress = newProgress(e.heads(), time.Now(), window)
+	changed := make(chan struct{}, 8)
+	e.spec.Stalls = func() { changed <- struct{}{} }
+	ctx, cancel := context.WithCancel(context.Background())
+	stop, moverDone := make(chan struct{}), make(chan struct{})
+	var resumed atomic.Bool
+	go func() {
+		defer close(moverDone)
+		for h := uint64(1); ; h++ {
+			setHead(1, h)
+			if resumed.Load() {
+				setHead(0, h)
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	}()
+	setHead(0, 1)
+	go e.run(ctx)
+	// The heads are written into the members' mappings, which the
+	// cleanup unmaps.
+	defer func() { cancel(); <-e.done; close(stop); <-moverDone }()
+
+	for {
+		select {
+		case <-changed:
+		case <-time.After(2 * window):
+			t.Fatal("the loop did not report a member that stood still")
+		}
+		if stalled, _ := e.Stalled(); len(stalled) > 0 {
+			require.Equal(t, []string{memberA}, stalled, "a member that kept moving was found stalled")
+			break
+		}
+	}
+
+	resumed.Store(true)
+	at := time.Now()
+	select {
+	case <-changed:
+	case <-time.After(RecoverAfter + time.Second):
+		t.Fatal("the loop did not report a member that moved steadily again")
+	}
+	require.GreaterOrEqual(t, time.Since(at), RecoverAfter-100*time.Millisecond, "a recovery was reported early")
+	stalled, _ := e.Stalled()
+	require.Empty(t, stalled)
+}
+
+// The same on mxlfs, through a reader: member A's lazily held
+// placeholder is replaced by an allocated copy a mirror writes, while
+// the engine still maps the placeholder. Reading what the output then
+// publishes must not touch a page of the placeholder, which has none.
+func TestEngineReaderNeverFaultsOnAReplacedMember(t *testing.T) {
+	domain := mxlfsDomain(t)
+	inst, err := mxl.NewInstance(domain, "")
+	require.NoError(t, err)
+	defer inst.Close()
+	lazily(t, domain) // the gateway holds placeholders lazily
+	var held []*mxl.Writer
+	for _, id := range []string{memberA, memberB} {
+		w, _, err := inst.NewWriter(audioDef(id))
+		require.NoError(t, err)
+		held = append(held, w)
+	}
+	defer func() {
+		for _, w := range held {
+			_ = w.Close()
+		}
+	}()
+	e, err := Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+		Skew: 40 * time.Millisecond, Ordered: true}, logr.Discard())
+	require.NoError(t, err)
+	defer e.Close()
+
+	refs := []mxlv1alpha1.RedundancyFlowRef{{FlowID: memberA}}
+	mapped := inodes(domain, refs)[0]
+	require.NoError(t, held[0].Close())
+	require.NoError(t, os.RemoveAll(flowDir(domain, memberA)))
+	w, _, err := inst.NewWriter(audioDef(memberA))
+	require.NoError(t, err)
+	held[0] = w
+	require.NoError(t, mxlfs.AllocateFlow(flowDir(domain, memberA)))
+	require.NotEqual(t, mapped, inodes(domain, refs)[0], "member A is still the mapped placeholder")
+
+	const batch = 480
+	rate := mxl.Rational{Num: 48000, Den: 1}
+	first := (mxl.CurrentIndex(rate)/batch + 1) * batch
+	for end := first; end < first+20*batch; end += batch {
+		s, err := w.OpenSamples(end, batch)
+		require.NoError(t, err)
+		require.NoError(t, s.Commit())
+		e.Committed(0, end-batch, end)
+	}
+
+	r, err := inst.NewReader(output)
+	require.NoError(t, err)
+	defer r.Close()
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	read := func(end uint64) (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("fault: %v", p)
+			}
+		}()
+		v, err := r.GetSamples(end, batch, 50*time.Millisecond)
+		if err != nil {
+			return nil // nothing published there
+		}
+		for ch := uint64(0); ch < 2; ch++ {
+			if _, err := v.CopyChannel(ch); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for end := first + 4*batch; end < first+20*batch; end += batch {
+		require.NoError(t, read(end), "samples up to %d", end)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for p, src := range e.audio.Current {
+		require.NotEqual(t, 0, src, "page %d selected to the replaced placeholder", p)
+	}
+}
+
+// A member that goes away for good, its producer gone and its directory
+// with it, leaves the engine serving from the others: the reconciler
+// keeps the engine rather than rebuild the output under every reader.
+// Losing the primary must neither stall the output nor blank it.
+func TestEngineServesOnWhenAMemberIsRemoved(t *testing.T) {
+	domain := mxlfsDomain(t)
+	inst, err := mxl.NewInstance(domain, "")
+	require.NoError(t, err)
+	defer inst.Close()
+	rate := mxl.Rational{Num: 50, Den: 1}
+	stop := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	done := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	for m, id := range []string{memberA, memberB} {
+		w, _, err := inst.NewWriter(videoDef(id))
+		require.NoError(t, err)
+		go func() {
+			defer close(done[m])
+			defer w.Close()
+			for i := mxl.CurrentIndex(rate); ; i++ {
+				select {
+				case <-stop[m]:
+					return
+				case <-time.After(time.Duration(mxl.NsUntilIndex(i, rate))):
+				}
+				g, err := w.OpenGrain(i)
+				require.NoError(t, err)
+				binary.LittleEndian.PutUint64(g.Payload, uint64(m)<<56|i)
+				require.NoError(t, g.Commit(g.TotalSlices, 0))
+			}
+		}()
+	}
+	defer func() { close(stop[1]); <-done[1] }()
+	time.Sleep(300 * time.Millisecond)
+
+	lazily(t, domain)
+	e, err := Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+		Skew: 40 * time.Millisecond, Ordered: true}, logr.Discard())
+	require.NoError(t, err)
+	defer e.Close()
+	r, err := inst.NewReader(output)
+	require.NoError(t, err)
+	defer r.Close()
+	before := mxl.CurrentIndex(rate) + 2
+	g, err := r.GetGrain(before, time.Second)
+	require.NoError(t, err)
+	require.Zero(t, binary.LittleEndian.Uint64(g.Payload)>>56, "the output is not served from the primary")
+
+	close(stop[0])
+	<-done[0]
+	require.NoError(t, os.RemoveAll(flowDir(domain, memberA)))
+
+	start := mxl.CurrentIndex(rate) + 2
+	for i := start; i < start+150; i++ {
+		g, err := r.GetGrain(i, time.Second)
+		require.NoError(t, err, "grain %d", i)
+		require.False(t, g.Invalid(), "grain %d is INVALID though member B had it", i)
+		v := binary.LittleEndian.Uint64(g.Payload)
+		require.Equal(t, i, v&(1<<56-1), "grain %d shows grain %d", i, v&(1<<56-1))
+		require.Equal(t, uint64(1), v>>56, "grain %d not from member B", i)
+	}
+}
+
+// A pass that moves the head on by more than one, after a tolerance or
+// skew wait, selects the slot of index i while the published head is
+// below i - 1. Readers still trust that slot as i - Grains, so a reader
+// of the oldest grain got the next ring period's grain under the old
+// index. The head must reach i - 1 before the slot moves. It runs
+// without mxlfs: the order is the engine's.
+func TestEnginePublishesTheHeadBeforeMovingASlotReadersTrust(t *testing.T) {
+	const grains = 20
+	path := filepath.Join(t.TempDir(), "data")
+	require.NoError(t, os.WriteFile(path, make([]byte, 4096), 0o644))
+	out, f, err := mapHeader(path, true)
+	require.NoError(t, err)
+	e := &Engine{out: out, outFile: f, views: make([]*os.File, grains)}
+	t.Cleanup(e.release)
+	var trusted []uint64 // per select, the oldest index readers then trusted
+	var indexes []uint64
+	orig := selectAllCall
+	t.Cleanup(func() { selectAllCall = orig })
+
+	a, b := newRing(grains), newRing(grains)
+	for i := uint64(90); i <= 100; i++ {
+		a.commit(i)
+		b.commit(i)
+	}
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew = true, 8
+	now := time.Unix(0, 0)
+	_, head, _ := d.Step([]Member{a.member(), b.member()}, now)
+	e.publish(head)
+
+	// The primary is late with 101 to 104, which b has: the head waits
+	// out the tolerance, then moves four on, every slot to b.
+	for i := uint64(101); i <= 104; i++ {
+		b.commit(i)
+	}
+	ms := []Member{a.member(), b.member()}
+	sel, _, wait := d.Step(ms, now)
+	require.Empty(t, sel)
+	require.Positive(t, wait)
+	sel, head, _ = d.Step(ms, now.Add(wait))
+	require.Equal(t, uint64(104), head)
+	require.Len(t, sel, 4)
+
+	selectAllCall = func(_ *os.File, _ int) error {
+		trusted = append(trusted, e.out.head()+2-grains)
+		return nil
+	}
+	require.NoError(t, e.apply(sel))
+	for k, s := range sel {
+		indexes = append(indexes, s.Index)
+		require.Greater(t, trusted[k], s.Index-grains,
+			"the slot of %d moved while readers trusted it as %d", s.Index, s.Index-grains)
+	}
+	require.Equal(t, []uint64{101, 102, 103, 104}, indexes)
+}
+
+// A member writing at the clock writes index k into the slot of
+// k - Grains at the boundary of k, whatever its head says after a loss.
+// While the output lags, readers still trust that slot, so the engine
+// must pass, and retire it, before that boundary: a pass at the boundary
+// races the member, which may write first. It runs without mxlfs: the
+// timing is the engine's.
+func TestEngineRetiresASlotBeforeTheBoundaryAMemberWritesItAt(t *testing.T) {
+	const grains = 20
+	rate := mxl.Rational{Num: 50, Den: 1}
+	guard := (&Engine{period: 20 * time.Millisecond}).retireGuard()
+	a, b := newRing(grains), newRing(grains)
+	d := NewDiscrete(grains, 2)
+	d.Ordered, d.Skew = true, 8
+	// Both write at the clock up to 119, then lose 120: the output stays
+	// at 119, and readers trust 101 on.
+	for i := uint64(100); i <= 119; i++ {
+		a.commit(i)
+		b.commit(i)
+		ms := []Member{a.member(), b.member()}
+		d.Step(ms, time.Unix(0, 0))
+		due, _ := retireDue(mxl.IndexToTimestamp(rate, i)+uint64(time.Millisecond), rate, guard)
+		require.Equal(t, i, due, "a member committing at the clock reads as late")
+		d.Retire(ms, due) // the pass the commit wakes
+	}
+	require.Equal(t, uint64(119), d.Head)
+	ms := []Member{a.member(), b.member()}
+
+	// A pass late in grain 120, then the one it schedules.
+	now := mxl.IndexToTimestamp(rate, 120) + uint64(12*time.Millisecond)
+	due, next := retireDue(now, rate, guard)
+	require.Equal(t, uint64(120), due)
+	require.Empty(t, d.Retire(ms, due))
+	now += uint64(next)
+	require.Less(t, now, mxl.IndexToTimestamp(rate, 121), "the next pass is not before the boundary of 121")
+	due, _ = retireDue(now, rate, guard)
+	require.Equal(t, uint64(121), due)
+	require.Equal(t, []Select{{Slot: 101 % grains, Source: d.Placeholder, Index: 101}}, d.Retire(ms, due),
+		"the slot of 101, which both members overwrite with 121 at its boundary, did not move before it")
+}
+
+// futex_waitv returns at once when it fails, ENOSYS on a kernel without
+// it; the engine loop would then spin a core. A wait that times out, is
+// woken or finds a word already changed is the normal case and must not
+// add a sleep.
+func TestWaitSleepsWhenFutexWaitvFails(t *testing.T) {
+	var slept []time.Duration
+	var errno unix.Errno
+	origCall, origSleep := futexWaitvCall, sleep
+	t.Cleanup(func() { futexWaitvCall, sleep = origCall, origSleep })
+	futexWaitvCall = func([]futexWaitv, *unix.Timespec) unix.Errno { return errno }
+	sleep = func(d time.Duration) { slept = append(slept, d) }
+	var logged int
+	e := &Engine{log: funcr.New(func(string, string) { logged++ }, funcr.Options{})}
+	waits := make([]futexWaitv, 1)
+
+	for _, errno = range []unix.Errno{0, unix.ETIMEDOUT, unix.EAGAIN, unix.EINTR} {
+		e.wait(waits, maxSleep)
+	}
+	require.Empty(t, slept)
+
+	for _, errno = range []unix.Errno{unix.ENOSYS, unix.EINVAL, unix.EFAULT} {
+		e.wait(waits, maxSleep)
+	}
+	require.Equal(t, []time.Duration{maxSleep, maxSleep, maxSleep}, slept)
+	require.Equal(t, 1, logged, "the failure is logged once")
+}
+
+// The output's definition is its first member's with the output's id.
+// The member's id may be written in upper case, and the same uuid may
+// name a parent: a byte replace missed the one and rewrote the other.
+func TestWithIDSetsOnlyTheFlowsID(t *testing.T) {
+	const member = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+	def := []byte(`{"id":"` + strings.ToUpper(member) + `","label":"cam","parents":["` + member + `"],` +
+		`"grain_rate":{"numerator":50,"denominator":1}}`)
+
+	got, err := withID(def, output)
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(got, &m))
+	require.Equal(t, output, m["id"])
+	require.Equal(t, []any{member}, m["parents"])
+	require.Equal(t, map[string]any{"numerator": 50.0, "denominator": 1.0}, m["grain_rate"])
+
+	_, err = withID([]byte("not json"), output)
+	require.Error(t, err)
+}
+
+// A module that predates MXLFS_IOC_VIEW_REPLACE_SOURCE does not know the
+// command, as no other file does: the engine then reports it cannot
+// replace a member, and the reconciler builds the output again.
+func TestEngineCannotReplaceWithoutTheIoctl(t *testing.T) {
+	f, err := os.Create(filepath.Join(t.TempDir(), "view"))
+	require.NoError(t, err)
+	defer f.Close()
+	require.False(t, canReplace(f))
+	_, err = (&Engine{}).Replace(0)
+	require.ErrorIs(t, err, ErrNoReplace)
+}
+
+// producer writes a flow from a goroutine until stopped. While paused
+// it commits nothing and keeps its writer, as a producer whose process
+// is stopped does.
+type producer struct {
+	stop, done chan struct{}
+	once       sync.Once
+	paused     atomic.Bool
+}
+
+// Stop stops the producer and closes its writer, which removes the flow
+// directory as a producer's exit does.
+func (p *producer) Stop() {
+	p.once.Do(func() { close(p.stop) })
+	<-p.done
+}
+
+// produce writes flow def at the clock. Video grains carry tag and their
+// index in the first word; audio samples carry a mark, tag and their
+// index.
+func produce(t *testing.T, inst *mxl.Instance, def string, tag uint64) *producer {
+	t.Helper()
+	w, _, err := inst.NewWriter(def)
+	require.NoError(t, err)
+	p := &producer{stop: make(chan struct{}), done: make(chan struct{})}
+	stop := p.stop
+	go func() {
+		defer close(p.done)
+		defer w.Close()
+		rate := w.Config().Common.GrainRate
+		if w.Config().Common.Format == mxl.FormatAudio {
+			const batch = 480
+			for end := (mxl.CurrentIndex(rate)/batch + 1) * batch; ; end += batch {
+				select {
+				case <-stop:
+					return
+				case <-time.After(time.Duration(mxl.NsUntilIndex(end, rate))):
+				}
+				if p.paused.Load() {
+					continue
+				}
+				s, err := w.OpenSamples(end, batch)
+				require.NoError(t, err)
+				for ch := uint64(0); ch < 2; ch++ {
+					f1, f2, err := s.ChannelFragments(ch)
+					require.NoError(t, err)
+					idx := end - batch
+					for _, f := range [][]byte{f1, f2} {
+						for o := 0; o+4 <= len(f); o += 4 {
+							binary.LittleEndian.PutUint32(f[o:], 0x80000000|uint32(tag)<<28|uint32(idx&0x0fffffff))
+							idx++
+						}
+					}
+				}
+				require.NoError(t, s.Commit())
+			}
+		}
+		for i := mxl.CurrentIndex(rate); ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Duration(mxl.NsUntilIndex(i, rate))):
+			}
+			if p.paused.Load() {
+				continue
+			}
+			g, err := w.OpenGrain(i)
+			require.NoError(t, err)
+			binary.LittleEndian.PutUint64(g.Payload, tag<<56|i)
+			require.NoError(t, g.Commit(g.TotalSlices, 0))
+		}
+	}()
+	return p
+}
+
+// trustedWindow reads what the output offers behind its head, as a
+// reader of the oldest grain or sample does. Member B wrote all of it, so
+// every grain and sample must be there with its own index: an INVALID
+// grain or silence is a slot or page left on the replaced member, where
+// the new ring holds nothing yet. The exception is an oldest grain B may
+// be writing the next ring period into, which the engine retires to the
+// INVALID grain whichever member served it. A grain or sample of
+// producer tag 0, the old ring, cannot be there any more.
+func trustedWindow(t *testing.T, e *Engine, r *mxl.Reader) {
+	t.Helper()
+	rt, err := r.Runtime()
+	require.NoError(t, err)
+	head := rt.HeadIndex
+	if e.audio == nil {
+		grains := uint64(e.disc.Grains)
+		for i := head + 2 - grains; i <= head; i++ {
+			g, err := r.GetGrain(i, 0)
+			if errors.Is(err, mxl.ErrOutOfRangeLate) {
+				continue // overwritten since the head was read
+			}
+			require.NoError(t, err, "grain %d", i)
+			if g.Invalid() {
+				// Discrete.serves: B's head this far on may be writing the slot.
+				require.Greater(t, e.members[1].head(), i+grains-2,
+					"grain %d behind head %d is INVALID though member B holds it", i, head)
+				continue
+			}
+			v := binary.LittleEndian.Uint64(g.Payload)
+			require.Equal(t, i, v&(1<<56-1), "grain %d behind head %d shows grain %d of producer %d", i, head, v&(1<<56-1), v>>56)
+			require.NotZero(t, v>>56, "grain %d behind head %d is the old ring's", i, head)
+		}
+		return
+	}
+	const batch = 480
+	length := e.audio.Pages * PageSamples
+	from := head - length/2 // the oldest sample readers trust
+	for end := (from+batch-1)/batch*batch + batch; end <= head; end += batch {
+		v, err := r.GetSamples(end, batch, 0)
+		if errors.Is(err, mxl.ErrOutOfRangeLate) {
+			continue
+		}
+		require.NoError(t, err, "samples up to %d", end)
+		for ch := uint64(0); ch < 2; ch++ {
+			buf, err := v.CopyChannel(ch)
+			require.NoError(t, err)
+			for o := 0; o < len(buf); o += 4 {
+				s := binary.LittleEndian.Uint32(buf[o:])
+				idx := end - batch + uint64(o/4)
+				require.NotZero(t, s, "sample %d of channel %d behind head %d is silence though member B holds it", idx, ch, head)
+				require.Equal(t, uint32(idx&0x0fffffff), s&0x0fffffff,
+					"sample %d of channel %d behind head %d carries %#x", idx, ch, head, s)
+				require.NotZero(t, s>>28&7, "sample %d of channel %d behind head %d is the old ring's", idx, ch, head)
+			}
+		}
+	}
+}
+
+func dataInode(t *testing.T, domain, id string) uint64 {
+	t.Helper()
+	var st unix.Stat_t
+	require.NoError(t, unix.Stat(filepath.Join(flowDir(domain, id), "data"), &st))
+	return st.Ino
+}
+
+// A producer that restarts recreates its flow directory, every file in
+// it new. The engine puts the new ring in place of the old one in every
+// view: readers of the output keep their flow, never told it went away,
+// and once the other member stops too, everything they read comes from
+// the restarted producer's new ring.
+func TestEngineTakesARestartedMembersRingInPlace(t *testing.T) {
+	for name, def := range map[string]func(string) string{"video": videoDef, "audio": audioDef} {
+		t.Run(name, func(t *testing.T) {
+			domain := mxlfsDomain(t)
+			inst, err := mxl.NewInstance(domain, "")
+			require.NoError(t, err)
+			defer inst.Close()
+			a, b := produce(t, inst, def(memberA), 0), produce(t, inst, def(memberB), 1)
+			defer func() { a.Stop(); b.Stop() }()
+			time.Sleep(300 * time.Millisecond)
+
+			lazily(t, domain)
+			e, err := Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+				Skew: 40 * time.Millisecond, Ordered: true}, logr.Discard())
+			require.NoError(t, err)
+			defer e.Close()
+			if !e.replaceable {
+				if os.Getenv("MXLFS_REQUIRE_REPLACE") == "1" {
+					t.Fatal("this mxlfs has no MXLFS_IOC_VIEW_REPLACE_SOURCE")
+				}
+				t.Skip("this mxlfs has no MXLFS_IOC_VIEW_REPLACE_SOURCE")
+			}
+			r, err := inst.NewReader(output)
+			require.NoError(t, err)
+			defer r.Close()
+			out := dataInode(t, domain, output)
+			// Long enough that all the output offers behind its head was
+			// published from the members, none from before it started.
+			time.Sleep(time.Second)
+
+			a.Stop()
+			_, err = os.Stat(flowDir(domain, memberA))
+			require.True(t, os.IsNotExist(err), "the producer's exit left its flow directory")
+			a = produce(t, inst, def(memberA), 2)
+			ino, err := e.Replace(0)
+			require.NoError(t, err)
+			require.Equal(t, dataInode(t, domain, memberA), ino)
+			// What readers trust behind the head was served by the old ring
+			// until now; none of it may show what the new ring holds there.
+			trustedWindow(t, e, r)
+
+			b.Stop()
+
+			if name == "audio" {
+				const batch = 480
+				rate := mxl.Rational{Num: 48000, Den: 1}
+				first := (mxl.CurrentIndex(rate)/batch + 4) * batch
+				for end := first; end < first+100*batch; end += batch {
+					v, err := r.GetSamples(end, batch, time.Second)
+					require.NoError(t, err, "samples up to %d", end)
+					for ch := uint64(0); ch < 2; ch++ {
+						buf, err := v.CopyChannel(ch)
+						require.NoError(t, err)
+						for o := 0; o < len(buf); o += 4 {
+							s := binary.LittleEndian.Uint32(buf[o:])
+							idx := end - batch + uint64(o/4)
+							require.Equal(t, 0x80000000|uint32(2)<<28|uint32(idx&0x0fffffff), s,
+								"sample %d of channel %d is not the restarted producer's", idx, ch)
+						}
+					}
+				}
+			} else {
+				rate := mxl.Rational{Num: 50, Den: 1}
+				start := mxl.CurrentIndex(rate) + 2
+				for i := start; i < start+100; i++ {
+					g, err := r.GetGrain(i, time.Second)
+					require.NoError(t, err, "grain %d", i)
+					require.False(t, g.Invalid(), "grain %d is INVALID though the restarted producer had it", i)
+					require.Equal(t, uint64(2)<<56|i, binary.LittleEndian.Uint64(g.Payload),
+						"grain %d is not the restarted producer's", i)
+				}
+			}
+			require.Equal(t, out, dataInode(t, domain, output), "the output was built again")
+		})
+	}
+}
+
+// A producer whose process stops keeps its writer, its flow directory
+// and every object of its flow; only its head stands still, a grain
+// ring's and a channel buffer's alike. The engine has to find it stalled
+// after StallAfter, say so the moment it is, and again once the producer
+// has committed steadily for RecoverAfter.
+func TestEngineFindsAMemberWhoseProducerStopsCommitting(t *testing.T) {
+	for name, def := range map[string]func(string) string{"video": videoDef, "audio": audioDef} {
+		t.Run(name, func(t *testing.T) {
+			domain := mxlfsDomain(t)
+			inst, err := mxl.NewInstance(domain, "")
+			require.NoError(t, err)
+			defer inst.Close()
+			a, b := produce(t, inst, def(memberA), 0), produce(t, inst, def(memberB), 1)
+			defer func() { a.Stop(); b.Stop() }()
+			time.Sleep(300 * time.Millisecond)
+
+			lazily(t, domain)
+			changed := make(chan time.Time, 8)
+			e, err := Start(context.Background(), Spec{DomainDir: domain, OutputID: output, Members: []string{memberA, memberB},
+				Skew: 40 * time.Millisecond, Ordered: true, Stalls: func() { changed <- time.Now() }}, logr.Discard())
+			require.NoError(t, err)
+			defer e.Close()
+			// Each member is decided on its first commit, the two in one
+			// pass of the loop or in two. A pass reports its change after
+			// the state is set, so the reports are drained once the loop
+			// has passed again.
+			select {
+			case <-changed:
+			case <-time.After(time.Second):
+				t.Fatal("the members were not decided on their first commits")
+			}
+			time.Sleep(200 * time.Millisecond)
+			for len(changed) > 0 {
+				<-changed
+			}
+			time.Sleep(StallAfter + 500*time.Millisecond)
+			stalled, undecided := e.Stalled()
+			require.Empty(t, stalled, "members committing at the clock were found stalled")
+			require.Empty(t, undecided)
+			require.Empty(t, changed)
+
+			a.paused.Store(true)
+			paused := time.Now()
+			select {
+			case at := <-changed:
+				require.GreaterOrEqual(t, at.Sub(paused), StallAfter-100*time.Millisecond, "found stalled early")
+			case <-time.After(StallAfter + time.Second):
+				t.Fatal("a member that stopped committing was not found stalled")
+			}
+			stalled, _ = e.Stalled()
+			require.Equal(t, []string{memberA}, stalled)
+
+			a.paused.Store(false)
+			resumed := time.Now()
+			select {
+			case at := <-changed:
+				require.GreaterOrEqual(t, at.Sub(resumed), RecoverAfter-100*time.Millisecond, "found moving early")
+				require.Less(t, at.Sub(resumed), RecoverAfter+500*time.Millisecond)
+			case <-time.After(RecoverAfter + time.Second):
+				t.Fatal("a member that committed again was not found moving")
+			}
+			stalled, _ = e.Stalled()
+			require.Empty(t, stalled)
+		})
+	}
+}
+
+// A ring's depth comes from the domain's history duration, not from the
+// flow's definition, so a member restarted after the domain's history
+// duration changed passes every check of its definition. Replace must refuse it as a ring of another
+// layout, which the reconciler builds the output again for, not as one
+// it could not open, which it tries again. It runs without mxlfs: the
+// ring is refused before any view is touched.
+func TestEngineRefusesARingOfAnotherDepth(t *testing.T) {
+	ring := func(history int) string {
+		domain := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(domain, "options.json"),
+			[]byte(fmt.Sprintf(`{"urn:x-mxl:option:history_duration/v1.0": %d}`, history)), 0o644))
+		inst, err := mxl.NewInstance(domain, "")
+		require.NoError(t, err)
+		t.Cleanup(func() { inst.Close() })
+		w, _, err := inst.NewWriter(videoDef(memberA))
+		require.NoError(t, err)
+		t.Cleanup(func() { w.Close() })
+		return domain
+	}
+	out, f, err := mapHeader(filepath.Join(flowDir(ring(400000000), memberA), "data"), false)
+	require.NoError(t, err)
+	e := &Engine{spec: Spec{DomainDir: ring(200000000), Members: []string{memberA}}, out: out, outFile: f,
+		disc: &Discrete{}, replaceable: true}
+	t.Cleanup(e.release)
+
+	_, err = e.Replace(0)
+	require.ErrorIs(t, err, ErrOtherLayout)
+	require.NotErrorIs(t, err, ErrNotOpened)
+	require.Contains(t, err.Error(), "grains")
+}
+
+// Start opens each member's directory once and builds the output from
+// the files in it. A member whose directory is replaced or removed in
+// between, as a producer that exits takes it, is no ring to build
+// from by its name any more, and on mxlfs a lookup of a flow directory
+// that is not there waits for it to appear. The build reads every
+// member file in the directory Start opened. Without mxlfs the build
+// stops at its first mxlfs ioctl, after it read the first member's
+// definition and first grain, so the per-slot grain opens are covered
+// only on a real mxlfs (MXLFS_TEST_DIR).
+func TestEngineBuildsFromTheMemberDirectoriesItOpened(t *testing.T) {
+	domain := t.TempDir()
+	if os.Getenv("MXLFS_TEST_DIR") != "" {
+		domain = mxlfsDomain(t)
+		lazily(t, domain)
+	}
+	inst, err := mxl.NewInstance(domain, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { inst.Close() })
+	w, _, err := inst.NewWriter(videoDef(memberA))
+	require.NoError(t, err)
+	t.Cleanup(func() { w.Close() })
+
+	e := &Engine{spec: Spec{DomainDir: domain, OutputID: output, Members: []string{memberA}},
+		outDir: flowDir(domain, output)}
+	t.Cleanup(e.release)
+	dir, err := os.Open(flowDir(domain, memberA))
+	require.NoError(t, err)
+	e.dirs = append(e.dirs, dir)
+	f, err := openIn(dir, "data")
+	require.NoError(t, err)
+	h, err := mapHeaderFile(f, unix.PROT_READ)
+	require.NoError(t, err)
+	e.members, e.files = append(e.members, h), append(e.files, f)
+	require.NoError(t, e.checkAligned())
+	require.NoError(t, os.Rename(flowDir(domain, memberA), filepath.Join(domain, ".gone")))
+
+	require.NotErrorIs(t, e.build(), fs.ErrNotExist, "the build looked a member up by its name")
+}
+
+// rig runs an engine's loop over two audio members on tmpfs, without
+// mxlfs: the loop reads the members' headers, which tmpfs maps as well.
+// Its clock decides only whether a member counts as fed.
+type rig struct {
+	t      *testing.T
+	e      *Engine
+	clock  atomic.Int64 // nanoseconds
+	cancel context.CancelFunc
+}
+
+const rigPages = 64
+
+// rigBase is where both members start writing, a page boundary.
+const rigBase = 1000 * PageSamples
+
+func newRig(t *testing.T) *rig {
+	t.Helper()
+	r := &rig{t: t}
+	r.clock.Store(time.Unix(1_000_000, 0).UnixNano())
+	e := &Engine{spec: Spec{Members: []string{memberA, memberB}}, audio: NewAudio(2, rigPages, 2),
+		done: make(chan struct{}), replaces: make(chan replaceReq)}
+	e.now = func() time.Time { return time.Unix(0, r.clock.Load()) }
+	e.audio.Skew = 2 * PageSamples
+	e.out, e.outFile = r.header()
+	for range 2 {
+		h, f := r.header()
+		e.members, e.files = append(e.members, h), append(e.files, f)
+	}
+	t.Cleanup(e.release)
+	r.e = e
+	return r
+}
+
+func (r *rig) header() (*header, *os.File) {
+	path := filepath.Join(r.t.TempDir(), "data")
+	require.NoError(r.t, os.WriteFile(path, make([]byte, 4096), 0o644))
+	h, f, err := mapHeader(path, true)
+	require.NoError(r.t, err)
+	return h, f
+}
+
+func setHead(h *header, head uint64) {
+	atomic.StoreUint64((*uint64)(unsafe.Pointer(&h.info.runtime.headIndex)), head)
+}
+
+// start runs the loop until the test ends.
+func (r *rig) start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
+	go r.e.run(ctx)
+	r.t.Cleanup(func() { cancel(); <-r.e.done })
+}
+
+// advance moves the rig's clock past any window a report keeps a member
+// fed for. A rig with no rate counts no report as lasting any time, so
+// its fed window is minFedWindow.
+func (r *rig) advance() { r.clock.Add(int64(4 * minFedWindow)) }
+
+// replace puts a fresh ring, written by nobody yet, in member's place,
+// as Replace does for a restarted producer, and returns its header.
+func (r *rig) replace(member int) *header {
+	h, f := r.header()
+	req := replaceReq{member: member, ring: &memberRing{h: h, f: f}, done: make(chan error, 1)}
+	r.e.replaces <- req
+	require.NoError(r.t, <-req.done)
+	return h
+}
+
+// write moves a and b on together from rigBase, a only up to stopA, b on
+// and on, until the returned stop is called.
+func write(a, b *header, stopA uint64) (stop func()) {
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for h := uint64(rigBase); ; h += 480 {
+			if h <= stopA {
+				setHead(a, h)
+			}
+			setHead(b, h)
+			select {
+			case <-quit:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	return func() { close(quit); <-done }
+}
+
+// requireServedFromB waits for the output to pass a's stop at stopA, and
+// checks the pages after it came from member b.
+func (r *rig) requireServedFromB(a, b *header, stopA uint64, stop func()) {
+	r.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for r.e.out.head() < stopA+8*PageSamples {
+		if time.Now().After(deadline) {
+			stop()
+			r.t.Fatalf("the output stood still at %d with A at %d, while B kept writing to %d",
+				r.e.out.head(), a.head(), b.head())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stop()
+	r.e.mu.Lock()
+	defer r.e.mu.Unlock()
+	for n := uint64(stopA/PageSamples + 1); n < stopA/PageSamples+8; n++ {
+		require.Equal(r.t, 1, r.e.audio.Current[n%rigPages], "page %d after A stopped is not B's", n)
+	}
+}
+
+// A member's ring is replaced when its producer restarts, and the new
+// ring need not be written the way the old one was: an engine that ran
+// on another node, its ring a mirror the gateway reported, can come back
+// on this node and write the ring itself, which nothing reports. The
+// output must then follow that member once the other one stops, as it
+// does a member that was local from the start.
+func TestEngineFollowsAReplacedMemberWrittenLocally(t *testing.T) {
+	r := newRig(t)
+	a := r.e.members[0]
+	setHead(r.e.members[1], rigBase+PageSamples)
+	r.e.Committed(1, rigBase, rigBase+PageSamples) // B is a mirror
+	setHead(a, rigBase)
+	r.start()
+	b := r.replace(1)
+	const stopA = rigBase + 20*PageSamples
+	r.requireServedFromB(a, b, stopA, write(a, b, stopA))
+}
+
+// A producer that comes back on the node holding a mirror of its flow
+// opens the mirror's ring and writes on in it: no ring is replaced, and
+// the gateway stops reporting the member. Its head is followed then.
+func TestEngineFollowsAMemberWhoseRingAProducerTookOver(t *testing.T) {
+	r := newRig(t)
+	a, b := r.e.members[0], r.e.members[1]
+	setHead(b, rigBase+PageSamples)
+	r.e.Committed(1, rigBase, rigBase+PageSamples) // B is a mirror
+	setHead(a, rigBase)
+	r.start()
+	r.advance() // no report since: the producer writes B's ring itself
+	const stopA = rigBase + 20*PageSamples
+	r.requireServedFromB(a, b, stopA, write(a, b, stopA))
+}
+
+// The gateway names a flow, not a ring, so a report about a member's old
+// ring can come after the ring was replaced. It must not leave the new
+// ring, which nobody reports, unfollowed.
+func TestEngineFollowsAReplacedMemberDespiteALateReport(t *testing.T) {
+	r := newRig(t)
+	a := r.e.members[0]
+	setHead(r.e.members[1], rigBase+PageSamples)
+	r.e.Committed(1, rigBase, rigBase+PageSamples)
+	setHead(a, rigBase)
+	r.start()
+	b := r.replace(1)
+	r.e.Committed(1, rigBase+PageSamples, rigBase+PageSamples+480) // about the old ring
+	r.advance()
+	const stopA = rigBase + 20*PageSamples
+	r.requireServedFromB(a, b, stopA, write(a, b, stopA))
+}
+
+// Once the gateway reports a replaced member, the loop stops counting
+// from its head: a mirror's head moving over samples it lost would
+// otherwise count them as committed. When the reports stop, it follows
+// the head again.
+func TestEngineStopsFollowingAReplacedMemberOnceReported(t *testing.T) {
+	r := newRig(t)
+	setHead(r.e.members[0], rigBase)
+	r.start()
+	b := r.replace(1)
+	evHead := func() uint64 {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return r.e.audio.evHead[1]
+	}
+	waitFor := func(want uint64, msg string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for evHead() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: counted to %d, want %d", msg, evHead(), want)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	setHead(b, rigBase)
+	// The loop's first look at the new ring sets where it follows from.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.e.mu.Lock()
+		seen := r.e.lastHead != nil && r.e.lastHead[1] == rigBase
+		r.e.mu.Unlock()
+		if seen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the loop never looked at the new ring")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	setHead(b, rigBase+PageSamples)
+	waitFor(rigBase+PageSamples, "not followed before any report")
+
+	setHead(b, rigBase+2*PageSamples)
+	r.e.Committed(1, rigBase+PageSamples, rigBase+2*PageSamples)
+	setHead(b, rigBase+4*PageSamples) // moves on with no report
+	time.Sleep(10 * maxSleep)         // several passes of the loop
+	require.Equal(t, uint64(rigBase+2*PageSamples), evHead(),
+		"the loop counted from the head of a member the gateway reports")
+
+	r.advance()
+	waitFor(rigBase+4*PageSamples, "not followed once the reports stopped")
+	// From the end of the report on, not from where the head was seen
+	// before it: counted again, the reported page would read as broken.
+	r.e.mu.Lock()
+	defer r.e.mu.Unlock()
+	n := uint64(rigBase/PageSamples + 1)
+	c := r.e.audio.cov[1][n%rigPages]
+	require.True(t, c.valid && c.n == n && !c.broken && c.to == rigBase+2*PageSamples,
+		"page %d, reported whole: %+v", n, c)
+}
+
+// batchCase is an audio flow written in batches of one size: per picture
+// at the slowest and fastest grain rates in use, in AAC frames, which at
+// 240 fps span five pictures, and in long batches whose fed and quiet
+// windows outlast the constant floors. A case's ring holds rigPages pages,
+// so a case writes less than that ahead of the oldest page it checks.
+type batchCase struct {
+	name  string
+	rate  int64 // samples per second
+	batch uint64
+}
+
+func (c batchCase) period() time.Duration {
+	return time.Duration(float64(c.batch) * float64(time.Second) / float64(c.rate))
+}
+
+var batchCases = []batchCase{
+	{"per picture at 24000/1001 fps, 48 kHz", 48000, 2002},
+	{"per picture at 50 fps, 48 kHz", 48000, 960},
+	{"per picture at 60000/1001 fps, 48 kHz", 48000, 801},
+	{"per picture at 120 fps, 48 kHz", 48000, 400},
+	{"per picture at 240 fps, 48 kHz", 48000, 200},
+	{"per picture at 240 fps, 44.1 kHz", 44100, 184},
+	{"AAC frames, 48 kHz", 48000, 1024},
+	{"100 ms batches, 96 kHz", 96000, 9600},
+	{"300 ms batches, 48 kHz", 48000, 14400},
+}
+
+func (r *rig) at(c batchCase) *rig {
+	r.e.setRate(mxl.Rational{Num: c.rate, Den: 1})
+	return r
+}
+
+// whole reports whether member m holds page n whole.
+func (r *rig) whole(m int, n uint64) bool {
+	c := r.e.audio.cov[m][n%rigPages]
+	return c.valid && c.n == n && !c.broken && c.to == (n+1)*PageSamples
+}
+
+// A mirror the gateway keeps reporting stays fed, at whatever rate it is
+// reported, and the loop adds nothing from its head: a mirror's head moves
+// over a batch it lost as over one it committed, and only the gateway's
+// reports tell them apart.
+func TestEngineCountsOnlyWhatTheGatewayReportsOfAMirror(t *testing.T) {
+	for _, c := range batchCases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRig(t).at(c)
+			b, n := r.e.members[1], c.batch
+			setHead(r.e.members[0], rigBase)
+			setHead(b, rigBase)
+			r.e.Committed(1, rigBase-n, rigBase)
+			r.start()
+			h := uint64(rigBase)
+			for h < rigBase+4*PageSamples {
+				r.clock.Add(int64(c.period()))
+				setHead(b, h+n)
+				r.e.Committed(1, h, h+n)
+				h += n
+				time.Sleep(time.Millisecond)
+			}
+			// The batch at h is lost: one period on, the head moves over it
+			// and the next one, and the gateway reports only the next one,
+			// after the loop has looked for longer than it holds an advance
+			// back. The member has to count as fed for that period.
+			r.clock.Add(int64(c.period()))
+			setHead(b, h+2*n)
+			time.Sleep(5 * maxSleep)
+			r.e.Committed(1, h+n, h+2*n)
+			r.e.mu.Lock()
+			defer r.e.mu.Unlock()
+			for p := uint64(rigBase / PageSamples); (p+1)*PageSamples <= h; p++ {
+				require.True(t, r.whole(1, p), "page %d of a reported member: %+v", p, r.e.audio.cov[1][p%rigPages])
+			}
+			p := h / PageSamples
+			require.False(t, r.whole(1, p), "a batch the mirror lost was counted from its head: %+v",
+				r.e.audio.cov[1][p%rigPages])
+		})
+	}
+}
+
+// When the gateway starts reporting a member the loop followed by its
+// head, its first report repeats samples the head already covered. Those
+// count once; counted again, the page would read as broken.
+func TestEngineCountsAReportOverlappingTheFollowedHeadOnce(t *testing.T) {
+	r := newRig(t)
+	const x = rigBase
+	setHead(r.e.members[1], x+960)
+	r.e.audio.Committed(1, x, x+480) // what the loop followed
+	r.e.Committed(1, x+240, x+960)   // the gateway's first report
+	c := r.e.audio.cov[1][(x/PageSamples)%rigPages]
+	require.False(t, c.broken, "a report overlapping the followed head broke the page")
+	require.Equal(t, uint64(x+960), c.to)
+}
+
+// A mirror quiet for longer than its fed window may have lost a batch.
+// libmxl wakes the loop on its next commit, and the loop can look before
+// the gateway reports that commit: a head moved over the lost batch must
+// not count it as arrived. follow is called directly here, so the loop's
+// look comes first for certain.
+func TestEngineDoesNotCountAQuietMirrorsGapFromItsHead(t *testing.T) {
+	for _, c := range batchCases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRig(t).at(c)
+			b, n := r.e.members[1], c.batch
+			setHead(b, rigBase+n)
+			r.e.Committed(1, rigBase, rigBase+n)
+			r.clock.Add(int64(r.e.fedWindow(1)))
+			t0 := time.Now()
+			setHead(b, rigBase+3*n) // the batch [+n, +2n) is lost
+			r.e.mu.Lock()
+			r.e.follow(t0)
+			r.e.mu.Unlock()
+			r.requireLostBatchNotCounted(t0, n, rigBase+3*n)
+		})
+	}
+}
+
+// requireLostBatchNotCounted checks, for member b that reported up to
+// rigBase+n and whose head the loop has just seen at h past a lost batch
+// [rigBase+n, rigBase+2n), that the loop held the advance back, then that
+// the report of b's last batch [h-n, h) leaves the lost batch uncounted.
+// A page smaller than three batches stays partial whether or not the gap
+// counted, so the counted range is checked directly, not page wholeness.
+func (r *rig) requireLostBatchNotCounted(t0 time.Time, n, h uint64) {
+	r.t.Helper()
+	r.e.mu.Lock()
+	require.Equal(r.t, rigBase+n, r.e.audio.evHead[1], "the advance over a lost batch counted before a report could come")
+	r.e.mu.Unlock()
+	r.e.Committed(1, h-n, h)
+	r.e.mu.Lock()
+	defer r.e.mu.Unlock()
+	r.e.follow(t0.Add(2 * followDelay))
+	require.Equal(r.t, h, r.e.audio.evHead[1], "the report of the last batch did not count")
+	p := (rigBase + n) / PageSamples
+	c := r.e.audio.cov[1][p%rigPages]
+	require.False(r.t, c.valid && c.n == p && !c.broken && c.to > rigBase+n,
+		"the lost batch was counted from the head: %+v", c)
+	for q := p + 1; q < (h-n)/PageSamples; q++ {
+		c := r.e.audio.cov[1][q%rigPages]
+		require.False(r.t, c.valid && c.n == q, "page %d, which b never reported, counted: %+v", q, c)
+	}
+}
+
+// A mirror that stays quiet is followed once its advance has stood
+// unreported for followDelay, however long it was quiet; a member never
+// reported, at once.
+func TestEngineFollowsAQuietMirrorLateAndALocalRingAtOnce(t *testing.T) {
+	for _, c := range batchCases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRig(t).at(c)
+			a, b, n := r.e.members[0], r.e.members[1], c.batch
+			setHead(b, rigBase+n)
+			r.e.Committed(1, rigBase, rigBase+n)
+			r.clock.Add(int64(r.e.fedWindow(1)))
+			setHead(a, rigBase)
+			t0 := time.Now()
+			r.e.mu.Lock()
+			defer r.e.mu.Unlock()
+			r.e.follow(t0) // notes a's head
+			setHead(a, rigBase+n)
+			setHead(b, rigBase+2*n)
+			r.e.follow(t0)
+			require.Equal(t, rigBase+n, r.e.audio.evHead[0], "a local ring's advance was held back")
+			require.Equal(t, rigBase+n, r.e.audio.evHead[1], "a quiet mirror's advance counted at once")
+			r.e.follow(t0.Add(followDelay))
+			require.Equal(t, rigBase+2*n, r.e.audio.evHead[1], "a quiet mirror's advance never counted")
+
+			r.clock.Add(int64(10 * time.Minute))
+			setHead(b, rigBase+3*n)
+			r.e.follow(t0.Add(followDelay))
+			require.Equal(t, rigBase+2*n, r.e.audio.evHead[1],
+				"a member quiet for ten minutes was counted at once")
+			r.e.follow(t0.Add(2 * followDelay))
+			require.Equal(t, rigBase+3*n, r.e.audio.evHead[1], "a long-quiet mirror's advance never counted")
+		})
+	}
+}
+
+// A replaced ring starts over: the head the loop saw of the old one, and
+// an advance it held back, say nothing about the new one, whose pages
+// below its first head nobody wrote. Counted from the old head, they
+// would be selected, and a page mxlfs never backed faults SIGBUS in the
+// output's readers.
+func TestEngineDoesNotCountAReplacedRingFromTheOldHead(t *testing.T) {
+	for _, c := range batchCases {
+		for _, quiet := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, quiet mirror %v", c.name, quiet), func(t *testing.T) {
+				r := newRig(t).at(c)
+				old, n := r.e.members[1], c.batch
+				t0 := time.Now()
+				setHead(old, rigBase)
+				if quiet {
+					r.e.Committed(1, rigBase-n, rigBase)
+					r.clock.Add(int64(r.e.fedWindow(1)))
+				}
+				r.e.mu.Lock()
+				r.e.follow(t0)
+				setHead(old, rigBase+n)
+				r.e.follow(t0) // counted, or held back for a quiet mirror
+				r.e.mu.Unlock()
+
+				h, f := r.header()
+				require.NoError(t, r.e.take(1, &memberRing{h: h, f: f}))
+				y := uint64(rigBase + 5*n)
+				setHead(h, y)
+				r.e.mu.Lock()
+				defer r.e.mu.Unlock()
+				r.e.follow(t0.Add(followDelay))
+				require.Zero(t, r.e.audio.evHead[1], "the new ring was counted from the old one's head")
+				for p := range r.e.audio.cov[1] {
+					require.False(t, r.e.audio.cov[1][p].valid, "slot %d of the new ring counted before it moved", p)
+				}
+				setHead(h, y+n)
+				r.e.follow(t0.Add(followDelay))
+				r.e.follow(t0.Add(2 * followDelay))
+				require.Equal(t, y+n, r.e.audio.evHead[1], "the new ring's advance was not followed")
+				for p := (rigBase + n) / PageSamples; p < y/PageSamples; p++ {
+					c := r.e.audio.cov[1][p%rigPages]
+					require.False(t, c.valid && c.n == p, "page %d, below the new ring's first head, counted: %+v", p, c)
+				}
+			})
+		}
+	}
+}
+
+// A mirror can lose a batch and then stay quiet for any time, and its
+// index can resume at the clock, past the gap by however long it was
+// quiet, or where it left off, as a producer whose output continues from
+// its own position does. Neither the time nor the distance tells a lost
+// batch from a local producer's advance, so the advance is held back for
+// a report in every combination, at every rate.
+func TestEngineHoldsBackAQuietMirrorHoweverLongAndFar(t *testing.T) {
+	for _, c := range batchCases {
+		for _, quiet := range []time.Duration{0, 10 * time.Second, 10 * time.Minute} {
+			for _, far := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s, quiet %v past the fed window, index at the clock %v", c.name, quiet, far), func(t *testing.T) {
+					r := newRig(t).at(c)
+					b, n := r.e.members[1], c.batch
+					setHead(b, rigBase+n)
+					r.e.Committed(1, rigBase, rigBase+n)
+					r.clock.Add(int64(r.e.fedWindow(1) + quiet))
+					h := uint64(rigBase + 3*n)
+					if far {
+						// Resumed at the clock: many pages on, inside the
+						// rig's ring of rigPages pages.
+						h = (rigBase+2*n)/PageSamples*PageSamples + 20*PageSamples + n
+					}
+					t0 := time.Now()
+					setHead(b, h)
+					r.e.mu.Lock()
+					r.e.follow(t0)
+					r.e.mu.Unlock()
+					r.requireLostBatchNotCounted(t0, n, h)
+				})
+			}
+		}
+	}
+}
+
+// Each advance a quiet mirror makes is counted followDelay after it was
+// seen, up to the head seen then: a head that moved on since, over a
+// batch the mirror lost, does not count with it. The report of the batch
+// after the lost one comes after that pass.
+func TestEngineCountsAHeldAdvanceOnlyUpToTheHeadSeen(t *testing.T) {
+	for _, c := range batchCases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRig(t).at(c)
+			b, n := r.e.members[1], c.batch
+			setHead(b, rigBase+n)
+			r.e.Committed(1, rigBase, rigBase+n)
+			r.clock.Add(int64(r.e.fedWindow(1)))
+			t0 := time.Now()
+			r.e.mu.Lock()
+			defer r.e.mu.Unlock()
+			setHead(b, rigBase+2*n)
+			r.e.follow(t0)
+			setHead(b, rigBase+4*n) // the batch [+2n, +3n) is lost
+			r.e.follow(t0.Add(followDelay / 2))
+			r.e.follow(t0.Add(followDelay))
+			require.Equal(t, rigBase+2*n, r.e.audio.evHead[1],
+				"an advance counted past the head seen when it was held")
+			r.e.mu.Unlock()
+			r.e.Committed(1, rigBase+3*n, rigBase+4*n)
+			r.e.mu.Lock()
+			r.e.follow(t0.Add(3 * followDelay))
+			require.Equal(t, rigBase+4*n, r.e.audio.evHead[1])
+			p := (rigBase + 2*n) / PageSamples
+			cv := r.e.audio.cov[1][p%rigPages]
+			require.False(t, cv.valid && cv.n == p && !cv.broken && cv.to > rigBase+2*n,
+				"the lost batch was counted: %+v", cv)
+			for q := p + 1; q < (rigBase+3*n)/PageSamples; q++ {
+				cv := r.e.audio.cov[1][q%rigPages]
+				require.False(t, cv.valid && cv.n == q, "page %d, inside the lost batch, counted: %+v", q, cv)
+			}
+		})
+	}
+}
+
+// A producer that took over a mirror's ring is never reported again, so
+// each of its advances is held for followDelay. When the other member
+// loses a batch, the samples are the held member's: the output must wait
+// for them rather than publish silence once the skew budget runs out,
+// with a budget shorter than followDelay and one far shorter than it,
+// under which several of the held member's advances queue at once.
+//
+// Where half a batch period is shorter than followDelay, B commits half a
+// period after A, so B's advance is still held when A's next batch makes
+// the lost one due, even at a period close to followDelay. At longer
+// periods B commits with A: B's advance would otherwise be counted before
+// A's next batch, B's own next batch not yet written, and a page A
+// resumes in the middle of is not A's whole, so its remainder would go
+// out as silence because B is late, not because anything is held.
+func TestEngineWaitsForAHeldMemberRatherThanPublishSilence(t *testing.T) {
+	for _, skew := range []time.Duration{20 * time.Millisecond, 5 * time.Millisecond} {
+		for _, c := range batchCases {
+			t.Run(fmt.Sprintf("%s, skew %v", c.name, skew), func(t *testing.T) {
+				r := newRig(t).at(c)
+				a, b, n := r.e.members[0], r.e.members[1], c.batch
+				r.e.audio.Skew = uint64(skew.Seconds() * float64(c.rate))
+				// B was a mirror; its producer then took over the ring.
+				setHead(b, rigBase)
+				r.e.Committed(1, rigBase-n, rigBase)
+				r.e.Committed(0, rigBase-n, rigBase)
+				setHead(a, rigBase)
+				r.clock.Add(int64(r.e.fedWindow(1)))
+				const lost = 3
+				now := time.Now()
+				r.e.mu.Lock()
+				defer r.e.mu.Unlock()
+				r.e.follow(now)
+				// A pass each half period: A commits at odd passes, B at
+				// the next one, or with A where it is not offset.
+				step := c.period() / 2
+				offset := step < followDelay
+				// The pages of A's lost batch, checked once the head first
+				// passes it: a page nothing served before maps to silence
+				// already, so picking silence there selects nothing.
+				lostFrom, lostTo := rigBase+uint64(lost-1)*n, rigBase+uint64(lost)*n
+				checked := false
+				passes := 2 * (lost + 6 + int(4*followDelay/c.period()))
+				for k := 1; k <= passes; k++ {
+					now = now.Add(step)
+					r.clock.Add(int64(step))
+					h := rigBase + uint64((k+1)/2)*n
+					if k%2 == 1 {
+						setHead(a, h)
+						if !offset {
+							setHead(b, h)
+						}
+						r.e.mu.Unlock()
+						if (k+1)/2 != lost {
+							r.e.Committed(0, h-n, h) // A, a mirror, loses one batch
+						}
+						r.e.mu.Lock()
+					} else if offset {
+						setHead(b, h)
+					}
+					r.e.reported[0].at = r.e.clock() // A stays fed throughout
+					r.e.follow(now)
+					sel, _, _ := r.e.audio.Step(now)
+					for _, s := range sel {
+						require.NotEqual(t, r.e.audio.Silence, s.Source,
+							"pass %d published page %d as silence while B held its samples", k, s.Page)
+					}
+					if !checked && r.e.audio.Head >= lostTo {
+						checked = true
+						for q := lostFrom / PageSamples; q*PageSamples < lostTo; q++ {
+							require.NotEqual(t, r.e.audio.Silence, r.e.audio.Current[q%rigPages],
+								"page %d of A's lost batch went out as silence while B held it", q)
+						}
+					}
+				}
+				require.True(t, checked, "the output never got past A's lost batch")
+				require.GreaterOrEqual(t, r.e.audio.Head, rigBase+uint64(lost+1)*n,
+					"the output never got past A's lost batch")
+			})
+		}
+	}
+}
+
+// What the policy is told is held is rebuilt each pass: a span left
+// over from an advance since counted would keep the output from
+// publishing silence that no member holds anything for.
+func TestEngineHeldIsRebuiltEachPass(t *testing.T) {
+	for _, c := range batchCases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newRig(t).at(c)
+			a, b, n := r.e.members[0], r.e.members[1], c.batch
+			setHead(b, rigBase)
+			r.e.Committed(1, rigBase-n, rigBase)
+			r.clock.Add(int64(r.e.fedWindow(1)))
+			setHead(a, rigBase)
+			now := time.Now()
+			r.e.mu.Lock()
+			defer r.e.mu.Unlock()
+			for k := 1; k <= 50; k++ {
+				now = now.Add(c.period())
+				setHead(a, rigBase+uint64(k)*n)
+				setHead(b, rigBase+uint64(k)*n)
+				r.e.follow(now)
+				require.LessOrEqual(t, len(r.e.audio.Held), len(r.e.members), "pass %d", k)
+			}
+			// B stops; once its last advance counts, nothing is held.
+			r.e.follow(now.Add(followDelay))
+			require.Empty(t, r.e.audio.Held, "a counted advance is still held")
+			require.False(t, r.e.audio.held(rigBase+n), "a stale span still blocks silence")
+		})
+	}
+}
+
+// The loop wakes when a held advance falls due. Woken for another member
+// in between, it would otherwise count the advance only at the first pass
+// after it fell due: with another member waking it every 19ms, at about
+// twice followDelay rather than once. Scheduling only ever adds delay, so
+// the least lag over several advances shows which it is. It runs without
+// mxlfs: the loop reads the members' headers.
+func TestEngineLoopCountsAHeldAdvanceWhenDue(t *testing.T) {
+	r := newRig(t)
+	a, b := r.e.members[0], r.e.members[1]
+	setHead(a, rigBase)
+	setHead(b, rigBase)
+	r.e.Committed(1, rigBase-480, rigBase)
+	r.advance()
+	r.start()
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(19 * time.Millisecond):
+			}
+			atomic.AddUint32(a.syncWord(), 1)
+			_, _, _ = unix.Syscall6(unix.SYS_FUTEX, uintptr(unsafe.Pointer(a.syncWord())), futexWake, futexWakeAll, 0, 0, 0)
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	time.Sleep(5 * maxSleep) // the loop's first look notes the heads
+	least := time.Hour
+	for k := uint64(1); k <= 10; k++ {
+		want := rigBase + 480*k
+		set := time.Now()
+		setHead(b, want) // no futex wake: a pass finds it
+		deadline := set.Add(time.Second)
+		for {
+			r.e.mu.Lock()
+			got := r.e.audio.evHead[1]
+			r.e.mu.Unlock()
+			if got == want {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("held advance %d never counted", k)
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+		least = min(least, time.Since(set))
+	}
+	require.Less(t, least, followDelay+10*time.Millisecond,
+		"a held advance counted a pass late at best: %v", least)
+}

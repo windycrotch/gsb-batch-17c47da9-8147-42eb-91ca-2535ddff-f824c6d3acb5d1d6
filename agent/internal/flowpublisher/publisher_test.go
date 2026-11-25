@@ -1,0 +1,771 @@
+package flowpublisher
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	mxlv1alpha1 "github.com/qvest-digital/mxl-k8s/api/v1alpha1"
+)
+
+const validFlowID = "11111111-2222-3333-4444-555555555555"
+
+func newScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(mxlv1alpha1.AddToScheme(s))
+	return s
+}
+
+func TestFlowIDFromDirName(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"canonical", validFlowID + ".mxl-flow", validFlowID, true},
+		{"empty id but suffix", ".mxl-flow", "", false},
+		{"missing suffix", validFlowID, "", false},
+		{"wrong suffix", validFlowID + ".mxl-flowx", "", false},
+		{"empty", "", "", false},
+		{"only suffix-looking", "abc.mxl-flow", "abc", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := FlowIDFromDirName(tc.in)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestPublishAppeared_CreatesMxlFlowAndLocationOnFirstObservation(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`","grain_size":1234}`),
+		0o644))
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		Build()
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	assert.Equal(t, validFlowID, got.Spec.ID)
+	assert.JSONEq(t, `{"id":"`+validFlowID+`","grain_size":1234}`, string(got.Spec.Definition.Raw))
+
+	require.Len(t, got.Status.Locations, 1)
+	assert.Equal(t, "n1", got.Status.Locations[0].NodeName)
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationOrigin, got.Status.Locations[0].Phase)
+	assert.NotNil(t, got.Status.Locations[0].LastObserved,
+		"the agent stamps observed time so stale-detection downstream "+
+			"has a reference; missing this turns Stale into a permanent state")
+}
+
+func TestPublishAppeared_IsIdempotent_DoesNotOverwriteExistingSpec(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`),
+		0o644))
+
+	// Pre-existing MxlFlow with a richer spec - simulates the case
+	// where another writer (operator-driven, or a different agent
+	// that watched first) created the CR.
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec: mxlv1alpha1.MxlFlowSpec{
+			ID:         validFlowID,
+			Definition: runtime.RawExtension{Raw: []byte(`{"id":"` + validFlowID + `","richer":true}`)},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	assert.Equal(t,
+		`{"id":"`+validFlowID+`","richer":true}`,
+		string(got.Spec.Definition.Raw),
+		"the agent must not clobber a richer definition the operator "+
+			"or another writer set; only the per-node location is the "+
+			"agent's to own")
+	require.Len(t, got.Status.Locations, 1)
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationOrigin, got.Status.Locations[0].Phase)
+}
+
+func TestPublishAppeared_RejectsInvalidJSON(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`not-json-at-all`),
+		0o644))
+
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+
+	err := p.PublishAppeared(context.Background(), validFlowID+".mxl-flow")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not valid JSON")
+}
+
+func TestPublishAppeared_MissingDefFileReturnsError(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	// Directory exists but no flow_def.json inside.
+	require.NoError(t, os.Mkdir(filepath.Join(domain, validFlowID+".mxl-flow"), 0o755))
+
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+
+	err := p.PublishAppeared(context.Background(), validFlowID+".mxl-flow")
+	require.Error(t, err)
+}
+
+func TestPublishAppeared_NonFlowEntryIsIgnoredQuietly(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: t.TempDir(), NodeName: "n1"}
+
+	require.NoError(t, p.PublishAppeared(context.Background(), "not-a-flow.txt"))
+	// No CR should have been created.
+	var list mxlv1alpha1.MxlFlowList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Empty(t, list.Items)
+}
+
+// A location records a copy on a node. Once the directory is gone there
+// is none, and every reader treats a missing entry as it treats Stale, so
+// the entry goes rather than staying behind Stale for good.
+func TestPublishVanished_RemovesThisNodesLocation(t *testing.T) {
+	scheme := newScheme(t)
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+				{NodeName: "other", Phase: mxlv1alpha1.MxlFlowLocationReady},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: "/tmp", NodeName: "n1"}
+
+	require.NoError(t, p.PublishVanished(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	assert.Equal(t, []mxlv1alpha1.MxlFlowLocation{
+		{NodeName: "other", Phase: mxlv1alpha1.MxlFlowLocationReady},
+	}, got.Status.Locations,
+		"vanishing on this node removes this node's entry only; "+
+			"other nodes' locations must stay intact")
+}
+
+// A directory that goes while the entry already reads Stale -- one a
+// writer had left, then libmxl's sweep reclaimed -- goes the same way.
+func TestPublishVanished_RemovesAStaleLocation(t *testing.T) {
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationStale},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: "/tmp", NodeName: "n1"}
+
+	require.NoError(t, p.PublishVanished(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	assert.Empty(t, got.Status.Locations)
+}
+
+// On mxlfs the gateway holds a placeholder for a flow on every node
+// without a copy, and each one's marker is published as a vanish. Each
+// of those nodes used to gain a Stale entry.
+func TestPublishVanished_UnlistedNodeAddsNoLocation(t *testing.T) {
+	scheme := newScheme(t)
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "other", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: "/tmp", NodeName: "n1"}
+
+	require.NoError(t, p.PublishVanished(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	assert.Equal(t, existing.Status.Locations, got.Status.Locations,
+		"a node with no entry has no copy to demote")
+}
+
+func TestPublishVanished_MissingMxlFlowIsNoOp(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: "/tmp", NodeName: "n1"}
+
+	require.NoError(t, p.PublishVanished(context.Background(), validFlowID+".mxl-flow"),
+		"a flow that never made it to the API server is the same as "+
+			"one that vanished; the agent must not error out on the race")
+}
+
+func TestInitialSync_WalksDomainAndPublishesEach(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+
+	// Create two valid flows + one entry to ignore.
+	for _, id := range []string{
+		validFlowID,
+		"22222222-3333-4444-5555-666666666666",
+	} {
+		dir := filepath.Join(domain, id+".mxl-flow")
+		require.NoError(t, os.Mkdir(dir, 0o755))
+		require.NoError(t, os.WriteFile(
+			filepath.Join(dir, FlowDefName),
+			[]byte(`{"id":"`+id+`"}`), 0o644))
+	}
+	// A non-flow directory must not produce a Create call.
+	require.NoError(t, os.Mkdir(filepath.Join(domain, "junk"), 0o755))
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		Build()
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+	require.NoError(t, p.InitialSync(context.Background()))
+
+	var list mxlv1alpha1.MxlFlowList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Len(t, list.Items, 2,
+		"InitialSync must produce one CR per .mxl-flow directory and "+
+			"ignore non-matching entries; if this slips, the agent "+
+			"would either skip flows on cold start or produce garbage CRs")
+}
+
+func TestPublishAppeared_MirrorTargetMarksReadyNotOrigin(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "some-mirror",
+			Namespace: "mxl-system",
+		},
+		Spec: mxlv1alpha1.MxlFlowMirrorSpec{
+			FlowID:     validFlowID,
+			SourceNode: "n0",
+			TargetNode: "n1",
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(mirror, existingFlow()).
+		Build()
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	require.Len(t, got.Status.Locations, 1)
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationReady, got.Status.Locations[0].Phase,
+		"a flow directory observed by an agent on a node that already "+
+			"hosts a mirror target for the same flow is a materialized "+
+			"copy, not an Origin; resolveSourceNode picks Origin to "+
+			"locate the producer, so misclassifying the target as "+
+			"Origin would route downstream lookups at a mirror")
+}
+
+// The other half of the same classification. A producer rescheduled
+// onto a node that already mirrors its flow attaches to the directory
+// in place, so ClaimOrigin is the only record that this node produces
+// it -- and the mirror it attached to outlives that claim. Every
+// re-publish re-runs isMirrorTarget, which still says "mirror", and
+// demotes the node again; InitialSync does one per flow on every agent
+// start. The flow ends up with no Origin location anywhere, which
+// resolveSourceNode cannot answer from, and every consumer on every
+// other node gets FLOW_NOT_FOUND for good.
+func TestPublishAppeared_MirrorTargetDoesNotDemoteAClaimedOrigin(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "some-mirror",
+			Namespace: "mxl-system",
+		},
+		Spec: mxlv1alpha1.MxlFlowMirrorSpec{
+			FlowID:     validFlowID,
+			SourceNode: "n0",
+			TargetNode: "n1",
+		},
+	}
+	claimed := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{{
+				NodeName:     "n1",
+				Phase:        mxlv1alpha1.MxlFlowLocationOrigin,
+				LastObserved: &metav1.Time{Time: metav1.Now().Time},
+				AppearedAt:   &metav1.Time{Time: metav1.Now().Time},
+			}},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(mirror, claimed).
+		Build()
+
+	lease := &fakeLease{}
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1", Lease: lease}
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Name: validFlowID}, &got))
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationOrigin, localPhase(t, &got, "n1"),
+		"a producer attaching to the flow is observed evidence and a "+
+			"mirror naming this node is an inference; the inference must "+
+			"not overrule it")
+	assert.Equal(t, []string{validFlowID}, lease.renewed,
+		"the location still reads Origin, so consumers check its Lease; "+
+			"skipping the renewal here leaves the Origin looking stale "+
+			"until the renew loop's next tick")
+}
+
+func TestInitialSync_RemovesLocationForFlowsNoLongerOnDisk(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	// no flow dirs on disk
+
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+				{NodeName: "other", Phase: mxlv1alpha1.MxlFlowLocationReady},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+	require.NoError(t, p.InitialSync(context.Background()))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	byNode := map[string]mxlv1alpha1.MxlFlowLocationPhase{}
+	for _, l := range got.Status.Locations {
+		byNode[l.NodeName] = l.Phase
+	}
+	assert.NotContains(t, byNode, "n1",
+		"an agent that owns an Origin location must retire it on cold "+
+			"start when the on-disk flow is gone; leaving the stale "+
+			"Origin behind misdirects resolveSourceNode to a node that "+
+			"no longer holds the flow")
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationReady, byNode["other"],
+		"other-node locations are out of this agent's scope; "+
+			"InitialSync must not touch them")
+}
+
+func TestPromoteStaleLocalOrigins_RepublishesStaleLocation(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	// Stale with no LastObserved: the shape PublishVanished leaves
+	// behind, and the shape a dropped PublishAppeared conflict never
+	// repairs.
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationStale},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+	require.NoError(t, p.promoteStaleLocalOrigins(context.Background(),
+		map[string]struct{}{validFlowID: {}}))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	require.Len(t, got.Status.Locations, 1)
+	loc := got.Status.Locations[0]
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationOrigin, loc.Phase,
+		"an on-disk flow stuck Stale must be re-published to Origin; "+
+			"leaving it Stale strands the source gateway's rotation "+
+			"detector, which only re-arms on a fresh LastObserved")
+	require.NotNil(t, loc.LastObserved)
+}
+
+func TestPromoteStaleLocalOrigins_RepublishesMissingLocationEntry(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	// MxlFlow exists (another node published it) but carries no
+	// location entry for n1 at all -- the shape a dropped first-ever
+	// PublishAppeared on this node leaves behind.
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+	require.NoError(t, p.promoteStaleLocalOrigins(context.Background(),
+		map[string]struct{}{validFlowID: {}}))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	require.Len(t, got.Status.Locations, 1)
+	assert.Equal(t, "n1", got.Status.Locations[0].NodeName)
+	assert.Equal(t, mxlv1alpha1.MxlFlowLocationOrigin, got.Status.Locations[0].Phase)
+}
+
+func TestPromoteStaleLocalOrigins_LeavesHealthyLocationUntouched(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	originalObserved := metav1.NewTime(metav1.Now().Add(-time.Hour))
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{
+					NodeName:     "n1",
+					Phase:        mxlv1alpha1.MxlFlowLocationOrigin,
+					LastObserved: &originalObserved,
+					AppearedAt:   &originalObserved,
+				},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+
+	// The fake client's object tracker round-trips seeded objects
+	// through its codec, which truncates metav1.Time to second
+	// precision -- read the seeded value back instead of comparing
+	// against originalObserved directly, or a same-second reopen
+	// (impossible below in the second-truncated stored value, but
+	// generally the discipline to follow for metav1.Time) would look
+	// identical to a no-op regardless of whether the code under test
+	// actually left it alone.
+	var before mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &before))
+	beforeAppeared := before.Status.Locations[0].AppearedAt
+
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1"}
+	require.NoError(t, p.promoteStaleLocalOrigins(context.Background(),
+		map[string]struct{}{validFlowID: {}}))
+
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+	require.Len(t, got.Status.Locations, 1)
+	assert.True(t, got.Status.Locations[0].AppearedAt.Equal(beforeAppeared),
+		"promoteStaleLocalOrigins must not touch an already-healthy "+
+			"location: RunLocalRescan calls it on every tick, and "+
+			"restamping AppearedAt on a steady-state flow reads to the "+
+			"source gateway as a genuine rotation, forcing a spurious "+
+			"reader reopen once per rescan interval")
+}
+
+// fakeLease records Renew/Release calls and lets a test return a
+// canned error from either method. Used to assert the Publisher's
+// Lease wiring without exercising the real coordination.k8s.io API.
+type fakeLease struct {
+	renewed    []string
+	released   []string
+	renewErr   error
+	releaseErr error
+}
+
+func (f *fakeLease) Renew(_ context.Context, flowID string) error {
+	f.renewed = append(f.renewed, flowID)
+	return f.renewErr
+}
+
+func (f *fakeLease) Release(_ context.Context, flowID string) error {
+	f.released = append(f.released, flowID)
+	return f.releaseErr
+}
+
+func TestPublisher_RenewsLeaseOnAppeared(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		Build()
+
+	lease := &fakeLease{}
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1", Lease: lease}
+
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+	assert.Equal(t, []string{validFlowID}, lease.renewed,
+		"the publisher must renew the Origin Lease right after the location "+
+			"flips to Origin; otherwise the operator would treat the brand-new "+
+			"Origin as stale on first read")
+	assert.Empty(t, lease.released)
+}
+
+func TestPublisher_AppearedAsMirrorTargetDoesNotRenewLease(t *testing.T) {
+	scheme := newScheme(t)
+	domain := t.TempDir()
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(flowDir, FlowDefName),
+		[]byte(`{"id":"`+validFlowID+`"}`), 0o644))
+
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "mxl-system"},
+		Spec: mxlv1alpha1.MxlFlowMirrorSpec{
+			FlowID:     validFlowID,
+			SourceNode: "n0",
+			TargetNode: "n1",
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(mirror).
+		Build()
+
+	lease := &fakeLease{}
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1", Lease: lease}
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+	assert.Empty(t, lease.renewed,
+		"a mirror target's local copy is not the authoritative flow; "+
+			"renewing a Lease for it would let the receiver pick the "+
+			"mirror as Origin and direct further lookups at a copy")
+}
+
+func TestPublisher_ReleasesLeaseOnVanished(t *testing.T) {
+	scheme := newScheme(t)
+	existing := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(existing).
+		Build()
+
+	lease := &fakeLease{}
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: "/tmp", NodeName: "n1", Lease: lease}
+
+	require.NoError(t, p.PublishVanished(context.Background(), validFlowID+".mxl-flow"))
+	assert.Equal(t, []string{validFlowID}, lease.released,
+		"the publisher must release the Origin Lease when the on-disk "+
+			"flow vanishes so consumers stop treating the departed Origin "+
+			"as a fresh source")
+}
+
+// chanLease reports each Renew on a channel, so a test can wait for the
+// renew loop's goroutine without sharing memory with it.
+type chanLease struct{ renewed chan string }
+
+func (l chanLease) Renew(_ context.Context, flowID string) error {
+	select {
+	case l.renewed <- flowID:
+	default:
+	}
+	return nil
+}
+
+func (chanLease) Release(context.Context, string) error { return nil }
+
+// A producer of a redundancy set's output id that never stopped keeps its
+// Lease renewed whatever IsOutput says. The set stays refused for as long
+// as the Lease is fresh, which is what protects the live producer: skipping
+// the output here would hand its id to the set within one Lease duration.
+func TestRunRenewLoop_RenewsAnOriginWhoseIdASetNamesAsOutput(t *testing.T) {
+	domain := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(domain, validFlowID+".mxl-flow"), 0o755))
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: ObjectMeta(validFlowID),
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: validFlowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationOrigin}},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(flow).
+		Build()
+	lease := chanLease{renewed: make(chan string, 1)}
+	p := &Publisher{Client: c, WriterAttached: writerAttached, DomainPath: domain, NodeName: "n1", Lease: lease,
+		IsOutput: func(context.Context, string, string) (bool, error) { return true, nil }}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); p.RunRenewLoop(ctx, 5*time.Millisecond) }()
+	defer func() { cancel(); <-done }()
+
+	select {
+	case id := <-lease.renewed:
+		assert.Equal(t, validFlowID, id)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the Lease of a held Origin whose id a set names as output was not renewed")
+	}
+}
+
+// On mxlfs a lookup by name of a flow directory that is gone waits for
+// it to come back. A placeholder's marker goes once its flow has been
+// deleted, and the publish that follows ran inside the serial marker
+// loop, which then stalled for the whole wait on every such flow. A flow
+// the domain no longer lists is published as nothing, without a lookup.
+func TestPublishAppeared_LooksUpOnlyListedFlows(t *testing.T) {
+	domain := t.TempDir()
+	var looked []string
+	read := readFlowDef
+	readFlowDef = func(name string) ([]byte, error) {
+		looked = append(looked, name)
+		return read(name)
+	}
+	t.Cleanup(func() { readFlowDef = read })
+	probed := 0
+	p := &Publisher{
+		Client:     fake.NewClientBuilder().WithScheme(newScheme(t)).WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).Build(),
+		DomainPath: domain,
+		NodeName:   "n1",
+		WriterAttached: func(string) (bool, error) {
+			probed++
+			return true, nil
+		},
+	}
+
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+	assert.Empty(t, looked, "a flow the listing did not return was looked up by name")
+	assert.Zero(t, probed, "a flow the listing did not return was probed for a writer")
+
+	flowDir := filepath.Join(domain, validFlowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(flowDir, FlowDefName), []byte(`{"id":"`+validFlowID+`"}`), 0o644))
+	require.NoError(t, p.PublishAppeared(context.Background(), validFlowID+".mxl-flow"))
+	assert.Equal(t, []string{filepath.Join(flowDir, FlowDefName)}, looked)
+	assert.Equal(t, 1, probed)
+	var got mxlv1alpha1.MxlFlow
+	require.NoError(t, p.Client.Get(context.Background(), types.NamespacedName{Name: validFlowID}, &got))
+}

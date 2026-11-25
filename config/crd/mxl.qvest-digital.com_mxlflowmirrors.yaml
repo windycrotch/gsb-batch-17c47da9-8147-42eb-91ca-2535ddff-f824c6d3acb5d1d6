@@ -1,0 +1,355 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: mxlflowmirrors.mxl.qvest-digital.com
+spec:
+  group: mxl.qvest-digital.com
+  names:
+    kind: MxlFlowMirror
+    listKind: MxlFlowMirrorList
+    plural: mxlflowmirrors
+    shortNames:
+    - mxlfm
+    singular: mxlflowmirror
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.flowID
+      name: Flow
+      type: string
+    - jsonPath: .spec.sourceNode
+      name: Source
+      type: string
+    - jsonPath: .spec.targetNode
+      name: Target
+      type: string
+    - jsonPath: .spec.provider
+      name: Provider
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.placement.sourceInterface
+      name: Source-If
+      type: string
+    - jsonPath: .spec.placement.targetInterface
+      name: Target-If
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Placed")].reason
+      name: Placement
+      type: string
+    - jsonPath: .status.sourceInterface
+      name: Bound-Source
+      priority: 1
+      type: string
+    - jsonPath: .status.targetInterface
+      name: Bound-Target
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          MxlFlowMirror represents the desired and observed state of one
+          (flow, target node) mirror.
+
+          A mirror exists to carry one flow from the node that holds it to a
+          node that wants it, so two things justify it and both are required:
+          something still asks for it, and the flow still has a live origin to
+          pull from. status.conditions carries both answers as Claimed and
+          Sourceable, and the operator deletes the mirror once either has read
+          False for longer than the grace period.
+
+          A claim is expressed in one of two ways, and never as a label.
+          metadata.ownerReferences names each MxlReceiver that wants this flow
+          on this target node, as a non-controller, non-blocking owner --
+          consumers must not set controller=true, because multiple owners
+          cannot all be controllers. spec.requestor names the single pod
+          behind an on-demand materialization, and is what a cross-namespace
+          mirror carries, since the apiserver rejects an owner reference that
+          crosses namespaces. The current set of consumers is visible via
+          kubectl describe.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              MxlFlowMirrorSpec defines a desired mirror of a flow onto a
+              specific node.
+            properties:
+              domain:
+                description: |-
+                  Domain is the MxlDomain the flow belongs to, one without a
+                  spec.directory, whose flows live at domains/<id>. Empty is the
+                  primary domain, the one the agent's --domain-path names, and the
+                  only spelling of it; every object written before domains existed
+                  carries none. Immutable: the same id in another domain is another
+                  flow.
+                maxLength: 63
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: domain is immutable
+                  rule: self == oldSelf
+              flowID:
+                description: FlowID is the MXL flow being mirrored.
+                pattern: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
+                type: string
+              placement:
+                description: |-
+                  Placement names the fabric interfaces the mirror is carried on.
+                  The operator writes it once both nodes report their interfaces;
+                  a placement written by hand is kept while both addresses stay
+                  advertised. See MxlFlowMirrorPlacement.
+                properties:
+                  sourceInterface:
+                    description: |-
+                      SourceInterface is the address on spec.sourceNode the source
+                      gateway's initiator binds.
+                    minLength: 1
+                    type: string
+                  targetInterface:
+                    description: |-
+                      TargetInterface is the address on spec.targetNode the target
+                      gateway's endpoint binds.
+                    minLength: 1
+                    type: string
+                required:
+                - sourceInterface
+                - targetInterface
+                type: object
+              provider:
+                default: auto
+                description: |-
+                  Provider selects the libmxl-fabrics provider used to move
+                  grains. Defaults to auto.
+                enum:
+                - auto
+                - tcp
+                - verbs
+                - efa
+                - shm
+                type: string
+              requestor:
+                description: |-
+                  Requestor identifies the Pod whose intent triggered this
+                  mirror. Set by the agent for fanotify-driven mirrors; unset for
+                  MxlReceiver-driven ones.
+                properties:
+                  name:
+                    description: Name is the Pod name.
+                    type: string
+                  namespace:
+                    description: Namespace is the Pod namespace.
+                    type: string
+                  uid:
+                    description: |-
+                      UID is the Pod's UID, captured at the time the reference was
+                      recorded. Empty when the producer cannot determine it.
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+              sourceNode:
+                description: SourceNode is the Kubernetes node hosting the origin
+                  flow.
+                type: string
+              targetNode:
+                description: |-
+                  TargetNode is the Kubernetes node where the flow should be
+                  materialized.
+                type: string
+            required:
+            - flowID
+            - sourceNode
+            - targetNode
+            type: object
+          status:
+            description: MxlFlowMirrorStatus reports the runtime state of a mirror.
+            properties:
+              attemptCount:
+                description: |-
+                  AttemptCount is the number of consecutive failed AddTarget
+                  attempts since the last successful reconcile. Reset to zero
+                  when the source gateway succeeds. Source-side only; the target
+                  side counts its own open failures in TargetAttemptCount.
+                format: int32
+                type: integer
+              conditions:
+                description: Conditions describes the current state of the mirror.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              demandBitsPerSecond:
+                description: |-
+                  DemandBitsPerSecond is the rate the operator charged against
+                  both interfaces of spec.placement when it placed the mirror.
+                  Written by the operator.
+                format: int64
+                minimum: 0
+                type: integer
+              lastError:
+                description: |-
+                  LastError is the most recent reconcile error message recorded
+                  by the source gateway when bounded backoff is engaged. Empty
+                  after a successful reconcile.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation last reconciled.
+                format: int64
+                type: integer
+              phase:
+                description: Phase tracks the mirror lifecycle.
+                enum:
+                - Pending
+                - Materializing
+                - Ready
+                - Degraded
+                - Failed
+                type: string
+              previousSourceNode:
+                description: |-
+                  PreviousSourceNode is the node spec.sourceNode pointed at
+                  before the most recent retarget. Empty until the mirror has
+                  been repointed at least once.
+                type: string
+              sourceInterface:
+                description: |-
+                  SourceInterface is the address the source gateway's initiator
+                  is bound to. Written by the source gateway.
+                type: string
+              sourceRetargetedAt:
+                description: |-
+                  SourceRetargetedAt is when spec.sourceNode was last repointed
+                  because the flow's origin moved, and PreviousSourceNode is
+                  where it pointed before.
+
+                  A mirror briefly Degraded after its producer moves is
+                  converging; one Degraded with no recent retarget is not.
+                  Telling those apart previously meant correlating agent logs
+                  against a rescan interval, and reading the mirror alone gave no
+                  hint a move had happened at all.
+                format: date-time
+                nullable: true
+                type: string
+              targetAttemptCount:
+                description: |-
+                  TargetAttemptCount is the number of consecutive failed attempts
+                  the target gateway has made to open the local writer and the
+                  libmxl-fabrics target endpoint. Reset to zero when the target
+                  side opens.
+
+                  Kept separate from AttemptCount because the two gateways apply
+                  status under different field managers: a single counter would
+                  have each side's server-side apply reset the other's value.
+                format: int32
+                type: integer
+              targetInfoHash:
+                description: |-
+                  TargetInfoHash identifies the current target descriptor: the
+                  TargetInfoHash of the MxlFlowMirrorTarget of the same name that
+                  the source gateway dials. Written after that object, so a
+                  matching object is the descriptor this hash names. A change of
+                  hash is a rotation of the target's fabric side.
+                type: string
+              targetInterface:
+                description: |-
+                  TargetInterface is the address the target gateway's endpoint is
+                  bound to. Written by the target gateway.
+                type: string
+              targetMaxSyncBatchSizeHint:
+                description: |-
+                  TargetMaxSyncBatchSizeHint is the maxSyncBatchSizeHint of the
+                  flow the target gateway writes, published with TargetInfoHash. For a
+                  continuous flow libmxl-fabrics sizes the target's bounce-buffer
+                  entries from it and rejects a larger sample batch, so the source
+                  gateway sends none. A target gateway that does not publish it
+                  leaves it unset, and the source then assumes libmxl's default of
+                  10 ms of samples.
+                format: int64
+                maximum: 4294967295
+                minimum: 1
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

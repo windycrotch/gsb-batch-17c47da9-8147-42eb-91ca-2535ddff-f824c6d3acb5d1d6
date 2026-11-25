@@ -1,0 +1,490 @@
+suite: daemonset-gateway
+templates:
+  - templates/daemonset-gateway.yaml
+tests:
+  - it: hostNetwork is true and dnsPolicy is ClusterFirstWithHostNet
+    asserts:
+      - equal:
+          path: spec.template.spec.hostNetwork
+          value: true
+      - equal:
+          path: spec.template.spec.dnsPolicy
+          value: ClusterFirstWithHostNet
+
+
+  - it: mounts the primary domain and domains/, not the rest of the runtime root
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content: {name: mxl-domain, mountPath: /run/mxl/domain}
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content: {name: mxl-domains, mountPath: /run/mxl/domains}
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content: {name: mxl-run, mountPath: /run/mxl}
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: mxl-domains
+            hostPath: {path: /run/mxl/domains, type: DirectoryOrCreate}
+
+  - it: pod template name label matches the selector
+    asserts:
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: mxl-k8s-gateway
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: mxl-k8s-gateway
+
+  - it: providers list joins on commas in the rendered arg
+    set:
+      gateway.flags.providers: [tcp, verbs, shm]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --providers=tcp,verbs,shm
+
+  - it: explicit empty string flag renders a bare --key= arg
+    set:
+      gateway.flags.bindAddress: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --bind-address=
+
+  - it: default pprofBindAddress renders no --pprof-bind-address arg
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --pprof-bind-address=
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --pprof-bind-address=127.0.0.1:6060
+
+  - it: explicit pprofBindAddress renders the loopback bind
+    set:
+      gateway.flags.pprofBindAddress: 127.0.0.1:6060
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --pprof-bind-address=127.0.0.1:6060
+
+  - it: rdma.enabled adds IPC_LOCK and the /dev/infiniband mount
+    set:
+      gateway.rdma.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          content: IPC_LOCK
+      - notContains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          content: SYS_RESOURCE
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: infiniband
+            mountPath: /dev/infiniband
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: infiniband
+            hostPath:
+              path: /dev/infiniband
+              type: Directory
+
+  - it: rdma.enabled=false leaves the cap list and volumes alone
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          content: IPC_LOCK
+      - lengthEqual:
+          path: spec.template.spec.volumes
+          count: 2
+
+  - it: POD_IP env wiring
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+
+  - it: rdma.extraEnv is appended only when rdma.enabled
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.extraEnv:
+        - name: FI_VERBS_IFACE
+          value: net1
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_IFACE
+            value: net1
+
+  - it: rdma.extraEnv has no effect when rdma is disabled
+    set:
+      gateway.rdma.enabled: false
+      gateway.rdma.extraEnv:
+        - name: FI_VERBS_IFACE
+          value: net1
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_IFACE
+            value: net1
+
+  - it: a verbs gateway gets FI_VERBS_ACK_TIMEOUT 14 by default
+    set:
+      gateway.rdma.enabled: true
+      gateway.flags.providers: [tcp, verbs]
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_ACK_TIMEOUT
+            value: "14"
+
+  - it: rdma.verbsAckTimeout -1 leaves FI_VERBS_ACK_TIMEOUT unset
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.verbsAckTimeout: -1
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_ACK_TIMEOUT
+          any: true
+
+  # The libfabric patch accepts 1 to 31 and treats anything else as
+  # unset, so 0 would read as a timeout the queue pairs never get.
+  - it: rejects rdma.verbsAckTimeout 0
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.verbsAckTimeout: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/gateway/rdma/verbsAckTimeout'"
+
+  - it: a gateway without verbs gets no FI_VERBS_ACK_TIMEOUT
+    set:
+      gateway.rdma.enabled: true
+      gateway.flags.providers: [tcp, efa]
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_ACK_TIMEOUT
+          any: true
+
+  - it: a gateway without rdma gets no FI_VERBS_ACK_TIMEOUT
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_ACK_TIMEOUT
+          any: true
+
+  - it: default rdma.resourceName emits no extended resource
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].resources.requests["rdma/hca_shared_devices"]
+      - isNull:
+          path: spec.template.spec.containers[0].resources.limits["rdma/hca_shared_devices"]
+
+  - it: rdma.resourceName injects the extended resource on requests and limits
+    set:
+      gateway.rdma.resourceName: rdma/hca_shared_devices
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests["rdma/hca_shared_devices"]
+          value: 1
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits["rdma/hca_shared_devices"]
+          value: 1
+
+  - it: rdma.resourceName coexists with user-supplied resource entries
+    set:
+      gateway.rdma.resourceName: rdma/hca_shared_devices
+      gateway.resources.requests.cpu: 250m
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: 250m
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests["rdma/hca_shared_devices"]
+          value: 1
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits["rdma/hca_shared_devices"]
+          value: 1
+
+  - it: full-rdma-nad fixture renders the NAD-attached pattern
+    values:
+      - ../values/full-rdma-nad.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --bind-address=
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests["rdma/hca_shared_devices"]
+          value: 1
+      - equal:
+          path: spec.template.spec.containers[0].resources.limits["rdma/hca_shared_devices"]
+          value: 1
+      - equal:
+          path: spec.template.metadata.annotations["k8s.v1.cni.cncf.io/networks"]
+          value: network/rdma-roce
+      - equal:
+          path: spec.template.spec.hostNetwork
+          value: false
+
+
+  # The template renders updateStrategy whole; a scalar would reach the
+  # API server as an invalid DaemonSet rather than fail the render.
+  - it: rejects an updateStrategy that is no object
+    set:
+      gateway.updateStrategy: foo
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/gateway/updateStrategy': got string, want object"
+
+  - it: rejects a values file that drops updateStrategy
+    set:
+      gateway.updateStrategy: null
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/gateway': missing property 'updateStrategy'"
+
+  - it: a site-defined verbs variant inherits rdma.verbsAckTimeout
+    set:
+      gateway.extraEnv:
+        - name: FI_VERBS_TX_IOV_LIMIT
+          value: "32"
+      gateway.variants.irdma:
+        enabled: true
+        nodeSelector:
+          fabric: irdma
+        flags:
+          providers: [tcp, verbs]
+        rdma:
+          enabled: true
+          resourceName: rdma/irdma_shared_devices
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_ACK_TIMEOUT
+            value: "14"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: FI_VERBS_TX_IOV_LIMIT
+            value: "32"
+
+  - it: renders the placement wait by default
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --placement-wait=10s
+
+  - it: placement settings render as comma-joined flags
+    set:
+      gateway.flags.fabricPortCapacity: [192.0.2.0/25=25G, 192.0.2.128/25=25G]
+      gateway.flags.fabricSharedBudget: [nic=40G, host=60G:combined]
+      gateway.flags.fabricMaxUtilization: 70
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --fabric-port-capacity=192.0.2.0/25=25G,192.0.2.128/25=25G
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --fabric-shared-budget=nic=40G,host=60G:combined
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --fabric-max-utilization=70
+
+  # libfabric fixes a provider's device list at the gateway's first
+  # enumeration, so a gateway that starts before a driver loaded after
+  # it, as by the Kernel Module Management operator, advertises no RDMA
+  # for its whole life unless it waits for the device.
+  - it: holds an RDMA gateway until a device has an active port
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.wait.seconds: 60
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: wait-for-rdma
+      - equal:
+          path: spec.template.spec.initContainers[0].image
+          value: busybox:1.38
+      - equal:
+          path: spec.template.spec.initContainers[0].command[3]
+          value: "60"
+      - equal:
+          path: spec.template.spec.initContainers[0].command[4]
+          value: /sys/class/infiniband
+      # No driver argument: any device counts.
+      - lengthEqual:
+          path: spec.template.spec.initContainers[0].command
+          count: 5
+      - matchRegex:
+          path: spec.template.spec.initContainers[0].command[2]
+          pattern: active
+      - equal:
+          path: spec.template.spec.initContainers[0].resources.requests
+          value:
+            cpu: 1m
+            memory: 4Mi
+      - equal:
+          path: spec.template.spec.initContainers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      # It reads the sysfs the runtime mounts, as the gateway does.
+      - notExists:
+          path: spec.template.spec.initContainers[0].volumeMounts
+
+  - it: waits only for a device of rdma.wait.driver when it is set
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.wait.seconds: 60
+      gateway.rdma.wait.driver: efa
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.initContainers[0].command
+          count: 6
+      - equal:
+          path: spec.template.spec.initContainers[0].command[5]
+          value: efa
+
+  - it: starts an RDMA gateway at once when rdma.wait.seconds is 0
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.wait.driver: efa
+    asserts:
+      - notExists:
+          path: spec.template.spec.initContainers
+
+  - it: does not wait for an RDMA device when rdma is disabled
+    set:
+      gateway.rdma.wait.seconds: 60
+    asserts:
+      - notExists:
+          path: spec.template.spec.initContainers
+
+  - it: waits for the device after mxlfs.ready and before site init containers
+    set:
+      mxlfs.enabled: true
+      gateway.rdma.enabled: true
+      gateway.rdma.wait.seconds: 60
+      gateway.initContainers:
+        - name: site-setup
+          image: busybox:1.38
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.initContainers
+          count: 3
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: wait-for-mxlfs
+      - equal:
+          path: spec.template.spec.initContainers[1].name
+          value: wait-for-rdma
+      - equal:
+          path: spec.template.spec.initContainers[2].name
+          value: site-setup
+
+  - it: refuses a negative rdma.wait.seconds
+    set:
+      gateway.rdma.enabled: true
+      gateway.rdma.wait.seconds: -1
+    asserts:
+      - failedTemplate: {}
+
+  # Set once at the base, the wait reaches every RDMA variant, the efa
+  # variant names its driver, and the tcp variant does not wait at all.
+  - it: applies rdma.wait per variant
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.rdma.wait.seconds: 120
+    documentSelector:
+      path: metadata.name
+      value: mxl-k8s-gateway-efa
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].command[3]
+          value: "120"
+      - equal:
+          path: spec.template.spec.initContainers[0].command[5]
+          value: efa
+  - it: waits for any device on the verbs variant
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.rdma.wait.seconds: 120
+    documentSelector:
+      path: metadata.name
+      value: mxl-k8s-gateway-verbs
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.initContainers[0].command
+          count: 5
+  - it: does not wait for an RDMA device on the tcp variant
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.rdma.wait.seconds: 120
+    documentSelector:
+      path: metadata.name
+      value: mxl-k8s-gateway-tcp
+    asserts:
+      - notExists:
+          path: spec.template.spec.initContainers
+
+  # The schema checks rdma.wait.seconds at the base only; in a variant,
+  # a value int reads as 0 would turn the wait off without a word.
+  - it: refuses a variant rdma.wait.seconds that is not an integer
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.variants.efa.rdma.wait.seconds: thirty
+    asserts:
+      - failedTemplate:
+          errorMessage: "gateway.variants.efa.rdma.wait.seconds must be a non-negative integer, not thirty"
+  - it: refuses a fractional variant rdma.wait.seconds
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.variants.efa.rdma.wait.seconds: 1.5
+    asserts:
+      - failedTemplate:
+          errorMessage: "gateway.variants.efa.rdma.wait.seconds must be a non-negative integer, not 1.5"
+  - it: refuses a negative variant rdma.wait.seconds
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.variants.verbs.rdma.wait.seconds: -5
+    asserts:
+      - failedTemplate:
+          errorMessage: "gateway.variants.verbs.rdma.wait.seconds must be a non-negative integer, not -5"
+  - it: takes a variant's own rdma.wait.seconds
+    values:
+      - ../values/mixed-fabric.yaml
+    set:
+      gateway.variants.efa.rdma.wait.seconds: 45
+    documentSelector:
+      path: metadata.name
+      value: mxl-k8s-gateway-efa
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].command[3]
+          value: "45"

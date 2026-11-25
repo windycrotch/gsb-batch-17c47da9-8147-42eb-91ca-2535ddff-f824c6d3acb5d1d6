@@ -1,0 +1,988 @@
+name: images
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Invoked from release-please.yml once the repository release tag
+  # has just been cut. One tag covers every component outside
+  # dev_only: they are one release-please package and therefore
+  # always carry the same version.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Repository release tag (e.g. v1.0.0-rc.14)"
+        type: string
+        required: true
+  # Manual recovery: re-run an image publish without waiting for a
+  # new tag. Leave release_tag empty to build the :dev / :sha-X
+  # tags for the current main, or pass v<X> to republish that exact
+  # tag.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Repository release tag (e.g. v1.0.0-rc.14). Leave empty for a dev build of HEAD."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+  # dorny/paths-filter calls the PR Files API for pull_request
+  # events; without pull-requests:read GITHUB_TOKEN can't list the
+  # changed files and the action fails with
+  # "Resource not accessible by integration".
+  pull-requests: read
+
+concurrency:
+  # Include release_tag so distinct workflow_call / workflow_dispatch
+  # backfills (one per component tag) get their own queue slot and
+  # don't cancel each other. PR / push invocations key on the ref
+  # as before.
+  group: images-${{ github.workflow }}-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Per-image filter for PR / push-to-main events. Each filter lists
+  # every input that the image's docker build context actually
+  # depends on. See CLAUDE.md for the contract: when a Dockerfile
+  # starts COPYing a new sibling module, that module must be added
+  # here so the image rebuilds on the dependency's changes.
+  changes:
+    # Diff-based filtering only makes sense for PR / push events.
+    # workflow_call and workflow_dispatch carry an explicit
+    # release_tag (or the dev-build sentinel) and bypass the per-
+    # image filter in meta.
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      operator:    ${{ steps.f.outputs.operator }}
+      agent:       ${{ steps.f.outputs.agent }}
+      gateway:     ${{ steps.f.outputs.gateway }}
+      exporter:    ${{ steps.f.outputs.exporter }}
+      shim:        ${{ steps.f.outputs.shim }}
+      demo_tools:  ${{ steps.f.outputs.demo_tools }}
+      workflow:    ${{ steps.f.outputs.workflow }}
+      kind:        ${{ steps.f.outputs.kind }}
+      code:        ${{ steps.f.outputs.code }}
+      deps_only:   ${{ steps.n.outputs.non_deps == 'false' }}
+      tree_tested: ${{ steps.tree.outputs.tested }}
+      dev_stale:   ${{ steps.dev.outputs.stale }}
+    env:
+      # The per-image filters. The dev step below reads the image
+      # entries too, so they live in one place.
+      FILTERS: |
+        operator:   ['docker/operator.Dockerfile', 'operator/**', 'api/**', 'go.work*']
+        agent:      ['docker/agent.Dockerfile', 'agent/**', 'api/**', 'shim/**', 'go.work*']
+        gateway:    ['docker/gateway.Dockerfile', 'gateway/**', 'api/**', 'go.work*', 'hack/build-libmxl-monitoring.sh']
+        exporter:   ['docker/exporter.Dockerfile', 'exporter/**', 'api/**', 'go.work*']
+        shim:       ['docker/shim.Dockerfile', 'shim/**']
+        demo_tools: ['docker/demo-tools.Dockerfile']
+        workflow:   ['.github/workflows/images.yml']
+        # True when the diff touches anything that is not
+        # markdown. The negation cannot be folded into the
+        # per-image filters above: dorny/paths-filter honours
+        # '!' only under predicate-quantifier 'every', and those
+        # filters are unions that 'every' could never satisfy.
+        # Standing alone it works under the default quantifier:
+        # true iff some changed file is not a .md.
+        code:       ['!**/*.md']
+        kind:
+          - 'hack/kind-*'
+          - 'docker/**'
+          - 'shim/**'
+          - 'examples/tcp-demo/**'
+          - 'config/crd/**'
+          - 'config/rbac/**'
+          - 'charts/mxl-k8s/**'
+          - 'Makefile'
+          - 'test/integration/kind/**'
+          - '.github/workflows/images.yml'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The tree comparison below needs the pushed commit and the
+          # pull request head it fetches to be readable in the same
+          # repository. Full history rather than a shallow clone plus
+          # a shallow fetch of an unrelated ref; the history is small
+          # enough that the difference does not show.
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v4
+        id: f
+        with:
+          filters: ${{ env.FILTERS }}
+
+      # Push to main only: the images whose :dev was built from an
+      # older revision than their inputs. The filters above compare
+      # the push with the commit before it, so a merge whose own run
+      # never built -- one cancelled while it waited in the
+      # concurrency group behind a newer push -- leaves its images
+      # unbuilt for good, and every later run that skips them retags
+      # the old :dev. Each image's OCI revision label names the
+      # commit it was built from; an image whose inputs changed since
+      # then is stale. One whose label cannot be read, or names a
+      # commit outside main's history, is stale too: nothing says
+      # otherwise.
+      - id: dev
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -uo pipefail
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          stale=()
+          for key in operator agent gateway exporter shim demo_tools; do
+            name="${key//_/-}"
+            if ! image=$(docker buildx imagetools inspect "ghcr.io/${owner}/mxl-k8s/${name}:dev" \
+                           --format '{{json .Image}}' 2>&1); then
+              echo "::warning::${name}: cannot inspect :dev, rebuilding it: ${image}"
+              stale+=("$name")
+              continue
+            fi
+            rev=$(jq -r '(."linux/amd64" // .).config.Labels["org.opencontainers.image.revision"] // empty' \
+                    <<<"$image" 2>/dev/null || true)
+            if [ -z "$rev" ]; then
+              echo "::warning::${name}: :dev has no revision label, rebuilding it"
+              stale+=("$name")
+              continue
+            fi
+            if ! git merge-base --is-ancestor "$rev" HEAD 2>/dev/null; then
+              echo "${name}: :dev revision ${rev} is not in main's history"
+              stale+=("$name")
+              continue
+            fi
+            spec=()
+            while IFS= read -r glob; do
+              spec+=(":(glob)${glob}")
+            done < <(yq -r ".${key}[]" <<<"$FILTERS")
+            if ! git diff --quiet "$rev" HEAD -- "${spec[@]}"; then
+              echo "${name}: inputs changed since :dev was built from ${rev}"
+              stale+=("$name")
+            fi
+          done
+          echo "stale=${stale[*]}" >> "$GITHUB_OUTPUT"
+
+      # Cheap pre-gate for the deps-impact job: true when the diff
+      # touches nothing but module requirement files. Needs its own
+      # step because 'every' is the only quantifier that reads a list
+      # of '!' patterns as "none of these" -- under the default 'some'
+      # each negation is satisfied by any file the others exclude, and
+      # under 'some-with-excludes' a negation-only filter matches
+      # nothing at all. The filters above are unions that 'every'
+      # could never satisfy, hence two steps rather than one.
+      #
+      # Only a hint either way: deps-impact re-derives the answer from
+      # the diff, and a run that never gets there builds as before.
+      - uses: dorny/paths-filter@v4
+        id: n
+        with:
+          predicate-quantifier: every
+          filters: |
+            non_deps:
+              - '!**/go.mod'
+              - '!**/go.sum'
+              - '!go.work'
+              - '!go.work.sum'
+
+      # Push to main only: whether this exact tree already went
+      # through the suite on the pull request it came from.
+      #
+      # The repository ruleset allows squash merges only, but leaves
+      # strict_required_status_checks_policy off, so a branch may be
+      # merged while main has moved on. The squash then lands a tree
+      # nobody ran anything against, and "it passed on the PR" stops
+      # being an answer. Comparing trees is what separates the two
+      # cases: they are equal only when main did not move between the
+      # PR's last run and the merge, and in that case the push-side
+      # diff is the PR's diff, so every filter above lands where it
+      # landed there. images-summary is a required check, so a merge
+      # also implies that run was green for this tree.
+      #
+      # Nothing else establishes that: no marker survives the squash,
+      # and the commit subject is the only handle on the pull request
+      # (GitHub appends "(#N)" to the squashed subject). Unresolvable
+      # for a direct push or a stripped subject, which reports false
+      # and runs the suite.
+      - id: tree
+        if: github.event_name == 'push'
+        env:
+          SUBJECT: ${{ github.event.head_commit.message }}
+        run: |
+          set -uo pipefail
+          tested=false
+          subject="${SUBJECT%%$'\n'*}"
+          pr=""
+          case "$subject" in
+            *"(#"*")")
+              pr="${subject##*(#}"
+              pr="${pr%)}"
+              ;;
+          esac
+          case "$pr" in
+            ''|*[!0-9]*) pr="" ;;
+          esac
+          if [ -n "$pr" ] \
+              && git fetch --no-tags --depth=1 origin "refs/pull/${pr}/head" 2>/dev/null; then
+            head_tree=$(git rev-parse 'FETCH_HEAD^{tree}')
+            main_tree=$(git rev-parse 'HEAD^{tree}')
+            echo "pr #${pr} tree ${head_tree}; pushed tree ${main_tree}"
+            if [ "$head_tree" = "$main_tree" ]; then
+              tested=true
+            fi
+          else
+            echo "no pull request resolvable from subject: ${subject}"
+          fi
+          echo "tested=${tested}" >> "$GITHUB_OUTPUT"
+
+  # Whether a requirement-file-only diff can reach a binary.
+  #
+  # Every module requires test-only dependencies -- testify, and
+  # whatever the test lane pulls in -- that no cmd/ package imports.
+  # The Dockerfiles build with GOWORK=off against ./cmd/<binary>, so
+  # bumping one of those produces a byte-identical binary while still
+  # matching the module's path filter above. Left alone, a renovate
+  # testify bump rebuilds every image and runs the kind suite over
+  # them.
+  #
+  # The linked set comes from `go list -deps` rather than a list of
+  # test-only module paths kept here by hand: the paths change as
+  # dependencies come and go, and a stale list would answer "not
+  # linked" for something that is.
+  deps-impact:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.deps_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      binary_affected: ${{ steps.d.outputs.binary_affected }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27'
+          check-latest: true
+
+      - id: d
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # No usable base to diff against; a branch's first push
+          # reports the null sha. Nothing can be ruled out from there,
+          # so build.
+          if [ -z "$BASE_SHA" ] || [ -z "$(printf '%s' "$BASE_SHA" | tr -d 0)" ]; then
+            echo "no base commit to compare against"
+            echo "binary_affected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The paths-filter gate that selected this job is a
+          # convenience, not the authority: a wrong 'true' from it
+          # would otherwise skip a build that a source change needs.
+          # Anything outside the requirement files answers "affected"
+          # regardless of what the module comparison finds.
+          outside=$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA" \
+            | grep -vE '(^|/)go\.(mod|sum)$|^go\.work(\.sum)?$' || true)
+          if [ -n "$outside" ]; then
+            echo "diff reaches outside the requirement files:"
+            echo "$outside" | awk '{ print "  " $0 }'
+            echo "binary_affected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Module paths whose version moved. A require line is the
+          # module path followed by a v-prefixed version, indented
+          # inside a require block or on a single `require` line;
+          # `go` and `toolchain` directives carry no second field
+          # that looks like a version and drop out here.
+          changed=$(git diff --unified=0 "$BASE_SHA" "$GITHUB_SHA" -- '*/go.mod' 'go.mod' \
+            | awk '/^[+-]/ {
+                     line = substr($0, 2)
+                     sub(/^[[:space:]]+/, "", line)
+                     sub(/^require[[:space:]]+/, "", line)
+                     n = split(line, f, " ")
+                     if (n >= 2 && f[1] ~ /\./ && f[2] ~ /^v[0-9]/) print f[1]
+                   }' \
+            | sort -u)
+
+          if [ -z "$changed" ]; then
+            echo "no module requirement moved; only go.sum entries changed"
+            echo "binary_affected=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # One main package per module, matching the Dockerfiles.
+          # GOWORK=off for the same reason they set it: the published
+          # binary resolves the api module through the replace
+          # directive in each go.mod, not through the workspace.
+          linked=$(
+            for module in operator agent gateway exporter; do
+              ( cd "$module" \
+                && GOWORK=off go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' ./cmd/... )
+            done | sort -u
+          )
+
+          echo "requirements moved:"
+          echo "$changed" | awk '{ print "  " $0 }'
+
+          affected=false
+          for module in $changed; do
+            if printf '%s\n' "$linked" | grep -qxF "$module"; then
+              echo "  -> ${module} links into a binary"
+              affected=true
+            fi
+          done
+          if [ "$affected" = "false" ]; then
+            echo "  -> none of them link into a binary"
+          fi
+          echo "binary_affected=${affected}" >> "$GITHUB_OUTPUT"
+
+  # Compute the list of images to build and the registry references /
+  # tag lists each image should be published under. Centralised here
+  # so build and merge agree on what to publish.
+  #
+  # The images list is a JSON array consumed by the build matrix
+  # below. On a workflow_call/dispatch carrying release_tag, the
+  # released set is included. On
+  # main / PR events the list is filtered by the changes job; an
+  # unrelated diff publishes nothing.
+  meta:
+    needs: [changes, deps-impact]
+    # changes is skipped for workflow_call and workflow_dispatch
+    # (neither relies on diff-based filtering), and deps-impact is
+    # skipped for every diff that is not requirement-file-only, so
+    # meta must run even when its dependencies were skipped.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    outputs:
+      images: ${{ steps.m.outputs.images }}
+      push: ${{ steps.m.outputs.push }}
+      has_images: ${{ steps.m.outputs.has_images }}
+      kind_wanted: ${{ steps.m.outputs.kind_wanted }}
+      kind_build: ${{ steps.m.outputs.kind_build }}
+      sha_short: ${{ steps.m.outputs.sha_short }}
+      all_components: ${{ steps.m.outputs.all_components }}
+    env:
+      INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+      # kind-integration eligibility (kind_wanted below):
+      # - pull_request: an image rebuilds or changes.kind == true on a
+      #   same-repo PR, OR a `run-kind` label is attached (opt-in
+      #   escape hatch).
+      # - push to main (branch): the same, and push == true
+      #   (release-please merges already toggled push=false above),
+      #   and the tree is not one the pull request already ran.
+      # - workflow_dispatch with empty release_tag: always true.
+      # - workflow_call with release_tag: false. Release publishes
+      #   are not gated on a smoke test.
+      CHANGED_KIND:   ${{ needs.changes.outputs.kind   || 'false' }}
+      PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+      # True when the pushed tree is the one the originating pull
+      # request already took through the suite. Empty for every event
+      # that is not a push to a branch.
+      TREE_TESTED:    ${{ needs.changes.outputs.tree_tested }}
+      # release-please owns this branch and force-pushes it on every
+      # regeneration, so nothing hand-written survives on it. Its diff
+      # is changelogs, the chart version, the manifest, and the api
+      # pin in each go.mod -- and that pin is inert, because every
+      # module `replace`s the api module to ../api and the Dockerfiles
+      # build with GOWORK=off. The binaries come out identical to the
+      # main commit already published as :dev.
+      RELEASE_PR_HEAD: ${{ startsWith(github.head_ref, 'release-please--branches--') }}
+      # false when a requirement-file-only diff moved nothing that
+      # links into a binary; empty when deps-impact did not run.
+      BINARY_AFFECTED: ${{ needs.deps-impact.outputs.binary_affected }}
+      # head_commit is present on push events; empty otherwise. Used
+      # to detect release-please's own merge commits and defer their
+      # image publish to the workflow_call run that release-please.yml
+      # fires alongside, so the same content isn't built twice.
+      HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+      # When `changes` is skipped, needs.changes.outputs.<x> is the
+      # empty string. Defaulting to 'true' falls back to "build it"
+      # for the no-filter case (manual workflow_dispatch dev build);
+      # the release_tag path overwrites the wanted set outright.
+      CHANGED_OPERATOR:   ${{ needs.changes.outputs.operator   || 'true' }}
+      CHANGED_AGENT:      ${{ needs.changes.outputs.agent      || 'true' }}
+      CHANGED_GATEWAY:    ${{ needs.changes.outputs.gateway    || 'true' }}
+      CHANGED_EXPORTER:   ${{ needs.changes.outputs.exporter   || 'true' }}
+      CHANGED_SHIM:       ${{ needs.changes.outputs.shim       || 'true' }}
+      CHANGED_DEMO_TOOLS: ${{ needs.changes.outputs.demo_tools || 'true' }}
+      CHANGED_WORKFLOW:   ${{ needs.changes.outputs.workflow   || 'false' }}
+      # Deliberately undefaulted: empty when the changes job is
+      # skipped (workflow_call / workflow_dispatch). The gate below
+      # fires only on an explicit 'false', so a release publish is
+      # never held back by it.
+      CHANGED_CODE:       ${{ needs.changes.outputs.code }}
+      # Push to main: images whose :dev is older than their inputs,
+      # space-separated; see the changes job.
+      DEV_STALE:          ${{ needs.changes.outputs.dev_stale }}
+    steps:
+      - id: m
+        run: |
+          set -eu
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          prefix="ghcr.io/${owner}/mxl-k8s"
+          short_sha="${GITHUB_SHA:0:7}"
+
+          # All images this repo ships. Order matches docker/ listing.
+          declare -a all=(
+            "operator|docker/operator.Dockerfile"
+            "agent|docker/agent.Dockerfile"
+            "gateway|docker/gateway.Dockerfile"
+            "exporter|docker/exporter.Dockerfile"
+            "shim|docker/shim.Dockerfile"
+            "demo-tools|docker/demo-tools.Dockerfile"
+          )
+
+          # Images that ship on the :dev / :sha-<short> channel only.
+          # Everything else in `all` is covered by the repository
+          # version, so a component added above is released by default
+          # rather than left out of the next tag by omission.
+          declare -a dev_only=(demo-tools)
+
+          # wanted and released are derived from `all`, not restated:
+          # three hand-maintained lists that have to agree drift
+          # silently, and the failure is an incomplete publish with
+          # every job green. An entry whose CHANGED_<NAME> is not wired
+          # in is a configuration error rather than a quiet "skip".
+          declare -A wanted=()
+          declare -a released=()
+          declare -a all_names=()
+          for entry in "${all[@]}"; do
+            comp="${entry%%|*}"
+            all_names+=("$comp")
+            var="CHANGED_$(printf '%s' "$comp" | tr 'a-z-' 'A-Z_')"
+            if [ -z "${!var+set}" ]; then
+              echo "::error::image '${comp}' has no ${var}; add it to the changes job filters and outputs"
+              exit 1
+            fi
+            wanted[$comp]="${!var}"
+            case " ${dev_only[*]} " in
+              *" ${comp} "*) ;;
+              *) released+=("$comp") ;;
+            esac
+          done
+
+          # A workflow-file edit expands the set to every image so an
+          # edit cannot silently exclude one from the publish surface.
+          if [ "$CHANGED_WORKFLOW" = "true" ]; then
+            for k in "${!wanted[@]}"; do wanted[$k]=true; done
+          fi
+
+          # Diffs that cannot change what the cluster runs. The
+          # per-image filters glob whole module directories, so a diff
+          # confined to a module's changelog or its test-only
+          # requirements matches them all the same; images-summary
+          # being a required check puts every one of those builds, and
+          # the suite that follows them, on the critical path to
+          # merging. Each case is an assertion that the resulting
+          # binaries are identical to the ones main already published,
+          # so there is neither an image to build nor anything for the
+          # kind suite to find.
+          inert=false
+          # Markdown only.
+          if [ "$CHANGED_CODE" = "false" ]; then inert=true; fi
+          # release-please's own pull request.
+          if [ "$RELEASE_PR_HEAD" = "true" ]; then inert=true; fi
+          # A requirement bump that no binary links.
+          if [ "$BINARY_AFFECTED" = "false" ]; then inert=true; fi
+          if [ "$inert" = "true" ]; then
+            for k in "${!wanted[@]}"; do wanted[$k]=false; done
+          fi
+          # A stale :dev is rebuilt whatever this push changed: no
+          # assertion above holds for what an earlier merge changed.
+          # On an inert push it is published to :dev without the kind
+          # suite, which inert vetoes, as on a release-please commit.
+          for k in ${DEV_STALE:-}; do wanted[$k]=true; done
+
+          push=false
+          release_commit=false
+          declare -a extra_tags=()
+
+          if [ -n "${INPUT_RELEASE_TAG:-}" ]; then
+            push=true
+            case "$INPUT_RELEASE_TAG" in
+              v*.*.*) ;;
+              *)
+                echo "::error::release_tag '${INPUT_RELEASE_TAG}' is not a v<X.Y.Z> tag"
+                exit 1
+                ;;
+            esac
+            # One tag covers every released image: the root
+            # release-please package spans every component outside
+            # dev_only, plus the chart, so they all publish the same
+            # version. Selecting them here overrides the diff filter,
+            # which is meaningless for a workflow_call.
+            for k in "${!wanted[@]}"; do wanted[$k]=false; done
+            for k in "${released[@]}"; do wanted[$k]=true; done
+
+            version="${INPUT_RELEASE_TAG#v}"
+            extra_tags+=("v${version}")
+            case "$version" in
+              *-*) extra_tags+=("pre") ;;
+              *)   extra_tags+=("latest") ;;
+            esac
+            # This run IS the release publish. The push-to-main run
+            # that fired alongside is skipped (see the release-please
+            # commit detection below), so add :dev and :sha-<short>
+            # here too. The commit being tagged is the current main
+            # HEAD by release-please's construction, so :dev tracking
+            # HEAD stays consistent.
+            extra_tags+=("dev" "sha-${short_sha}")
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # Push to main: :dev tracks HEAD; :sha-<short> is the
+            # content-addressed handle. Defer release-please's own
+            # merge commits to the workflow_call invocation from
+            # release-please.yml so the same content isn't built
+            # twice (push-to-main run alongside workflow_call run).
+            # release-please's PR titles always start with
+            # "chore(main): release "; the squash-merge subject
+            # carries that prefix verbatim.
+            case "${HEAD_COMMIT_MSG%%$'\n'*}" in
+              "chore(main): release "*)
+                echo "Release-please merge commit; image publish deferred to workflow_call from release-please.yml."
+                push=false
+                release_commit=true
+                # Empty the wanted set so the loop below produces
+                # an empty images list and build/merge skip. The
+                # release publish covers the released images only,
+                # so a dev_only image whose :dev is stale is still
+                # built here.
+                for k in "${!wanted[@]}"; do wanted[$k]=false; done
+                for k in ${DEV_STALE:-}; do
+                  case " ${dev_only[*]} " in
+                    *" ${k} "*)
+                      wanted[$k]=true
+                      push=true
+                      ;;
+                  esac
+                done
+                if [ "$push" = "true" ]; then
+                  extra_tags+=("dev" "sha-${short_sha}")
+                fi
+                ;;
+              *)
+                push=true
+                extra_tags+=("dev" "sha-${short_sha}")
+                ;;
+            esac
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
+              && [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            push=true
+            extra_tags+=("pr-${{ github.event.number }}-${short_sha}")
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # Manual recovery with an empty release_tag: republish
+            # :dev and :sha-<short> for the current HEAD on every
+            # image. Same effect as a push-to-main run, but on
+            # demand.
+            push=true
+            extra_tags+=("dev" "sha-${short_sha}")
+          fi
+
+          # Build the images JSON. For fork PRs (push=false) we still
+          # include every image we'd otherwise build so the matrix
+          # exercises the Dockerfiles; nothing gets pushed.
+          images='['
+          first=true
+          for entry in "${all[@]}"; do
+            name="${entry%%|*}"
+            dockerfile="${entry#*|}"
+            # Respect the per-image filter. On push/PR it comes from
+            # the changes job; on a tag-driven release the release
+            # set above has already replaced it.
+            if [ "${wanted[$name]:-false}" != "true" ]; then continue; fi
+            image="${prefix}/${name}"
+            tags=""
+            if [ ${#extra_tags[@]} -gt 0 ]; then
+              for t in "${extra_tags[@]}"; do
+                if [ -z "$tags" ]; then tags="${image}:${t}"; else tags="${tags},${image}:${t}"; fi
+              done
+            fi
+            $first || images="${images},"
+            images="${images}{\"name\":\"${name}\",\"dockerfile\":\"${dockerfile}\",\"image\":\"${image}\",\"tags\":\"${tags}\"}"
+            first=false
+          done
+          images="${images}]"
+
+          if [ "$first" = "true" ]; then
+            has_images=false
+          else
+            has_images=true
+          fi
+
+          # kind-integration eligibility. The kind path is a pre-
+          # release smoke test, not a release gate, so workflow_call-
+          # with-release_tag invocations always skip.
+          #
+          # Any rebuilt image is worth smoke-testing, so has_images
+          # selects. The kind filter selects independently, for what
+          # changes the cluster without building an image: the chart,
+          # the CRDs, the harness, the demo manifests. kind-up is the
+          # only place in CI where the chart is installed rather than
+          # rendered, so gating the suite on an image build would
+          # leave that class with no coverage at all.
+          #
+          # `inert` vetoes both, and the run-kind label overrides the
+          # veto: the label is a human asserting the suite is worth
+          # running on a diff none of these rules select.
+          kind_wanted=false
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              # Fork PRs are excluded -- neither the per-PR image tag
+              # nor :dev is readable with a fork's token, so there is
+              # no manifest to kind-load.
+              if [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+                if [ "$inert" != "true" ] \
+                    && { [ "$CHANGED_KIND" = "true" ] || [ "$has_images" = "true" ]; }; then
+                  kind_wanted=true
+                elif echo "${PR_LABELS_JSON:-[]}" | grep -q '"run-kind"'; then
+                  kind_wanted=true
+                fi
+              fi
+              ;;
+            push)
+              # TREE_TESTED means the pull request this commit was
+              # squashed from already ran the suite over this exact
+              # tree; see the changes job for why that holds.
+              if [ "$GITHUB_REF" = "refs/heads/main" ] \
+                  && [ "$inert" != "true" ] \
+                  && [ "$TREE_TESTED" != "true" ] \
+                  && [ "$release_commit" != "true" ] \
+                  && { [ "$CHANGED_KIND" = "true" ] || [ "$has_images" = "true" ]; } \
+                  && [ "$push" = "true" ]; then
+                kind_wanted=true
+              fi
+              ;;
+            workflow_dispatch)
+              if [ -z "${INPUT_RELEASE_TAG:-}" ]; then
+                kind_wanted=true
+              fi
+              ;;
+          esac
+
+          # The tag kind-up pulls every component at. A run that built
+          # images uses the tag they were just published under, with
+          # the retag job filling in the components the diff skipped.
+          # A run that built none has no such tag and takes :dev,
+          # which tracks main HEAD -- current code underneath the
+          # chart or harness change under test.
+          if [ "$has_images" = "true" ]; then
+            case "$GITHUB_EVENT_NAME" in
+              pull_request) kind_build="pr-${{ github.event.number }}-${short_sha}" ;;
+              *)            kind_build="sha-${short_sha}" ;;
+            esac
+          else
+            kind_build=dev
+          fi
+
+          {
+            echo "push=${push}"
+            echo "images=${images}"
+            echo "has_images=${has_images}"
+            echo "kind_wanted=${kind_wanted}"
+            echo "kind_build=${kind_build}"
+            echo "sha_short=${short_sha}"
+            echo "all_components=${all_names[*]}"
+          } >> "$GITHUB_OUTPUT"
+
+  # Per-image, per-arch build. Each cell builds on the matching native
+  # runner and (when push=true) writes a per-digest entry to GHCR. The
+  # digest is uploaded as an artifact so the merge job can stitch the
+  # two arches into one multi-arch manifest list per tag.
+  build:
+    needs: meta
+    # `!cancelled()` defeats the implicit success() check on needs.
+    # Without it, build would be skipped whenever a transitive need
+    # (the changes job, which is skipped for workflow_call /
+    # workflow_dispatch events) was non-success, even though the
+    # explicit condition below would otherwise have run it.
+    if: ${{ !cancelled() && needs.meta.outputs.has_images == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.meta.outputs.images) }}
+        runner:
+          - { arch: amd64, runs_on: ubuntu-24.04,     platform: linux/amd64 }
+          - { arch: arm64, runs_on: ubuntu-24.04-arm, platform: linux/arm64 }
+    runs-on: ${{ matrix.runner.runs_on }}
+    timeout-minutes: 60
+    steps:
+      # When invoked with a release_tag (workflow_call from release-
+      # please.yml or workflow_dispatch backfilling a missed tag),
+      # check out the tag's commit rather than the workflow's
+      # triggering ref. The default ref is main HEAD, which can have
+      # drifted from the tag's content; building from there would
+      # publish "v<X>" tags pointing at a binary that isn't the
+      # tag's source.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: needs.meta.outputs.push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (push by digest)
+        if: needs.meta.outputs.push == 'true'
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.runner.platform }}
+          outputs: type=image,name=${{ matrix.image.image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.runner.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.runner.arch }}
+
+      # Fork PRs can't write to the package registry, so fall back to a
+      # local build that just validates the Dockerfile compiles.
+      - name: Build (validate only)
+        if: needs.meta.outputs.push != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.runner.platform }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.runner.arch }}
+
+      - name: Export digest
+        if: needs.meta.outputs.push == 'true'
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/digests"
+          d="${{ steps.push.outputs.digest }}"
+          touch "${RUNNER_TEMP}/digests/${d#sha256:}"
+
+      - name: Upload digest
+        if: needs.meta.outputs.push == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.image.name }}-${{ matrix.runner.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch the per-arch digests of each image into one multi-arch
+  # manifest list, applying the full tag list computed by meta.
+  merge:
+    needs: [meta, build]
+    if: ${{ !cancelled() && needs.meta.outputs.push == 'true' && needs.meta.outputs.has_images == 'true' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.meta.outputs.images) }}
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image.name }}-*
+          merge-multiple: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list
+        env:
+          IMAGE: ${{ matrix.image.image }}
+          TAGS: ${{ matrix.image.tags }}
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          tag_args=""
+          IFS=,
+          for t in $TAGS; do tag_args="$tag_args -t $t"; done
+          unset IFS
+          refs=""
+          for f in digests-${{ matrix.image.name }}-*/*; do
+            digest=$(basename "$f")
+            refs="$refs ${IMAGE}@sha256:${digest}"
+          done
+          echo "creating manifest for $IMAGE with tags:$tag_args" >&2
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $tag_args $refs
+
+      - name: Inspect
+        run: |
+          first=$(echo '${{ matrix.image.tags }}' | cut -d, -f1)
+          docker buildx imagetools inspect "$first"
+
+  # Retag the components the merge job skipped (no path change for
+  # them) from :dev to the BUILD tag the kind-integration step
+  # expects. `docker buildx imagetools create` writes a new tag
+  # against the existing manifest digest; no blob transfer, the
+  # multi-arch manifest list is preserved. Required so kind-up can
+  # pull every component at a single uniform tag without per-
+  # component fallback logic.
+  #
+  # Skipped when the run built no images: kind_build is :dev there,
+  # which every component already carries.
+  retag:
+    needs: [meta, merge]
+    if: ${{ !cancelled() && needs.meta.outputs.kind_wanted == 'true' && needs.merge.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag skipped components to ${BUILD}
+        env:
+          BUILD: ${{ needs.meta.outputs.kind_build }}
+          META_IMAGES_JSON: ${{ needs.meta.outputs.images }}
+          ALL_COMPONENTS: ${{ needs.meta.outputs.all_components }}
+          IMAGE_REGISTRY_RAW: ghcr.io/${{ github.repository_owner }}/mxl-k8s
+        run: |
+          set -euo pipefail
+          IMAGE_REGISTRY=$(echo "$IMAGE_REGISTRY_RAW" | tr '[:upper:]' '[:lower:]')
+          # Components the kind smoke test expects to find at $BUILD,
+          # taken from the meta job rather than restated: a component
+          # missing here is never retagged, and kind-up then fails
+          # pulling a tag that was never pushed.
+          read -r -a all_components <<< "$ALL_COMPONENTS"
+          built=$(echo "$META_IMAGES_JSON" | jq -r '[.[].name] | join(" ")')
+          for comp in "${all_components[@]}"; do
+            case " $built " in
+              *" $comp "*) continue ;;
+            esac
+            src="${IMAGE_REGISTRY}/${comp}:dev"
+            dst="${IMAGE_REGISTRY}/${comp}:${BUILD}"
+            echo "retag $src -> $dst"
+            docker buildx imagetools create --tag "$dst" "$src"
+          done
+
+  # Bring up a 3-node KIND cluster on the runner, point `make kind-up`
+  # at meta.kind_build -- the per-PR multi-arch manifest the `merge`
+  # job just published, or :dev when the diff built nothing -- and
+  # exercise the integration suite under test/integration/kind.
+  # Gated by meta.kind_wanted so unrelated diffs skip cleanly.
+  # workflow_call-with-release_tag invocations skip by design --
+  # the kind path is a pre-release smoke test, not a release gate.
+  kind-integration:
+    needs: [meta, build, merge, retag]
+    # A run that published images must have finished publishing them
+    # before the cluster can pull the tag; a run that published none
+    # takes :dev and does not wait on either job.
+    if: >-
+      ${{ !cancelled()
+          && needs.meta.outputs.kind_wanted == 'true'
+          && (needs.meta.outputs.has_images != 'true'
+              || (needs.merge.result == 'success' && needs.retag.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    # Two fabric interfaces per node is what exercises placement; one,
+    # bound to the pod IP, is the chart's default and the layout every
+    # single-port node runs.
+    strategy:
+      fail-fast: false
+      matrix:
+        fabric_ports: ["2", "1"]
+    steps:
+      - uses: actions/checkout@v7
+
+      # install_only avoids creating a stub cluster here; hack/kind-up.sh
+      # creates the real one against hack/kind-config.yaml.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - uses: azure/setup-kubectl@v5
+
+      # hack/kind-up.sh installs the chart via `helm upgrade --install`.
+      # Pin the helm version to the value chart.yml uses so the chart
+      # path is exercised against a single tested release. Same depName
+      # as chart.yml's HELM_VERSION, so Renovate bumps both together.
+      - uses: azure/setup-helm@v5
+        with:
+          # renovate: datasource=github-releases depName=helm/helm versioning=semver
+          version: v4.3.1
+
+      # `make kind-up BUILD=<tag>` pulls images from GHCR. GHCR
+      # packages are private regardless of event, so the runner
+      # must log in first.
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bring up KIND demo against ${{ needs.meta.outputs.kind_build }} images
+        env:
+          BUILD: ${{ needs.meta.outputs.kind_build }}
+          IMAGE_REGISTRY_RAW: ghcr.io/${{ github.repository_owner }}/mxl-k8s
+          KIND_CLUSTER: mxl-k8s-ci
+          # Hosted runners are slower on first image pull than a
+          # developer laptop; raise the kind-up defaults (180 / 300)
+          # to absorb that without changing the script's defaults.
+          MIRROR_TIMEOUT_SECS: 240
+          ROLLOUT_TIMEOUT_SECS: 360
+          FABRIC_PORTS: ${{ matrix.fabric_ports }}
+        run: |
+          set -euo pipefail
+          IMAGE_REGISTRY=$(echo "$IMAGE_REGISTRY_RAW" | tr '[:upper:]' '[:lower:]')
+          make kind-up \
+            BUILD="$BUILD" \
+            IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+            KIND_CLUSTER="$KIND_CLUSTER"
+
+      - name: Run integration suite
+        env:
+          KIND_CLUSTER: mxl-k8s-ci
+          KIND_DIAG_DIR: ${{ runner.temp }}/kind-diagnostics
+        run: make kind-test KIND_CLUSTER="$KIND_CLUSTER" KIND_DIAG_DIR="$KIND_DIAG_DIR"
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-diagnostics-${{ github.run_id }}-ports-${{ matrix.fabric_ports }}
+          path: ${{ runner.temp }}/kind-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Branch-protection target. Always runs, succeeds only when every
+  # required upstream job is in `success` or `skipped` state. Without
+  # this gate, branch protection would need to enumerate every
+  # conditional job individually and would block PRs that legitimately
+  # skipped one.
+  images-summary:
+    needs: [changes, deps-impact, meta, build, merge, retag, kind-integration]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Verify upstream jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -eu
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$NEEDS" | jq '[.[] | select(.result == "failure" or .result == "cancelled")] | length')
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$bad required job(s) failed or were cancelled"
+            exit 1
+          fi

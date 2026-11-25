@@ -1,0 +1,279 @@
+# renovate: datasource=go depName=sigs.k8s.io/controller-tools versioning=semver
+CONTROLLER_TOOLS_VERSION ?= v0.22.0
+CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
+
+# renovate: datasource=go depName=gotest.tools/gotestsum versioning=semver
+GOTESTSUM_VERSION ?= v1.13.0
+GOTESTSUM ?= go run gotest.tools/gotestsum@$(GOTESTSUM_VERSION)
+# renovate: datasource=go depName=github.com/vektra/mockery/v3 versioning=semver
+MOCKERY_VERSION ?= v3.7.4
+MOCKERY ?= go run github.com/vektra/mockery/v3@$(MOCKERY_VERSION)
+# SETUP_ENVTEST_VERSION (a controller-runtime release branch) and
+# ENVTEST_K8S_VERSION (an envtest asset version that trails upstream
+# Kubernetes) have no clean Renovate datasource and are bumped by hand.
+# Keep them in step with the .github/workflows/ci.yml copies.
+SETUP_ENVTEST_VERSION ?= release-0.22
+SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
+ENVTEST_K8S_VERSION ?= 1.31.0
+ENVTEST_DIR ?= $(CURDIR)/bin
+COVERAGE_DIR ?= $(CURDIR)/bin
+TEST_TIMEOUT ?= 5m
+TEST_ARGS ?= -race -timeout $(TEST_TIMEOUT)
+
+MODULES := api operator agent gateway
+PURE_TEST_MODULES := api operator agent
+
+.PHONY: all
+all: gen-api lint build
+
+.PHONY: lint
+lint:
+	@out=$$(gofmt -l .); \
+	if [ -n "$$out" ]; then \
+		echo "Files need gofmt:"; echo "$$out"; exit 1; \
+	fi
+	@for m in $(MODULES); do \
+		echo ">> go vet ./... in $$m"; \
+		(cd $$m && go vet ./...) || exit $$?; \
+	done
+
+.PHONY: build
+build:
+	@for m in $(MODULES); do \
+		echo ">> go build ./... in $$m"; \
+		(cd $$m && go build ./...) || exit $$?; \
+	done
+
+.PHONY: gen-api
+gen-api:
+	cd api && $(CONTROLLER_GEN) object paths=./...
+	$(CONTROLLER_GEN) crd paths=./api/... output:crd:dir=./config/crd
+
+.PHONY: gen-rbac
+gen-rbac:
+	$(CONTROLLER_GEN) rbac:roleName=mxl-operator paths=./operator/... output:rbac:dir=./config/rbac
+
+CRD_GEN_PATHS := config/ api/v1alpha1/zz_generated.deepcopy.go
+
+.PHONY: manifests-check
+manifests-check: gen-api gen-rbac
+	@if ! git diff --exit-code -- $(CRD_GEN_PATHS); then \
+		echo "Generated CRD/DeepCopy/RBAC files are out of sync."; \
+		echo "Run 'make gen-api gen-rbac' and commit the result."; \
+		exit 1; \
+	fi
+
+.PHONY: chart-crd-sync
+chart-crd-sync:
+	@mkdir -p charts/mxl-k8s/crds
+	@cp config/crd/mxl.qvest-digital.com_*.yaml charts/mxl-k8s/crds/
+
+.PHONY: chart-schema
+chart-schema:
+	$(HELM_SCHEMA) --chart-search-root charts/mxl-k8s --append-newline \
+	    --helm-docs-compatibility-mode --skip-auto-generation additionalProperties
+
+.PHONY: chart-docs
+chart-docs:
+	$(HELM_DOCS) --chart-search-root charts
+
+.PHONY: chart-lint
+chart-lint:
+	helm lint charts/mxl-k8s
+
+.PHONY: chart-test
+chart-test: chart-lint
+	helm unittest charts/mxl-k8s -f 'tests/unit/*_test.yaml'
+
+.PHONY: chart-check
+chart-check: chart-crd-sync chart-schema chart-docs
+	@if ! git diff --exit-code -- charts/mxl-k8s/crds charts/mxl-k8s/values.schema.json charts/mxl-k8s/README.md; then \
+		echo "Chart generated artefacts are out of sync."; \
+		echo "Run 'make chart-crd-sync chart-schema chart-docs' and commit the result."; \
+		exit 1; \
+	fi
+
+# Set per-component image tags in charts/mxl-k8s/values.yaml for a
+# local `helm install ./charts/mxl-k8s` or `helm template
+# ./charts/mxl-k8s`. `MODE=dev` rewrites every tag to "dev" to match
+# the floating dev chart; `MODE=release` (default) keeps the committed
+# per-component pins, which is what a release chart ships. The chart
+# workflow runs the same script at package time.
+# `make chart-resolve-reset` reverts values.yaml.
+MODE ?= release
+
+.PHONY: chart-resolve
+chart-resolve:
+	@bash hack/chart-resolve-tags.sh $(MODE)
+
+.PHONY: chart-resolve-reset
+chart-resolve-reset:
+	git checkout -- charts/mxl-k8s/values.yaml
+
+HELM_SCHEMA ?= $(shell go env GOPATH)/bin/helm-schema
+HELM_DOCS   ?= $(shell go env GOPATH)/bin/helm-docs
+
+.PHONY: generated-check
+generated-check: manifests-check chart-check
+
+# --- Test targets ---
+# `make test`         runs unit tests across pure-Go modules (api,
+#                     operator, agent). The operator suite needs the
+#                     kube-apiserver + etcd binaries that envtest provides;
+#                     they are fetched into $(ENVTEST_DIR) on demand and
+#                     reused thereafter.
+# `make test-gateway` runs gateway tests inside the cgo lane (libmxl +
+#                     libmxl-fabrics must be installed for the package to
+#                     compile). CI runs this in the go-mxl-builder image.
+# `make test-all`     runs both lanes.
+# `make mocks`        regenerates testify-style mocks listed in
+#                     `.mockery.yaml`. `make mocks-check` fails the build
+#                     if generated mocks are out of sync with the
+#                     committed copies.
+#
+# JUnit XML and coverage profiles land under bin/ keyed by module name.
+
+.PHONY: envtest-assets
+envtest-assets:
+	@mkdir -p $(ENVTEST_DIR)
+	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=$(ENVTEST_DIR) >/dev/null
+
+.PHONY: envtest-path
+envtest-path:
+	@$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=$(ENVTEST_DIR) -p path
+
+define test_module
+	@echo ">> test $(1)"
+	@mkdir -p $(COVERAGE_DIR)
+	@cd $(1) && KUBEBUILDER_ASSETS="$$(cd $(CURDIR) && $(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=$(ENVTEST_DIR) -p path)" \
+	    $(GOTESTSUM) \
+	        --format=testname \
+	        --junitfile=$(COVERAGE_DIR)/junit-$(1).xml \
+	        --jsonfile=$(COVERAGE_DIR)/test-$(1).json \
+	        -- $(TEST_ARGS) \
+	        -coverprofile=$(COVERAGE_DIR)/cover-$(1).out \
+	        -covermode=atomic \
+	        ./...
+endef
+
+.PHONY: test
+test: envtest-assets
+	@for m in $(PURE_TEST_MODULES); do \
+	    $(MAKE) --no-print-directory test-one MODULE=$$m || exit $$?; \
+	done
+
+.PHONY: test-one
+test-one:
+	$(call test_module,$(MODULE))
+
+# libmxl-monitoring's static libraries, built from the module version
+# gateway/go.mod pins; the gateway's cgo build links them.
+LIBMXL_MONITORING_DIR ?= $(CURDIR)/bin/libmxl-monitoring
+
+.PHONY: libmxl-monitoring
+libmxl-monitoring:
+	bash hack/build-libmxl-monitoring.sh $(LIBMXL_MONITORING_DIR)
+
+.PHONY: test-gateway
+test-gateway: libmxl-monitoring
+	CGO_LDFLAGS="$${CGO_LDFLAGS:+$$CGO_LDFLAGS }-L$(LIBMXL_MONITORING_DIR)" $(MAKE) --no-print-directory test-one MODULE=gateway
+
+.PHONY: test-all
+test-all: test test-gateway
+
+.PHONY: coverage-report
+coverage-report:
+	@for m in $(MODULES); do \
+	    f=$(COVERAGE_DIR)/cover-$$m.out; \
+	    if [ -f $$f ]; then \
+	        echo "=== $$m ==="; \
+	        (cd $$m && go tool cover -func=$$f | tail -n 1); \
+	    fi; \
+	done
+
+.PHONY: mocks
+mocks:
+	$(MOCKERY)
+
+.PHONY: mocks-check
+mocks-check: mocks
+	@if ! git diff --exit-code -- '**/mocks/*.go'; then \
+	    echo "mocks out of date; run 'make mocks' and commit the result."; \
+	    exit 1; \
+	fi
+
+# --- KIND demo helpers ---
+# `make kind-up`     builds the five component images, creates (or
+#                    reuses) a 3-node KIND cluster, loads the images,
+#                    installs the mxl-k8s Helm chart against
+#                    examples/kind/values.yaml, applies the demo
+#                    workload from examples/kind/demo/, and waits
+#                    for the MxlFlowMirror to reach Ready.
+# `make kind-down`   deletes the cluster.
+# `make kind-status` prints a quick status summary.
+# `make kind-test`   runs the integration suite in
+#                    test/integration/kind against the cluster spun
+#                    up by `make kind-up`. Failure diagnostics land
+#                    under KIND_DIAG_DIR for the kind-integration
+#                    GitHub Actions job to upload as an artifact.
+#
+# Requires: docker (or podman), kind, kubectl, helm.
+#
+# Override the cluster name with KIND_CLUSTER=<name>.
+# Use Podman instead of Docker: CONTAINER_RUNTIME=podman
+#   e.g. `make kind-up CONTAINER_RUNTIME=podman`
+#
+# Image source selector (BUILD):
+#   unset / BUILD=local  build the five component images locally as
+#                        ghcr.io/qvest-digital/mxl-k8s/<comp>:dev and
+#                        kind-load them (existing behaviour).
+#   BUILD=<tag>          skip the local build; pull
+#                        ghcr.io/<owner>/mxl-k8s/<component>:<tag> for
+#                        every component, kind-load it, and install
+#                        the chart with --set <comp>.image.tag=<tag>.
+#   e.g. `make kind-up BUILD=sha-abc1234`
+#        `make kind-up BUILD=v1.0.0-rc.3`
+
+KIND_CLUSTER ?= mxl-k8s-demo
+# Container runtime: "docker" (default) or "podman".
+CONTAINER_RUNTIME ?= docker
+# Image source: "local" (default) or a CI-produced image tag.
+BUILD ?= local
+# Where the integration suite writes failure diagnostics.
+KIND_DIAG_DIR ?= $(CURDIR)/kind-diagnostics
+MONITORING_RELEASE ?= kube-prometheus-stack
+# Host address `make kind-grafana` binds the forward on. 0.0.0.0 serves
+# every interface, so the board is reachable from another machine;
+# 127.0.0.1 keeps it on the loopback of the host running make.
+KIND_GRAFANA_ADDRESS ?= 0.0.0.0
+KIND_GRAFANA_PORT ?= 3000
+# Host name to print in the URL. Only cosmetic -- what the forward
+# accepts is decided by KIND_GRAFANA_ADDRESS.
+KIND_GRAFANA_HOST ?= $(shell hostname -f 2>/dev/null || hostname)
+
+.PHONY: kind-up
+kind-up:
+	KIND_CLUSTER=$(KIND_CLUSTER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) BUILD=$(BUILD) bash hack/kind-up.sh
+
+.PHONY: kind-down
+kind-down:
+	KIND_CLUSTER=$(KIND_CLUSTER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) bash hack/kind-down.sh
+
+.PHONY: kind-status
+kind-status:
+	KIND_CLUSTER=$(KIND_CLUSTER) CONTAINER_RUNTIME=$(CONTAINER_RUNTIME) bash hack/kind-status.sh
+
+.PHONY: kind-grafana
+kind-grafana:
+	@echo "Grafana on http://$(KIND_GRAFANA_HOST):$(KIND_GRAFANA_PORT)  (admin / admin)"
+	@echo "Flow dashboard: http://$(KIND_GRAFANA_HOST):$(KIND_GRAFANA_PORT)/d/mxl-flow-metrics"
+	@echo "Fabric dashboard: http://$(KIND_GRAFANA_HOST):$(KIND_GRAFANA_PORT)/d/mxl-fabric"
+	@test "$(KIND_GRAFANA_ADDRESS)" = "127.0.0.1" || \
+	    echo "Bound on $(KIND_GRAFANA_ADDRESS): reachable from other hosts, with the default admin password. KIND_GRAFANA_ADDRESS=127.0.0.1 keeps it local."
+	kubectl --context kind-$(KIND_CLUSTER) -n monitoring port-forward \
+	    --address $(KIND_GRAFANA_ADDRESS) \
+	    svc/$(MONITORING_RELEASE)-grafana $(KIND_GRAFANA_PORT):80
+
+.PHONY: kind-test
+kind-test:
+	KIND_CLUSTER=$(KIND_CLUSTER) KIND_DIAG_DIR=$(KIND_DIAG_DIR) bash test/integration/kind/run.sh

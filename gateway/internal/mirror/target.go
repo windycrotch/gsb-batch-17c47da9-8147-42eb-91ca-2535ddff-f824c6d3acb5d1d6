@@ -1,0 +1,3050 @@
+package mirror
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/qvest-digital/go-mxl/fabrics"
+	"github.com/qvest-digital/go-mxl/mxl"
+
+	apimxlfs "github.com/qvest-digital/mxl-k8s/api/mxlfs"
+	mxlv1alpha1 "github.com/qvest-digital/mxl-k8s/api/v1alpha1"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/fabric"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/flowlocks"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/instance"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/mxlfs"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/numaplace"
+	"github.com/qvest-digital/mxl-k8s/gateway/internal/placeholder"
+)
+
+// TargetFinalizerName is the finalizer the target-side reconciler
+// adds so libmxl-fabrics handles get torn down before the CR is
+// removed from the API.
+const TargetFinalizerName = "gateway.mxl.qvest-digital.com/target-side"
+
+// targetFieldOwner is the server-side-apply field manager owning the
+// TargetProgress condition and the target-side status fields the
+// flusher writes. Distinct from the source-side manager so the two
+// gateways never collide on the same conditions entry.
+const targetFieldOwner = "mxl-target-gateway"
+
+// targetInfoFieldOwner is the server-side-apply field manager owning
+// the MxlFlowMirrorTarget and the descriptor fields of the mirror's
+// status: targetInfoHash, targetMaxSyncBatchSizeHint and
+// targetInterface.
+//
+// Held apart from targetFieldOwner because the two change on
+// completely different clocks. The descriptor changes only when the
+// fabric side is opened or rebuilt, perhaps twice in a mirror's life,
+// while the progress fields change whenever grains move. SSA releases
+// a field its manager omits, so one manager for both would have every
+// progress write carry the descriptor fields again.
+const targetInfoFieldOwner = "mxl-target-gateway-info"
+
+// statusQuantum is the resolution at which grain-progress timestamps
+// are published, which both sides do by renewing their heartbeat
+// Lease. Within one quantum a moving timestamp is not worth an etcd
+// write: the fine-grained signal already exists as flow metrics, which
+// is where a per-grain view belongs. Phase and reason transitions go
+// to the mirror's status immediately and are not quantised.
+//
+// Well inside defaultStuckHandshakeAfter, so the cross-side wedge
+// discriminators that compare these timestamps keep their meaning.
+const statusQuantum = 5 * time.Second
+
+// defaultDegradedAfter is the duration of grain-commit inactivity
+// after which the flusher demotes a Ready mirror to Degraded.
+const defaultDegradedAfter = 10 * time.Second
+
+// defaultTargetFlushInterval is how often the per-mirror flusher
+// re-evaluates targetEntry trackers and publishes TargetProgress on
+// transition.
+const defaultTargetFlushInterval = 1 * time.Second
+
+// defaultStuckHandshakeAfter is the duration without any grain
+// commit since the fabric side was last opened that the flusher
+// treats as a silent libmxl-fabrics wedge: ReadGrain keeps reporting
+// ErrNotReady forever, so onFatal never fires, but no FI_CONNECTED
+// has landed and no grain has ever arrived. After this much time the
+// flusher escalates into recoverFromFatalError instead of waiting on
+// a fatal signal that will never come. 20 s sits between the typical
+// post-DaemonSet-rollout reconnect window (~15 s observed) and the
+// kind testcase-60 ceiling (STUCK_SECS=45 s).
+const defaultStuckHandshakeAfter = 20 * time.Second
+
+// defaultSendingIntoSilenceAfter is the shorter window the watchdog
+// gives a fabric side that a source is delivering into while nothing
+// commits. The source stamps lastSentAt when a transfer to this
+// mirror's target completes, so a lastSentAt past the fabric open says
+// the writes reached this side, and it reports TransfersNotLanding when
+// its head advances and none complete. Either way the source has
+// grains for this side, and a fabric side that has committed none of
+// them three seconds into that is rebuilt.
+//
+// A lastSentAt past the fabric open belongs to this fabric side: the
+// source publishes nothing for an entry added against a TargetInfo the
+// target has since replaced (see attachedToReplacedTarget). A connection
+// commits its first grain within tens of milliseconds of the add, so
+// three seconds of silence is not a slow start.
+const defaultSendingIntoSilenceAfter = 3 * time.Second
+
+// maxStuckRebuilds bounds the number of consecutive recovery spawns
+// the watchdog will issue without seeing a grain commit land. On the
+// (maxStuckRebuilds+1)th observation of a stuck handshake the flusher
+// publishes Phase=Failed with reason StuckHandshakeCapReached, drops
+// the entry, closes the writer (invalidating consumer FlowReaders),
+// and exits; the next Reconcile rebuilds from scratch. The counter
+// resets on the first commit after each successful fabric open, so
+// the cap counts *consecutive* failed rebuilds, not lifetime ones.
+const maxStuckRebuilds uint32 = 3
+
+// maxTargetOpenAttempts is the number of consecutive openTarget
+// failures after which the mirror stops reading as Materializing.
+// Materializing is a transient state a consumer waits through, so a
+// mirror parked there is indistinguishable from one a moment away
+// from Ready: no phase change to alert on and no counter to
+// threshold. From this attempt on the target side publishes
+// Phase=Degraded, and a failure to open the target's own writer also
+// gets the flow directory reclaimed (see reclaimUnusableFlowDir).
+const maxTargetOpenAttempts uint32 = 3
+
+// localWriterRecheckInterval is how often a target that stood down for
+// a process on this node writing its flow looks again. Nothing the
+// target reconciler watches changes when that process exits, so the
+// look is on its own clock.
+const localWriterRecheckInterval = 5 * time.Second
+
+// providerRecheckInterval is how soon a mirror whose live target was
+// sent to be rebuilt for a new provider, or found mid-rebuild, is
+// looked at again. A rebuild already running may have read the old
+// provider, and one whose progress loop did not exit skips the
+// rebuild, so neither is proof the target follows the spec.
+const providerRecheckInterval = 5 * time.Second
+
+// ReasonLocalWriter marks a target-side mirror that stood down because
+// a process on this node writes the flow. The local writer wins: the
+// mirror opens no writer into the flow and leaves its directory alone
+// for as long as that process writes it. Held here rather than in the
+// api module, like ReasonOpenTargetUnrecoverable.
+const ReasonLocalWriter = "LocalWriter"
+
+// terminalTargetOpenAttempts is the consecutive-failure count past
+// which the target side stops treating an open failure as retryable.
+//
+// maxTargetOpenAttempts moves the phase out of Materializing, but
+// Degraded still reads as "retrying", and backoffFor tops out at 30 s.
+// A mirror whose fabric device has gone away therefore re-probes twice
+// a minute for as long as the CR exists and reports the same reason as
+// one that has failed twice, so nothing distinguishes a mirror that is
+// recovering from one that never will. Past this count the phase goes
+// to Failed under its own reason and the retry drops to
+// terminalRetryInterval.
+//
+// The count is reached after roughly 80 s of honest retrying, which is
+// longer than any handshake window the gateway waits on elsewhere.
+const terminalTargetOpenAttempts uint32 = 10
+
+// terminalRetryInterval is the retry period a mirror gets once its
+// open failures have been declared unrecoverable. Long enough that a
+// permanently dead device costs nothing, short enough that a device
+// that does come back is picked up without operator action.
+const terminalRetryInterval = 10 * time.Minute
+
+// targetConcurrentReconciles is how many mirrors the target side
+// reconciles at once.
+//
+// controller-runtime defaults to one worker, so every blocking step -
+// a libmxl handshake, a bounded teardown wait - stalls target-side
+// reconciliation for every other mirror on the node, and one mirror
+// whose fabric device is wedged holds up the deletion of all the
+// others. A worker per mirror is not wanted either: the work behind
+// each one is a libmxl open, and the map plus the per-entry lifecycle
+// lock are what keep the state correct, so the bound is about how much
+// of the node's libmxl work happens at once, not about safety.
+//
+// controller-runtime never reconciles one object key on two workers at
+// the same time regardless of this value, so raising it introduces no
+// same-mirror concurrency that did not already exist between Reconcile,
+// the flusher and the recovery goroutine.
+const targetConcurrentReconciles = 4
+
+// defaultTeardownGrace bounds how long a target teardown waits for the
+// per-mirror goroutines it cancelled to return. A progress loop parked
+// in a libmxl-fabrics call that never comes back cannot be waited out,
+// and every teardown path is on the critical path of either a deletion
+// or a rebuild.
+const defaultTeardownGrace = 5 * time.Second
+
+// reclaimRetryDelay is how long the retry after a flow-directory
+// reclaim waits. Short on purpose: materialising a fresh directory is
+// the point of the reclaim, so that attempt does not sit out the
+// backoff the failures before it earned.
+const reclaimRetryDelay = 100 * time.Millisecond
+
+// flowDirSuffix is the directory-name suffix libmxl gives a per-flow
+// directory under a domain (FLOW_DIRECTORY_NAME_SUFFIX). go-mxl keeps
+// its own copy unexported, so the gateway carries one; the agent
+// module holds the same constant as flowpublisher.FlowDirSuffix.
+const flowDirSuffix = ".mxl-flow"
+
+// grainDirName is the subdirectory of a flow directory holding the
+// grain segment files (GRAIN_DIRECTORY_NAME). Only ever read, and
+// only to report how much of the ring was present when a directory
+// is reclaimed.
+const grainDirName = "grains"
+
+// errOpenWriterFailed wraps a NewWriter failure so the Reconcile
+// failure path can tell "the local flow file could not be opened"
+// apart from "the libmxl-fabrics side could not be set up". Only the
+// former is answerable by reclaiming the flow directory.
+var errOpenWriterFailed = errors.New("open local writer")
+
+// ReasonStuckHandshakeCapReached marks a target-side mirror whose
+// libmxl-fabrics handshake never produced a grain commit across
+// maxStuckRebuilds consecutive watchdog-driven rebuilds. Distinct
+// from ReasonNoGrains: NoGrains is a recoverable Degraded state, this
+// reason accompanies a terminal Phase=Failed and signals that the
+// gateway has given up rebuilding the target in place.
+const ReasonStuckHandshakeCapReached = "StuckHandshakeCapReached"
+
+// ReasonOpenTargetUnrecoverable marks a target-side mirror whose open
+// has failed terminalTargetOpenAttempts times running.
+//
+// Distinct from ReasonOpenTargetFailed, which rides on a Degraded
+// mirror the gateway is still retrying at full rate: this reason says
+// the gateway has stopped expecting the open to succeed, so an
+// operator reading it knows the mirror needs the device looked at
+// rather than more time. Held here rather than in the api module for
+// the same reason as ReasonStuckHandshakeCapReached - it names a
+// gateway-internal give-up rule, not part of the CRD contract.
+const ReasonOpenTargetUnrecoverable = "OpenTargetUnrecoverable"
+
+// TargetReconciler reconciles MxlFlowMirror resources from the
+// receiving side. See the package doc.
+type TargetReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+
+	// published is the TargetProgress condition last written per mirror.
+	published publishedConditions
+
+	// Recorders receives what each mirror's progress loop observes. Nil
+	// records nothing.
+	Recorders Recorders
+
+	// APIReader is an uncached reader for the Node lookup that gates
+	// orphaned-finalizer reaping. Nil falls back to Client.
+	APIReader client.Reader
+
+	// Recorder publishes mirror-level events for the target side. Nil
+	// records nothing.
+	Recorder record.EventRecorder
+
+	// NodeName is the Kubernetes node this gateway runs on. Mirrors
+	// with spec.targetNode set to a different node are ignored.
+	NodeName string
+
+	// Selector narrows the interfaces a setup may bind to the fabric
+	// this node is allowed to carry MXL traffic on. The capability
+	// publisher applies the same one.
+	Selector fabric.Selector
+
+	// Domains holds the long-lived mxl + fabrics instances, one per
+	// MxlDomain a mirror writes into.
+	Domains *instance.Set
+
+	// DomainPath is the primary MXL domain directory, the same path
+	// Domains.Primary was opened against. Held separately because
+	// reclaimUnusableFlowDir works on the directory with the filesystem
+	// rather than through libmxl. Empty disables the reclaim in the
+	// primary domain.
+	DomainPath string
+
+	// FlushInterval is how often the per-mirror status flusher
+	// inspects the targetEntry trackers and publishes TargetProgress
+	// when the observed phase has transitioned. Defaults to 1s.
+	FlushInterval time.Duration
+
+	// DegradedAfter is the duration of grain-commit inactivity after
+	// which the flusher demotes the mirror from Ready to Degraded.
+	// The same threshold gates the Reconcile fast-path: a Ready
+	// mirror whose target heartbeat is older than this falls through
+	// to re-establish instead of short-circuiting. Defaults to 10s.
+	DegradedAfter time.Duration
+
+	// StuckHandshakeAfter is the duration without any grain commit
+	// since the fabric side was opened that the flusher treats as a
+	// silent libmxl-fabrics wedge (ErrNotReady forever, no fatal
+	// signal). On reaching it the flusher spawns recoverFromFatalError
+	// instead of waiting on a fatal that will not come. Defaults to
+	// defaultStuckHandshakeAfter.
+	StuckHandshakeAfter time.Duration
+
+	// SendingIntoSilenceAfter is how long the source may report
+	// transfers into a fabric side on which nothing has committed
+	// before the flusher sets the target up again, counted from the
+	// first tick that saw the source sending. Defaults to
+	// defaultSendingIntoSilenceAfter.
+	SendingIntoSilenceAfter time.Duration
+
+	// SamplesCommitted is told every audio sample range a target commits:
+	// the domain directory, the flow id and the samples [start, end).
+	// A redundancy set merging that flow learns its arrivals from it.
+	SamplesCommitted func(domain, id string, start, end uint64)
+
+	// Unfilled ends each Filled, with the same domain directory and flow
+	// id, once the target that filled the flow gives up its writer: the
+	// mirror is deleted, or its entry is dropped or closed for another
+	// open. A placeholder the target filled becomes one again rather
+	// than a copy nothing feeds. Nil leaves it out.
+	Unfilled func(domain, id string)
+
+	// Placer gives the ring of a target on an mxlfs domain the NIC's
+	// NUMA node as its preference and holds it, before it is allocated.
+	// Nil places nothing.
+	Placer *numaplace.Placer
+
+	// Filled is told when a target on an mxlfs domain has its ring
+	// allocated and its fabric side open, with the domain directory and
+	// the flow id, so a placeholder there becomes a published copy. Nil
+	// leaves it out.
+	Filled func(domain, id string)
+
+	// Retire is told, with the domain directory and the flow id, before a
+	// target replaces a directory laid out in another geometry than the
+	// flow's definition, so a placeholder held there is released first.
+	// It is set with --mxlfs, and only then is a live target whose ring
+	// no longer matches the flow's definition replaced. Nil leaves both
+	// out.
+	Retire func(domain, id string)
+
+	// PlacementWait is how long a mirror with no placement waits for
+	// the operator to place it before its target binds the first
+	// interface, on a node advertising more than one for the provider.
+	// Zero does not wait.
+	PlacementWait time.Duration
+
+	// TeardownGrace bounds how long a teardown waits for the per-mirror
+	// goroutines it cancelled to return before giving up on releasing
+	// their libmxl handles. Defaults to defaultTeardownGrace.
+	TeardownGrace time.Duration
+
+	// openFabricSideFn is overridable so tests exercise the recovery
+	// path without a real libmxl-fabrics. Production leaves it nil
+	// and the reconciler falls back to (*TargetReconciler).openFabricSide.
+	openFabricSideFn func(writer *mxl.Writer, provider fabrics.Provider, want string) (*fabrics.Target, *fabrics.TargetInfo, string, error)
+
+	// recoverFn is the seam the stuck-handshake watchdog uses to
+	// spawn its recovery work. Production leaves it nil and the
+	// flusher invokes recoverFromFatalError directly; tests inject a
+	// stub so the watchdog's spawn/cap behavior can be observed
+	// without driving a real libmxl-fabrics rebuild. Kept distinct
+	// from openFabricSideFn because the watchdog's contract is
+	// "fire-and-forget" -- it does not own the recovery result, only
+	// the gate that prevents double spawns.
+	recoverFn func(key types.NamespacedName)
+
+	// openTargetFn is the seam Reconcile opens the target through.
+	// Production leaves it nil and falls back to
+	// (*TargetReconciler).openTarget, which needs a real libmxl;
+	// tests inject failures so the attempt accounting and the
+	// escalation out of Materializing can be observed without one.
+	openTargetFn func(key types.NamespacedName, flowDef string, provider fabrics.Provider) (*targetEntry, error)
+
+	// reclaimFS is what reclaimUnusableFlowDir reaches the domain
+	// through. Production leaves it nil for the real filesystem; tests
+	// record which paths a reclaim touches.
+	reclaimFS reclaimFS
+
+	// nowFn is the clock the open backoff is measured against.
+	// Production leaves it nil and the reconciler falls back to
+	// time.Now; tests inject one so the gate can be driven without
+	// sleeping.
+	nowFn func() time.Time
+
+	mu      sync.Mutex
+	targets map[types.NamespacedName]*targetEntry
+
+	// sharedFlows holds one *sharedFlow per flow a target writes, keyed
+	// by sharedFlowKey; see sharedFlow.
+	sharedFlows sync.Map
+
+	// attempts counts consecutive openTarget failures per mirror.
+	// Cleared the moment a target opens, so the value is always the
+	// length of the current failure run. Guarded by mu.
+	attempts attemptTable[targetOpenInputs]
+}
+
+// targetOpenInputs is what an open attempt depends on. A change to
+// any makes the next attempt a new one rather than a retry.
+type targetOpenInputs struct {
+	flowDef  string
+	hints    placeholder.Hints
+	provider fabrics.Provider
+	// iface is the address the mirror's placement names on this node,
+	// empty for an unplaced mirror.
+	iface string
+}
+
+// targetEntry holds the live libmxl handles for one target-side
+// mirror plus the goroutine that drives the target's progress loop.
+// Closed together by closeTargetHandles.
+type targetEntry struct {
+	// writer owns the local flow file. Its lifetime spans recoveries:
+	// closing it would invalidate the FlowReader handles in consumer
+	// pods, so the recovery path leaves it alone and only rebuilds
+	// the fabric side.
+	writer *mxl.Writer
+
+	// ringRelease drops the holds on the writer's ring files, and goes
+	// with the writer. Nil when nothing holds them.
+	ringRelease func()
+
+	// handles is the domain instance the writer was opened through;
+	// a fabric-side rebuild has to use the same one.
+	handles *instance.Handles
+
+	// fabric-side handles, rebuilt by recoverFromFatalError when
+	// ReadGrain reports a non-recoverable error.
+	target  *fabrics.Target
+	info    *fabrics.TargetInfo
+	infoStr string
+
+	// boundInterface is the address the live fabric side is bound to,
+	// guarded like provider.
+	boundInterface string
+	// provider is the provider the live fabric side was opened with.
+	// A rebuild takes the one spec.provider names at the time and
+	// records it here once installed; followRepoint compares the spec
+	// against it. Written under both r.mu and lifecycle, so the
+	// collector reads it under r.mu and the recovery under lifecycle.
+	provider fabrics.Provider
+
+	// flow serialises commits into the local flow with every other
+	// entry writing it; see sharedFlow.
+	flow *sharedFlow
+
+	// def is the flow definition the entry was opened with, and cfg the
+	// flow as its writer opened it.
+	def string
+	cfg mxl.FlowConfig
+
+	// commits counts grains the progress loop has committed, and
+	// arrivals of grains a sibling mirror of the flow committed shortly
+	// before. lastCommitAt records the wall-clock time of the most
+	// recent of either, the sibling's commit time for the latter. Both
+	// feed the per-mirror status flusher.
+	commits      atomic.Uint64
+	lastCommitAt atomic.Pointer[time.Time]
+
+	// fabricOpenedAt is the wall-clock the current fabric side became
+	// live (initial openTarget or a recoverFromFatalError rebuild).
+	// commitsAtFabricOpen snapshots the commits counter at the same
+	// moment. Together they let the flusher discriminate "no commits
+	// yet because we just opened" from "no commits because the
+	// handshake is silently wedged" without needing a separate
+	// state-machine flag.
+	//
+	// Atomic because the recovery goroutine swaps them inside
+	// startProgressLoop while the flusher tick reads them. The
+	// existing entry.recovering atomic gates the flusher's read but
+	// only after the recovery has cleared it; the watchdog block
+	// reads these values from the flusher without ever taking r.mu.
+	// nil pointer (zero value) means "fabric side never opened".
+	fabricOpenedAt      atomic.Pointer[time.Time]
+	commitsAtFabricOpen atomic.Uint64
+
+	// bytes counts payload committed to the local flow for this
+	// mirror, read by the throughput collector at scrape time. A
+	// counter rather than a rate: the scrape interval is the
+	// collector's business, not the progress loop's. When two mirrors
+	// share a flow, each counts only the commits it won, so the two
+	// split the flow's bytes between them.
+	bytes atomic.Uint64
+
+	// invalidFromSource and indexMismatch count the arrivals this
+	// mirror committed invalid, by invalidReason.
+	invalidFromSource atomic.Uint64
+	indexMismatch     atomic.Uint64
+
+	// phaseMu orders the phases a recovery publishes against the Failed a
+	// drop publishes. Two recoveries of one entry can run at once -- the
+	// watchdog's and the one a fatal progress loop spawns -- and without it
+	// one that read the entry before the other dropped it would publish
+	// Materializing or Ready over Failed, leaving a mirror that reads as
+	// rebuilding with nothing behind it. dropped is set, under phaseMu,
+	// by the drop; no recovery phase is written after it.
+	phaseMu sync.Mutex
+	dropped bool
+
+	// domain, flowID and peerNode label that counter alongside
+	// provider. domain and flowID are set once when the entry is
+	// published and never changed. peerNode is spec.sourceNode, which
+	// the operator rewrites when it moves the mirror to a new origin;
+	// followRepoint carries that onto the entry. All three are written
+	// under r.mu, which is what the collector reads them under.
+	domain   string
+	flowID   string
+	peerNode string
+
+	// recoveryAttempts counts consecutive watchdog-spawned recovery
+	// invocations that did not result in a fresh commit. recordCommit
+	// resets it to zero on the first commit after each fabric open,
+	// so the cap counts *consecutive* failed rebuilds rather than
+	// lifetime ones. The flusher caps spawns at maxStuckRebuilds.
+	recoveryAttempts atomic.Uint32
+
+	// recovering, set during recoverFromFatalError, tells the flusher
+	// to back off so its writes do not race the rebuild's own status
+	// publish. The recovery path clears it once the fabric side is
+	// rebuilt and the new progress loop is running.
+	recovering atomic.Bool
+
+	// statusReleased, set by a status write that carried no
+	// TargetProgress condition, tells the flusher to publish its state
+	// again, since that write released the condition.
+	statusReleased atomic.Bool
+
+	// lifecycle guards every mutable handle below, together with
+	// closed. The recovery goroutine swaps the fabric side and the
+	// progress-loop pair while a teardown on the reconcile goroutine
+	// reads them, and the two have to move as one: a teardown that
+	// took one generation's cancel and the next generation's done
+	// channel would cancel a loop that had already exited and then
+	// wait on one nobody had asked to stop.
+	lifecycle sync.Mutex
+
+	// closed marks the entry as torn down, and is the authority on who
+	// owns its handles. A recovery already in flight when a teardown
+	// lands must not install a rebuilt fabric side or start a fresh
+	// progress loop against the entry: it is gone from r.targets, so
+	// nothing would ever cancel that loop again.
+	closed bool
+
+	// cancel stops the per-mirror progress goroutine; done is closed
+	// when the goroutine returns. Without this loop the libmxl-fabrics
+	// Target never advances its event/completion queues, so remote
+	// initiators never get an FI_CONNECTED back and grains never land.
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	// flusherCancel stops the per-mirror status flusher; flusherDone
+	// is closed when it returns.
+	flusherCancel context.CancelFunc
+	flusherDone   chan struct{}
+}
+
+// stopProgressLoop cancels the entry's progress loop and waits up to
+// grace for it to return, reporting whether it exited.
+//
+// The cancel and the done channel are read under one hold of lifecycle
+// so they always belong to the same loop generation. The wait is
+// bounded because a loop parked inside libmxl-fabrics never returns:
+// every caller is on the critical path of a deletion or a rebuild, and
+// neither may be held by a goroutine that is not coming back.
+func (e *targetEntry) stopProgressLoop(grace time.Duration) bool {
+	e.lifecycle.Lock()
+	cancel, done := e.cancel, e.done
+	e.lifecycle.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	return waitClosed(done, grace)
+}
+
+// syncHint is the maxSyncBatchSizeHint of the flow the entry writes, 0
+// for an entry opened without a writer.
+func (e *targetEntry) syncHint() uint32 { return e.cfg.Common.MaxSyncBatchSizeHint }
+
+// abandon marks the entry torn down and hands back the writer, so a
+// caller that has already removed it from r.targets can release the
+// one handle it still owns. A nil writer means another teardown got
+// there first.
+func (e *targetEntry) abandon() *mxl.Writer {
+	e.lifecycle.Lock()
+	defer e.lifecycle.Unlock()
+	if e.closed {
+		return nil
+	}
+	e.closed = true
+	writer := e.writer
+	e.writer = nil
+	if e.ringRelease != nil {
+		e.ringRelease()
+		e.ringRelease = nil
+	}
+	return writer
+}
+
+// releaseRing drops the holds on the entry's ring and ends its fill,
+// once, leaving the writer alone. An entry given up while its progress
+// loop still runs keeps the writer the loop may be using, but its ring
+// and fill go with it as on every other way out.
+func (e *targetEntry) releaseRing() {
+	e.lifecycle.Lock()
+	release := e.ringRelease
+	e.ringRelease = nil
+	e.lifecycle.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+// waitClosed reports whether ch closed within d. A nil channel counts
+// as closed: an entry whose goroutine was never started has nothing to
+// wait for.
+func waitClosed(ch <-chan struct{}, d time.Duration) bool {
+	if ch == nil {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// +kubebuilder:rbac:groups=mxl.qvest-digital.com,resources=mxlflowmirrors,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=mxl.qvest-digital.com,resources=mxlflowmirrors/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=mxl.qvest-digital.com,resources=mxlflowmirrors/finalizers,verbs=update
+// +kubebuilder:rbac:groups=mxl.qvest-digital.com,resources=mxlflows,verbs=get;list;watch
+
+// reapOrphanedFinalizer drops TargetFinalizerName from a deleting
+// mirror whose spec.targetNode names a Node that no longer exists.
+// Symmetric with the source-side reaper; same DaemonSet gate, same
+// orphaned finalizer when the node it named is removed.
+func (r *TargetReconciler) reapOrphanedFinalizer(ctx context.Context, mirror *mxlv1alpha1.MxlFlowMirror) (ctrl.Result, error) {
+	if mirror.DeletionTimestamp.IsZero() ||
+		!controllerutil.ContainsFinalizer(mirror, TargetFinalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	gone, err := nodeGone(ctx, r.nodeReader(), mirror.Spec.TargetNode)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("look up target node %s: %w", mirror.Spec.TargetNode, err)
+	}
+	if !gone {
+		return ctrl.Result{RequeueAfter: orphanRecheckInterval}, nil
+	}
+	deleteHeartbeat(ctx, r.Client, client.ObjectKeyFromObject(mirror), mxlv1alpha1.MirrorSideTarget)
+
+	controllerutil.RemoveFinalizer(mirror, TargetFinalizerName)
+	if err := r.Update(ctx, mirror); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		if apierrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("remove orphaned target finalizer: %w", err)
+	}
+	log.FromContext(ctx).Info("reaped orphaned target-side finalizer",
+		"mxlflowmirror", client.ObjectKeyFromObject(mirror),
+		"targetNode", mirror.Spec.TargetNode)
+	return ctrl.Result{}, nil
+}
+
+// nodeReader prefers the uncached APIReader SetupWithManager binds.
+func (r *TargetReconciler) nodeReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get
+
+// Reconcile drives one MxlFlowMirror through its target-side
+// lifecycle.
+func (r *TargetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	l := log.FromContext(ctx).WithValues("mxlflowmirror", req.NamespacedName)
+
+	var mirror mxlv1alpha1.MxlFlowMirror
+	if err := r.Get(ctx, req.NamespacedName, &mirror); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Other-node mirrors are not ours.
+	if mirror.Spec.TargetNode != r.NodeName {
+		if r.Recorders != nil {
+			r.Recorders.ReleaseTarget(req.NamespacedName)
+		}
+		r.published.forget(req.NamespacedName)
+		return r.reapOrphanedFinalizer(ctx, &mirror)
+	}
+
+	// Deletion path: tear down libmxl handles, drop the finalizer.
+	if !mirror.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(&mirror, TargetFinalizerName) {
+			return ctrl.Result{}, nil
+		}
+		// The finalizer comes off whether or not the handles could be
+		// released. Teardown is bounded but not guaranteed: a progress
+		// loop wedged inside libmxl-fabrics never returns, and this
+		// reconciler is the only thing that can remove its own
+		// finalizer, so gating the removal on that wait leaves an
+		// MxlFlowMirror no delete can ever clear - a forced delete
+		// does not remove finalizers either. Abandoned handles cost
+		// one node's memory until the gateway restarts, which is
+		// recoverable; an undeletable object is not.
+		if !r.closeEntry(req.NamespacedName, r.localFlowDisposition(ctx, mirror.Ref().Name())) {
+			l.Info("target-side teardown timed out; abandoning libmxl handles to let the mirror be deleted",
+				"grace", r.teardownGrace())
+		}
+		if r.Recorders != nil {
+			r.Recorders.ReleaseTarget(req.NamespacedName)
+		}
+		r.published.forget(req.NamespacedName)
+		deleteHeartbeat(ctx, r.Client, req.NamespacedName, mxlv1alpha1.MirrorSideTarget)
+		controllerutil.RemoveFinalizer(&mirror, TargetFinalizerName)
+		if err := r.Update(ctx, &mirror); err != nil {
+			// The other side's gateway removed its finalizer first and
+			// the object went with it: the teardown is complete.
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, nil
+			}
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
+		}
+		l.Info("torn down target-side mirror")
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure the finalizer is in place before we own any handles.
+	// Concurrent reconcilers (source-side gateway, agent intent
+	// dispatcher) routinely race us on the same MxlFlowMirror in
+	// the moments after creation; treat an optimistic-concurrency
+	// conflict as a benign requeue rather than surfacing it as a
+	// stacktraced Reconciler error.
+	if !controllerutil.ContainsFinalizer(&mirror, TargetFinalizerName) {
+		controllerutil.AddFinalizer(&mirror, TargetFinalizerName)
+		if err := r.Update(ctx, &mirror); err != nil {
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("add finalizer: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Idempotent fast-path. Requires a live in-memory entry, a Ready
+	// status naming a descriptor (TargetInfoHash), *and* fresh grain activity:
+	// a gateway restart preserves status but loses the libmxl
+	// FlowWriter (closing it removes the on-disk flow definition);
+	// re-opening here restores the flow file and rotates TargetInfo,
+	// which the source side picks up via the MxlFlowMirror watch.
+	// The freshness check forces a re-establish when the target's
+	// heartbeat has fallen outside the degraded window: a Ready
+	// status without recent commits means the fabric side has likely died silently
+	// (no fatal ReadGrain error to trigger recoverFromFatalError) and
+	// the flow file in the consumer pod is no longer being filled.
+	r.replaceOtherGeometry(ctx, req.NamespacedName, mirror.Ref().Name())
+	if res, rebuilding := r.followRepoint(ctx, req.NamespacedName, &mirror); rebuilding {
+		return res, nil
+	}
+	r.mu.Lock()
+	live := r.targets[req.NamespacedName] != nil
+	r.mu.Unlock()
+	published := mirror.Status.TargetInfoHash != ""
+	if live && mirror.Status.Phase == mxlv1alpha1.MxlFlowMirrorReady && published &&
+		r.lastGrainFresh(heartbeatAt(ctx, r.Client, &mirror, mxlv1alpha1.MirrorSideTarget)) {
+		return ctrl.Result{}, nil
+	}
+
+	// Resolve the flow definition.
+	var flow mxlv1alpha1.MxlFlow
+	if err := r.Get(ctx, types.NamespacedName{Name: mirror.Ref().Name()}, &flow); err != nil {
+		if apierrors.IsNotFound(err) {
+			if mirror.Status.Phase != mxlv1alpha1.MxlFlowMirrorMaterializing {
+				if err := r.applyTargetStatus(ctx, &mirror, mxlv1alpha1.MxlFlowMirrorMaterializing, nil); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("get MxlFlow %s: %w", mirror.Ref().Name(), err)
+	}
+	if len(flow.Spec.Definition.Raw) == 0 {
+		// The MxlFlow exists but the producer has not published its
+		// definition yet. Treat it like a not-yet-materialized flow:
+		// surface the reason and requeue instead of returning a bare
+		// error that leaves the mirror sitting at an empty phase.
+		r.surfaceTargetFailure(ctx, &mirror, mxlv1alpha1.MxlFlowMirrorMaterializing,
+			mxlv1alpha1.ReasonFlowDefinitionEmpty,
+			fmt.Sprintf("MxlFlow %s has empty spec.definition", mirror.Ref().Name()))
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	provider, err := providerForSetup(&mirror)
+	if err != nil {
+		// Never forward auto into libmxl-fabrics: surface the reason on
+		// status and stop. The agent or operator patches spec.provider to
+		// a concrete value, which wakes this reconciler through its watch.
+		r.surfaceTargetFailure(ctx, &mirror, mxlv1alpha1.MxlFlowMirrorMaterializing,
+			mxlv1alpha1.ReasonProviderUnresolved, err.Error())
+		l.Info("refusing target setup: mirror provider is unresolved", "error", err.Error())
+		return ctrl.Result{}, nil
+	}
+
+	// Seed the in-memory attempts counter from the persisted
+	// status.targetAttemptCount so a gateway pod restart does not hand
+	// a wedged mirror a fresh budget: without this a target that has
+	// been unopenable across the bounce reads as Materializing again
+	// and the escalation to Degraded restarts from zero. Matches the
+	// source side's seeding of status.attemptCount.
+	if res, wait := r.awaitPlacement(ctx, &mirror, provider); wait {
+		return res, nil
+	}
+	inputs := targetOpenInputs{flowDef: string(flow.Spec.Definition.Raw), hints: placeholder.HintsOf(&flow), provider: provider,
+		iface: placedInterface(mirror.Spec.Placement, true)}
+	r.mu.Lock()
+	r.attempts.seed(req.NamespacedName, uint32(mirror.Status.TargetAttemptCount))
+	remaining, gated := r.attempts.wait(req.NamespacedName, inputs, r.now())
+	r.mu.Unlock()
+	// Nothing is written on a gated pass: the status write is what
+	// wakes this reconciler through its own watch.
+	if gated {
+		return ctrl.Result{RequeueAfter: remaining}, nil
+	}
+
+	entry, err := r.openTargetDispatch(req.NamespacedName, mirror.Spec.Domain, inputs)
+	if errors.Is(err, errLocalWriter) {
+		return r.standDown(ctx, &mirror, inputs)
+	}
+	if err != nil {
+		return r.handleOpenTargetFailure(ctx, &mirror, inputs, err)
+	}
+
+	r.mu.Lock()
+	if existing := r.targets[req.NamespacedName]; existing != nil {
+		// Concurrent reconcile produced a stray entry; close the new
+		// one and reuse the existing.
+		r.mu.Unlock()
+		closeTargetHandles(entry, keepFlow, r.teardownGrace())
+		return ctrl.Result{}, nil
+	}
+	entry.domain = mirror.Spec.Domain
+	entry.flowID = mirror.Spec.FlowID
+	entry.def = string(flow.Spec.Definition.Raw)
+	entry.peerNode = mirror.Spec.SourceNode
+	r.targets[req.NamespacedName] = entry
+	delete(r.attempts, req.NamespacedName)
+	r.mu.Unlock()
+
+	// Publish the descriptor before the phase: a Ready mirror whose
+	// targetInfo has not landed yet is one the source side cannot dial.
+	if err := r.applyTargetInfo(ctx, &mirror, entry.infoStr, entry.syncHint(), entry.boundInterface); err != nil {
+		r.closeEntry(req.NamespacedName, r.localFlowDisposition(ctx, mirror.Ref().Name()))
+		return ctrl.Result{}, fmt.Errorf("publish target info: %w", err)
+	}
+	if err := r.applyTargetStatus(ctx, &mirror, mxlv1alpha1.MxlFlowMirrorReady, nil); err != nil {
+		// Status update lost; close the entry so the next pass can
+		// retry cleanly.
+		r.closeEntry(req.NamespacedName, r.localFlowDisposition(ctx, mirror.Ref().Name()))
+		return ctrl.Result{}, fmt.Errorf("update status: %w", err)
+	}
+
+	r.startFlusher(req.NamespacedName, entry)
+
+	l.Info("target ready",
+		"flowID", mirror.Spec.FlowID,
+		"sourceNode", mirror.Spec.SourceNode,
+		"provider", provider.String())
+	return ctrl.Result{}, nil
+}
+
+// followRepoint carries spec.sourceNode and spec.provider onto the
+// live entry of key. The operator moves a mirror to its flow's new
+// origin by rewriting both, and an entry captures them when it opens.
+// It runs ahead of the Ready fast path, which a repointed mirror whose
+// grains keep flowing would otherwise always take.
+//
+// A placement naming another interface than the one the fabric side is
+// bound to is a fabric side on the wrong port, and goes through the
+// same rebuild onto the placed address.
+//
+// A new source node relabels the entry's counters and nothing else:
+// the target does not care which node dials it. A new provider is a
+// fabric side the new source cannot reach, so the entry goes through
+// the recovery rebuild, which keeps the writer, opens the fabric side
+// for the provider the spec names and publishes the new targetInfo.
+// The rebuild is spawned through the recovering gate the watchdog
+// uses, so it never runs twice for one entry from here. Reports true
+// when it spawned one or found one running; the caller stops there and
+// requeues to check the outcome. An unresolved provider is left to the
+// rest of Reconcile.
+func (r *TargetReconciler) followRepoint(ctx context.Context, key types.NamespacedName, mirror *mxlv1alpha1.MxlFlowMirror) (ctrl.Result, bool) {
+	l := log.FromContext(ctx)
+
+	r.mu.Lock()
+	entry := r.targets[key]
+	if entry == nil {
+		r.mu.Unlock()
+		return ctrl.Result{}, false
+	}
+	oldSource, current, bound := entry.peerNode, entry.provider, entry.boundInterface
+	moved := oldSource != mirror.Spec.SourceNode
+	if moved {
+		entry.peerNode = mirror.Spec.SourceNode
+	}
+	r.mu.Unlock()
+	if moved {
+		l.Info("mirror source moved; relabelling the target", "from", oldSource, "to", mirror.Spec.SourceNode)
+	}
+
+	provider, err := providerForSetup(mirror)
+	want := placedInterface(mirror.Spec.Placement, true)
+	replaced := want != "" && !fabric.SameAddress(bound, want)
+	if err != nil || (provider == current && !replaced) {
+		return ctrl.Result{}, false
+	}
+	if !entry.recovering.CompareAndSwap(false, true) {
+		return ctrl.Result{RequeueAfter: providerRecheckInterval}, true
+	}
+	l.Info("mirror provider or placement changed; rebuilding the target's fabric side",
+		"from", current.String(), "to", provider.String(), "fromInterface", bound, "toInterface", want)
+	go r.dispatchRecovery(key)
+	return ctrl.Result{RequeueAfter: providerRecheckInterval}, true
+}
+
+// awaitPlacement holds the open of a mirror the operator has not
+// placed, so its target binds the interface placement chooses rather
+// than the first one enumerated. The operator places within its own
+// reconcile, so the wait ends on the placement's spec update; the
+// bound covers an operator that is down or slow, after which the
+// mirror is set up as an unplaced one is. A node advertising at most
+// one interface for the provider has nothing to choose and does not
+// wait, nor does a mirror the operator found no pair for. A mirror the
+// operator holds is not set up at all: it was held because no pair had
+// room for it.
+func (r *TargetReconciler) awaitPlacement(ctx context.Context, mirror *mxlv1alpha1.MxlFlowMirror, provider fabrics.Provider) (ctrl.Result, bool) {
+	if mirror.Spec.Placement != nil {
+		return ctrl.Result{}, false
+	}
+	if c := meta.FindStatusCondition(mirror.Status.Conditions, mxlv1alpha1.ConditionTypePlaced); c != nil && c.Status == metav1.ConditionFalse {
+		switch c.Reason {
+		case mxlv1alpha1.ReasonHeld:
+			r.surfaceTargetFailure(ctx, mirror, mxlv1alpha1.MxlFlowMirrorPending, mxlv1alpha1.ReasonHeld, c.Message)
+			return ctrl.Result{}, true
+		case mxlv1alpha1.ReasonNoInterface:
+			return ctrl.Result{}, false
+		}
+	}
+	if r.PlacementWait <= 0 || r.localInterfaces(ctx, provider) <= 1 {
+		return ctrl.Result{}, false
+	}
+	if remaining := mirror.CreationTimestamp.Add(r.PlacementWait).Sub(r.now()); remaining > 0 {
+		return ctrl.Result{RequeueAfter: remaining}, true
+	}
+	return ctrl.Result{}, false
+}
+
+// localInterfaces counts the interfaces this node's MxlNodeCapabilities
+// advertises for provider. An unreadable or missing record counts as
+// none, which does not hold anything up.
+func (r *TargetReconciler) localInterfaces(ctx context.Context, provider fabrics.Provider) int {
+	var caps mxlv1alpha1.MxlNodeCapabilities
+	if err := r.Get(ctx, types.NamespacedName{Name: r.NodeName}, &caps); err != nil {
+		return 0
+	}
+	for _, p := range caps.Status.Providers {
+		if mapProvider(p.Name) == provider {
+			return len(p.Interfaces)
+		}
+	}
+	return 0
+}
+
+// now reports the current time through the reconciler's clock seam.
+func (r *TargetReconciler) now() time.Time {
+	if r.nowFn != nil {
+		return r.nowFn()
+	}
+	return time.Now()
+}
+
+// openTarget walks the libmxl handshake: open FlowWriter, create +
+// setup fabrics.Target against it, marshal TargetInfo, and start the
+// progress goroutine.
+//
+// key identifies the MxlFlowMirror whose target we're opening; the
+// progress goroutine uses it to invoke recovery if the libmxl-fabrics
+// Target dies (the writer is retained across recoveries to keep the
+// flow file valid for consumer pods).
+func (r *TargetReconciler) openTarget(key types.NamespacedName, domain string, in targetOpenInputs) (*targetEntry, error) {
+	flowDef, provider := in.flowDef, in.provider
+	handles, err := r.Domains.For(context.Background(), domain)
+	if err != nil {
+		return nil, err
+	}
+	mxlInst := handles.MXL()
+	if mxlInst == nil {
+		return nil, fmt.Errorf("mxl instance closed")
+	}
+
+	// A flow another process on this node writes belongs to that
+	// process: the local writer wins, and a mirror into it would write
+	// over a producer's ring.
+	if handles.OnMxlfs() {
+		if id, ok := flowIDFromDef(flowDef); ok {
+			if err := prepareFlowDir(handles.DomainPath(), id, flowDef, r.Retire); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// With the origin's hints, as the target of tools/mxl-fabrics-demo is
+	// given the producer's flow options: an audio target's bounce-buffer
+	// entries hold one batch of the copy's sync hint, and the source sends
+	// batches of the origin's. Without published hints libmxl's defaults
+	// apply, which the source reads back from targetMaxSyncBatchSizeHint.
+	writer, err := openWriter(mxlInst, handles.DomainPath(), flowDef, in.hints, r.Retire)
+	if err != nil {
+		return nil, err
+	}
+	// The ring has to be in place before the fabric side registers it:
+	// pinning a lazily allocated mxlfs ring would fault it in page by page.
+	// It is allocated on the NICs' NUMA node when the placer holds it.
+	ringRelease := func() {}
+	var ringID string
+	if handles.OnMxlfs() {
+		dir := mxlfs.FlowDir(handles.DomainPath(), writer.Config().Common.ID)
+		ringID = strings.TrimSuffix(filepath.Base(dir), ".mxl-flow")
+		ringRelease, err = allocateRing(func() func() {
+			return r.Placer.HoldTarget(handles.DomainPath(), ringID, mirrorRef(key))
+		}, func() error { return mxlfs.AllocateFlow(dir) })
+		if err != nil {
+			_ = writer.Close()
+			return nil, fmt.Errorf("%w: allocate ring: %w", errOpenWriterFailed, err)
+		}
+	}
+	target, info, s, bound, err := r.openFabricSideDispatch(handles, writer, provider, in.iface)
+	if err != nil {
+		_ = writer.Close()
+		ringRelease()
+		return nil, err
+	}
+	// Filled only once nothing can fail the open: the fill goes with the
+	// entry's ring holds, which every way of giving up its writer
+	// releases.
+	if handles.OnMxlfs() {
+		ringRelease = r.fill(handles.DomainPath(), ringID, ringRelease)
+	}
+
+	// The entry is not in r.targets yet, so nothing can be tearing it
+	// down and the install cannot be refused.
+	entry := &targetEntry{
+		writer:   writer,
+		cfg:      writer.Config(),
+		handles:  handles,
+		provider: provider,
+		flow:     r.sharedFlowFor(handles, writer.Config().Common.ID),
+
+		boundInterface: bound,
+	}
+	entry.ringRelease = ringRelease
+	r.startProgressLoop(entry, key, target, info, s)
+	return entry, nil
+}
+
+// fill tells Filled that a target fills flow id in domain and returns
+// release extended by the Unfilled that ends it. The entry calls its
+// release once, wherever it gives its writer up.
+func (r *TargetReconciler) fill(domain, id string, release func()) func() {
+	if r.Filled != nil {
+		r.Filled(domain, id)
+	}
+	return func() {
+		release()
+		if r.Unfilled != nil {
+			r.Unfilled(domain, id)
+		}
+	}
+}
+
+// allocateRing holds a target's ring, which gives it its node
+// preference, and then allocates it, so the ring is allocated where the
+// preference says. A failed allocation drops the holds.
+func allocateRing(hold func() func(), allocate func() error) (release func(), err error) {
+	release = hold()
+	if err := allocate(); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+// openTargetDispatch routes the open through the test seam when set,
+// falling back to the cgo openTarget in production.
+func (r *TargetReconciler) openTargetDispatch(key types.NamespacedName, domain string, in targetOpenInputs) (*targetEntry, error) {
+	if r.openTargetFn != nil {
+		return r.openTargetFn(key, in.flowDef, in.provider)
+	}
+	return r.openTarget(key, domain, in)
+}
+
+// openWriter opens the target's writer on flowDef with hints. libmxl
+// opens a flow that exists as it is, so an audio flow already there
+// with other hints is removed and created anew, as clearOtherGeometry
+// does for another geometry; one another writer still holds fails the
+// open until it is released.
+func openWriter(inst *mxl.Instance, domain, flowDef string, hints placeholder.Hints, retire func(domain, id string)) (*mxl.Writer, error) {
+	writer, _, err := inst.NewWriterOpts(flowDef, hints.Options())
+	if err != nil {
+		return nil, fmt.Errorf("%w: NewWriter: %w", errOpenWriterFailed, err)
+	}
+	if !hints.Differ(writer.Config()) {
+		return writer, nil
+	}
+	_ = writer.Close()
+	id, _ := flowIDFromDef(flowDef)
+	if err := clearFlowDir(filepath.Join(domain, id+".mxl-flow"), retire, errOtherHints); err != nil {
+		return nil, err
+	}
+	writer, _, err = inst.NewWriterOpts(flowDef, hints.Options())
+	if err != nil {
+		return nil, fmt.Errorf("%w: NewWriter: %w", errOpenWriterFailed, err)
+	}
+	return writer, nil
+}
+
+// standDown yields a target to a process on this node that writes its
+// flow. That process is the flow's producer here, so the mirror has
+// nothing to deliver: it opens no writer, its failure run ends instead
+// of escalating, and the flow directory is never reclaimed, whatever
+// the MxlFlow says about this node. The location published for this
+// node lags a producer that has just opened the flow, which is exactly
+// when this path runs. The operator deletes the mirror once this node
+// reads Origin; until then the open is tried again every
+// localWriterRecheckInterval, which also resumes the mirror should the
+// process exit first.
+//
+// A target still live here gives its writer up, as StopFlow does for a
+// placeholder taken over: it would write over the producer's ring.
+// status.targetInfoHash is left as it is: the source side keeps the
+// descriptor it dialed rather than tearing its half down, and the mirror
+// goes with the operator's delete either way.
+//
+// The operator deletes the mirror only once it resolves the flow's
+// Origin to this node. While it resolves it to another node, which a
+// second producer of the same flow still renewing its Lease there does,
+// the target stays stood down and costs one look at the node's locks
+// per recheck; it resumes from that node once the producer here exits.
+func (r *TargetReconciler) standDown(ctx context.Context, mirror *mxlv1alpha1.MxlFlowMirror, inputs targetOpenInputs) (ctrl.Result, error) {
+	key := client.ObjectKeyFromObject(mirror)
+	r.closeEntry(key, keepFlow)
+	r.mu.Lock()
+	r.attempts[key] = attempt[targetOpenInputs]{notBefore: r.now().Add(localWriterRecheckInterval), inputs: inputs}
+	r.mu.Unlock()
+	// One write per stand-down: each one wakes this reconciler through
+	// its own watch.
+	if c := meta.FindStatusCondition(mirror.Status.Conditions, mxlv1alpha1.ConditionTypeTargetProgress); c == nil || c.Reason != ReasonLocalWriter {
+		r.surfaceTargetFailure(ctx, mirror, mxlv1alpha1.MxlFlowMirrorDegraded, ReasonLocalWriter,
+			errLocalWriter.Error()+"; the mirror stands down")
+		log.FromContext(ctx).Info("standing down: a process on this node writes the flow", "flowID", mirror.Spec.FlowID)
+	}
+	return ctrl.Result{RequeueAfter: localWriterRecheckInterval}, nil
+}
+
+// handleOpenTargetFailure records the failed open, publishes the
+// reason on status, and returns a bounded-backoff requeue.
+//
+// openTarget wraps NewWriter + the libmxl-fabrics Target.Setup, whose
+// errors otherwise land only in the gateway log: the producer, the
+// consumer and the cluster diagnostics only ever observe the CR.
+// Publishing Materializing alone is not enough either - it is the
+// state a consumer waits through, so a mirror that can never open
+// looks the same as one about to succeed. Past maxTargetOpenAttempts
+// consecutive failures the phase escalates to Degraded and, for a
+// failure to open the target's own writer, the flow directory is
+// reclaimed so the retry materialises a fresh one.
+func (r *TargetReconciler) handleOpenTargetFailure(ctx context.Context, mirror *mxlv1alpha1.MxlFlowMirror, inputs targetOpenInputs, openErr error) (ctrl.Result, error) {
+	key := client.ObjectKeyFromObject(mirror)
+	l := log.FromContext(ctx).WithValues("mxlflowmirror", key)
+
+	r.mu.Lock()
+	attempts, wait := r.attempts.fail(key, inputs, r.now(), backoffFor)
+	r.mu.Unlock()
+
+	// Three escalations, not two. Materializing while the failure could
+	// still be a slow handshake, Degraded once it cannot, and Failed
+	// once the gateway has stopped expecting the open to work at all:
+	// backoffFor caps at 30s, so without the last step a mirror whose
+	// fabric device has gone away re-probes twice a minute forever and
+	// reads the same as one that has failed three times.
+	phase := mxlv1alpha1.MxlFlowMirrorMaterializing
+	reason := mxlv1alpha1.ReasonOpenTargetFailed
+	switch {
+	case attempts >= terminalTargetOpenAttempts:
+		phase = mxlv1alpha1.MxlFlowMirrorFailed
+		reason = ReasonOpenTargetUnrecoverable
+		// The retry is armed on the way in, not returned as advice:
+		// this reconciler watches the object it is about to write, so
+		// its own status write wakes it long before any RequeueAfter.
+		wait = terminalRetryInterval
+		r.mu.Lock()
+		r.attempts.rearm(key, r.now(), wait)
+		r.mu.Unlock()
+	case attempts >= maxTargetOpenAttempts:
+		phase = mxlv1alpha1.MxlFlowMirrorDegraded
+	}
+	r.surfaceTargetFailure(ctx, mirror, phase, reason,
+		fmt.Sprintf("%s (attempt %d)", openErr.Error(), attempts))
+	l.Error(openErr, "open target", "attempt", attempts, "phase", string(phase))
+
+	// A writer that will not open is the one failure the gateway can
+	// act on: it wrote that directory as a mirror target, so a
+	// directory it can no longer open is its own torn output. Only
+	// reclaim once the failure has repeated, so a single transient
+	// error never costs a directory.
+	if attempts >= maxTargetOpenAttempts && errors.Is(openErr, errOpenWriterFailed) {
+		if reclaimed := r.reclaimUnusableFlowDir(ctx, mirror.Ref()); reclaimed {
+			// Materialising a fresh directory is the point of the
+			// reclaim; do not sit out the accumulated backoff first.
+			r.mu.Lock()
+			r.attempts.rearm(key, r.now(), reclaimRetryDelay)
+			r.mu.Unlock()
+			return ctrl.Result{RequeueAfter: reclaimRetryDelay}, nil
+		}
+	}
+	return ctrl.Result{RequeueAfter: wait}, nil
+}
+
+// reclaimUnusableFlowDir removes the local flow directory for ref
+// so the next openTarget materialises a complete one, and reports
+// whether it removed anything.
+//
+// A gateway restart part-way through materialising a target leaves a
+// flow directory whose grain ring is short of what its flow header
+// declares. libmxl walks to a grain segment that was never written
+// and every later open of that path fails, so retrying the open
+// against the same directory can only keep failing.
+//
+// Two gates keep a producer's flow out of it. On mxlfs, where the
+// gateway runs in the host's PID namespace and so sees every process's
+// locks, a directory another process on this node writes is that
+// process's flow, whatever the MxlFlow says: the location this node
+// publishes lags a producer that has just opened the flow. Without
+// mxlfs no other process's lock is visible and only the second gate
+// applies. And a flow this node is Origin for belongs
+// to a local producer even while that producer is not attached. Only a
+// directory this gateway owns as a mirror copy is reclaimed, which is
+// the same ownership test teardown applies.
+func (r *TargetReconciler) reclaimUnusableFlowDir(ctx context.Context, ref mxlv1alpha1.FlowRef) bool {
+	l := log.FromContext(ctx).WithName("target-reclaim").WithValues("flow", ref.Name())
+	domainPath := r.DomainPath
+	if ref.Domain != "" {
+		handles, err := r.Domains.For(ctx, ref.Domain)
+		if err != nil {
+			l.Error(err, "resolve domain directory")
+			return false
+		}
+		domainPath = handles.DomainPath()
+	}
+	if domainPath == "" {
+		return false
+	}
+	if r.localFlowDisposition(ctx, ref.Name()) == keepFlow {
+		l.Info("leaving flow directory in place: not this node's mirror copy")
+		return false
+	}
+
+	// Looked for in the domain's listing rather than resolved: on a
+	// domain that waits for a missing flow name to appear, resolving
+	// one blocks for the whole wait, and every check below resolves a
+	// path inside the directory.
+	fsys := r.reclaimFS
+	if fsys == nil {
+		fsys = osReclaimFS{}
+	}
+	name := ref.ID + flowDirSuffix
+	names, err := fsys.Names(domainPath)
+	if err != nil {
+		l.Error(err, "list domain directory", "path", domainPath)
+		return false
+	}
+	if !slices.Contains(names, name) {
+		return false
+	}
+	dir := filepath.Join(domainPath, name)
+	if n, err := fsys.ForeignWriters(filepath.Join(dir, "data")); err != nil || n > 0 {
+		l.Info("leaving flow directory in place: a process on this node writes it", "writers", n, "error", err)
+		return false
+	}
+	// Report how much of the grain ring was there: the shortfall
+	// against the flow header is what distinguishes a torn directory
+	// from one that failed to open for another reason, and it is not
+	// recoverable once the directory is gone.
+	grains := -1
+	if entries, err := fsys.ReadDir(filepath.Join(dir, grainDirName)); err == nil {
+		grains = len(entries)
+	}
+	if err := fsys.RemoveAll(dir); err != nil {
+		l.Error(err, "remove flow directory", "path", dir)
+		return false
+	}
+	l.Info("reclaimed unopenable flow directory", "path", dir, "grainFiles", grains)
+	return true
+}
+
+// reclaimFS is the filesystem a reclaim works on.
+type reclaimFS interface {
+	Names(dir string) ([]string, error)
+	ForeignWriters(dataPath string) (int, error)
+	ReadDir(dir string) ([]os.DirEntry, error)
+	RemoveAll(path string) error
+}
+
+type osReclaimFS struct{}
+
+// Names lists dir without resolving any of its entries.
+func (osReclaimFS) Names(dir string) ([]string, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.Readdirnames(-1)
+}
+
+func (osReclaimFS) ForeignWriters(dataPath string) (int, error) {
+	return flowlocks.ForeignWriters(dataPath)
+}
+
+func (osReclaimFS) ReadDir(dir string) ([]os.DirEntry, error) { return os.ReadDir(dir) }
+
+func (osReclaimFS) RemoveAll(path string) error { return os.RemoveAll(path) }
+
+// openFabricSide creates the fabrics.Target + TargetInfo on an
+// already-open mxl.Writer. Used both by initial openTarget and by
+// recoverFromFatalError when the fabric side died but the writer is
+// still good.
+func (r *TargetReconciler) openFabricSide(handles *instance.Handles, writer *mxl.Writer, provider fabrics.Provider, want string) (*fabrics.Target, *fabrics.TargetInfo, string, string, error) {
+	fabInst := handles.Fabrics()
+	if fabInst == nil {
+		return nil, nil, "", "", fmt.Errorf("fabrics instance closed")
+	}
+	target, err := fabInst.NewTarget()
+	if err != nil {
+		return nil, nil, "", "", fmt.Errorf("NewTarget: %w", err)
+	}
+	iface, err := resolveInterface(fabInst, r.Selector, provider, want)
+	if err != nil {
+		_ = target.Close()
+		return nil, nil, "", "", err
+	}
+	info, err := target.Setup(targetConfig(iface, writer))
+	if err != nil {
+		_ = target.Close()
+		return nil, nil, "", "", fmt.Errorf("Target.Setup: %w", err)
+	}
+	s, err := info.MarshalString()
+	if err != nil {
+		_ = info.Close()
+		_ = target.Close()
+		return nil, nil, "", "", fmt.Errorf("TargetInfo.MarshalString: %w", err)
+	}
+	return target, info, s, iface.Address.Node, nil
+}
+
+// targetCQDepth is the completion queue depth of every target,
+// passed as the cqDepth option docs/Fabrics.md describes for receivers
+// whose read loop can fall behind. Mirror latency has reached 269 ms,
+// 14 grains of a 50 fps flow, which bounds how far a target's reads
+// trailed its writes, and a 1.1.0-rc.42 source keeps up to 16 sample
+// batches in flight; 64 holds both with room to spare. With the libmxl-fabrics this gateway links,
+// it is also how many receives a connected target keeps posted for
+// writes that carry immediate data.
+const targetCQDepth = 64
+
+// targetConfig is the libmxl-fabrics setup of a target writing into
+// writer.
+func targetConfig(iface fabrics.InterfaceConfig, writer *mxl.Writer) fabrics.TargetConfig {
+	return fabrics.TargetConfig{
+		Interface: iface,
+		Writer:    writer,
+		Options:   fmt.Sprintf(`{"cqDepth": %d}`, targetCQDepth),
+	}
+}
+
+// openFabricSideDispatch routes the fabric-side open through the
+// test seam when set, falling back to the cgo openFabricSide in
+// production. The source reconciler routes the equivalent libmxl-
+// fabrics Initiator setup through the initiatorOpener interface
+// instead, but the seam serves the same purpose.
+func (r *TargetReconciler) openFabricSideDispatch(handles *instance.Handles, writer *mxl.Writer, provider fabrics.Provider, want string) (*fabrics.Target, *fabrics.TargetInfo, string, string, error) {
+	if r.openFabricSideFn != nil {
+		t, i, s, err := r.openFabricSideFn(writer, provider, want)
+		return t, i, s, want, err
+	}
+	return r.openFabricSide(handles, writer, provider, want)
+}
+
+// startProgressLoop publishes a freshly-opened fabric side on the
+// entry and wires the progress goroutine that drives it. Called after
+// openTarget and again after every successful in-place fabric rebuild.
+//
+// The install and the goroutine handles are written under one hold of
+// entry.lifecycle, so a teardown racing this either sees the whole new
+// generation or none of it. Splitting them is what lets a teardown
+// pair one generation's cancel with the next generation's done channel
+// and then wait forever on a loop nobody asked to stop.
+//
+// Reports false when the entry has already been torn down. The caller
+// still owns target and info in that case and has to release them:
+// nothing would ever cancel a loop started against an entry that is no
+// longer in r.targets.
+func (r *TargetReconciler) startProgressLoop(
+	entry *targetEntry,
+	key types.NamespacedName,
+	target *fabrics.Target,
+	info *fabrics.TargetInfo,
+	infoStr string,
+) bool {
+	// Re-arm the stuck-handshake watchdog reference: every fabric
+	// open (initial or rebuilt) gets its own elapsed window measured
+	// against its own commits baseline. Without resetting here the
+	// post-recovery flusher would trip the watchdog immediately on
+	// the carried-over (now-stale) fabricOpenedAt.
+	now := time.Now()
+	entry.fabricOpenedAt.Store(&now)
+	entry.commitsAtFabricOpen.Store(entry.commits.Load())
+
+	loopCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	entry.lifecycle.Lock()
+	if entry.closed {
+		entry.lifecycle.Unlock()
+		cancel()
+		return false
+	}
+	entry.target, entry.info, entry.infoStr = target, info, infoStr
+	entry.cancel = cancel
+	entry.done = done
+	writer := entry.writer
+	flow := entry.flow
+	entry.lifecycle.Unlock()
+
+	var rec TargetRecorder = noopTarget{}
+	if r.Recorders != nil {
+		id := writer.Config().Common.ID
+		if t := r.Recorders.Target(key, fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16]), writer.Config()); t != nil {
+			rec = t
+		}
+	}
+
+	onFatal := func() {
+		// Detach the recovery work from the goroutine that's exiting
+		// so the recovery's wait-for-done doesn't deadlock on its own
+		// done channel.
+		go r.recoverFromFatalError(key)
+	}
+	// A continuous (audio) flow receives sample runs, not grains; pick
+	// the progress path from the flow's data format. The writer's
+	// cached config is the source of truth for which API is valid.
+	if writer.Config().Common.Format == mxl.FormatAudio {
+		readFn := func() (uint64, int, error) { return target.ReadSamples(targetReadTimeout) }
+		id := writer.Config().Common.ID
+		flowID := fmt.Sprintf("%x-%x-%x-%x-%x", id[0:4], id[4:6], id[6:8], id[8:10], id[10:16])
+		commitFn := func(head uint64, count int) error {
+			n, err := flow.commitSamples(writer, head, count, entry)
+			entry.bytes.Add(n)
+			recordSampleCommit(rec, head, count, err)
+			if err == nil && r.SamplesCommitted != nil && entry.handles != nil {
+				r.SamplesCommitted(entry.handles.DomainPath(), flowID, head-uint64(count), head)
+			}
+			return err
+		}
+		go runTargetSampleProgressLoop(loopCtx, done, readFn, commitFn, onFatal, entry)
+	} else {
+		readFn := func() (uint64, error) { return target.ReadGrain(targetReadTimeout) }
+		commitFn := func(idx uint64) error {
+			c, err := flow.commitGrain(writer, idx, entry)
+			entry.bytes.Add(c.bytes)
+			entry.recordInvalid(c.reason)
+			recordGrainCommit(rec, idx, c, err)
+			return err
+		}
+		go runTargetProgressLoop(loopCtx, done, readFn, commitFn, onFatal, entry)
+	}
+	return true
+}
+
+// targetReadTimeout is how long a blocking target read parks before
+// reporting not-ready. It bounds how long a cancelled loop takes to
+// notice, so it stays short enough for a responsive teardown while
+// still being long next to the grain intervals in use.
+const targetReadTimeout = 20 * time.Millisecond
+
+// commitTracker is the subset of targetEntry the progress loop
+// updates after every successful commit, and sharedFlow after an
+// arrival a sibling's recent commit vouches for. Defined as an interface so
+// tests can drive runTargetProgressLoop with a stub.
+type commitTracker interface {
+	recordCommit(idx uint64, at time.Time)
+}
+
+func (e *targetEntry) recordCommit(_ uint64, at time.Time) {
+	n := e.commits.Add(1)
+	t := at
+	e.lastCommitAt.Store(&t)
+	// First commit after this fabric side opened disarms the
+	// stuck-handshake cap so a previously-rebuilt-successfully entry
+	// gets a fresh budget if it later wedges again. recoveryAttempts
+	// thus counts *consecutive* unsuccessful rebuilds, not lifetime
+	// ones.
+	if n == e.commitsAtFabricOpen.Load()+1 {
+		e.recoveryAttempts.Store(0)
+	}
+}
+
+// recordInvalid counts an arrival committed invalid for reason; an
+// empty reason counts nothing.
+func (e *targetEntry) recordInvalid(reason invalidReason) {
+	switch reason {
+	case invalidFromSource:
+		e.invalidFromSource.Add(1)
+	case invalidIndexMismatch:
+		e.indexMismatch.Add(1)
+	}
+}
+
+// runTargetProgressLoop drives the libmxl-fabrics Target until ctx
+// is canceled or ReadGrain reports a non-recoverable error. Each
+// ReadGrain call internally advances the libfabric event +
+// completion queues - without it the target never accepts incoming
+// connections nor signals grain arrivals.
+//
+// The read is the blocking variant. libfabric still treats -EINTR from
+// epoll_wait as a fatal "poll failed" in release builds - the filter in
+// util_wait.c is behind ENABLE_DEBUG in every release up to and
+// including the pinned v2.5.1 - and Go's async preemption sends SIGURG
+// to running goroutines ~50/sec, so that interrupt remains routine.
+// What changed is libmxl-fabrics: RCTarget and RDMTarget now catch the
+// interrupted FabricException per state and return the state unchanged,
+// surfacing MXL_ERR_INTERRUPTED instead of tearing the endpoint down.
+// classifyFabricError already reads that as fabricTransient, so the
+// loop retries and keeps its handles.
+//
+// Every grain ReadGrain reports as received, a batch of its slices or
+// all of it, is committed by commitFn on the local FlowWriter, where
+// consumer FlowReaders see it.
+//
+// Errors from ReadGrain are classified: idle means nothing arrived,
+// transient means the call was disturbed and the handles are still
+// good. On anything else the underlying Target
+// is no longer safe to poll - libmxl-fabrics has been observed to
+// dangle internal state after the remote endpoint drops, and the
+// next ReadGrain call segfaults inside cgo. We exit the loop and
+// call onFatal so the reconciler can rebuild the fabric side.
+//
+// The loop takes readFn and commitFn as injected closures so the state
+// machine - the only piece prone to bugs and the only piece worth
+// unit-testing - is isolated from cgo. Production passes a closure over
+// fabrics.Target.ReadGrain and one over commitArrivedGrain(writer, ...).
+func runTargetProgressLoop(
+	ctx context.Context,
+	done chan struct{},
+	readGrain ReadGrainFunc,
+	commit CommitFunc,
+	onFatal func(),
+	tracker commitTracker,
+) {
+	defer close(done)
+	l := ctrl.Log.WithName("target-progress")
+	const transientSleep = 1 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		idx, err := readGrain()
+		switch kind := classifyFabricError(err); {
+		case err == nil:
+			if err := commit(idx); err != nil {
+				if !errors.Is(err, errGrainAlreadyCommitted) {
+					l.Error(err, "commit received grain", "idx", idx)
+					break
+				}
+				// Another mirror of this flow into this node committed
+				// the grain first, or the source sent it twice. It is in
+				// the ring either way; the commit function has already
+				// counted the arrival if a sibling's commit vouches for
+				// it.
+				l.V(1).Info("dropping already-committed grain arrival",
+					"idx", idx, "error", err.Error())
+				break
+			}
+			if tracker != nil {
+				tracker.recordCommit(idx, time.Now())
+			}
+		case kind == fabricIdle:
+			// The blocking read already waited out its timeout.
+		case kind == fabricTransient:
+			// Disturbed, not broken: the handles are still usable, so
+			// poll again instead of rebuilding the fabric side.
+			l.V(1).Info("ReadGrain disturbed, retrying",
+				"error", err.Error(), "class", kind.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(transientSleep):
+			}
+		default:
+			l.Error(err, "ReadGrain - target is no longer safe to poll, exiting loop",
+				"class", kind.String())
+			if onFatal != nil {
+				onFatal()
+			}
+			return
+		}
+	}
+}
+
+// commitArrivedGrain advances the local flow's HeadIndex for a grain
+// whose payload + header were already filled in by the remote
+// initiator's RDMA write. OpenGrain returns a writable handle aliasing
+// the ring slot -- we leave the slot bytes untouched and Commit so the
+// flow metadata catches up.
+// The returned byte count is the grain payload libmxl declares for the
+// flow, which the write access already carries.
+//
+// errGrainAlreadyCommitted reports an arrival whose grain the writer
+// has already committed: libmxl rejects an OpenGrain whose index does
+// not advance the last committed one, and that is the only case it
+// answers with invalid argument. libmxl shares one writer per flow, so
+// a second mirror of the flow into this node commits every grain the
+// first already has.
+var errGrainAlreadyCommitted = errors.New("grain already committed")
+
+// invalidReason says why an arrived grain was committed invalid; empty
+// for one committed valid.
+type invalidReason string
+
+const (
+	// invalidFromSource is a grain whose producer committed it invalid.
+	invalidFromSource invalidReason = "invalid_from_source"
+	// invalidIndexMismatch is a slot whose header names another index
+	// than the one committed: a later write into the slot, such as a
+	// transfer the source retransmitted after its producer reused the
+	// slot, landed after the arrival was reported. OpenGrain rewrites
+	// the header to the committed index, so the later grain is not
+	// served from this slot either: its own arrival finds this index
+	// there and is committed invalid, or the writer flags it as a gap
+	// once a grain past it commits.
+	invalidIndexMismatch invalidReason = "index_mismatch"
+)
+
+// A valid arrival is committed with the valid slices the initiator's
+// write carried, as the target in tools/mxl-fabrics-demo/demo.cpp
+// commits the grain info OpenGrain hands back: a video grain sent in
+// slice batches is readable batch by batch, libmxl lets the writer
+// reopen a grain it has not completed, and the batch that carries the
+// last slice completes it. A data grain's valid slices are its length.
+//
+// The slot's header is read before OpenGrain, which resets an older
+// grain's header. An arrival is committed invalid when the header
+// carries the invalid flag or another index. An invalid video grain is
+// committed whole, so the writer completes it and the next arrival
+// commits past it. An invalid data grain arrives as its header alone,
+// and libmxl-fabrics sets the slot's valid slices from the range a
+// transfer carried (RMAGrainIngressProtocol::read), so it commits
+// empty, as one whose header names another index does.
+//
+// Two mirrors of a flow can write into this node's ring at once: the
+// operator keeps one mirror per (flow, node) for each consumer namespace
+// (mirrorNameForReceiver in operator/internal/receiver/controller.go),
+// and a mirror whose origin moves is sent by its old and its new source
+// for a moment. libmxl-fabrics sets the slot's valid slices from each
+// arrival's range, so a sibling's earlier batch lowers them. open, when
+// set, records the grain the writer holds open and the most slices
+// committed of it, and such an arrival commits no fewer. A grain the
+// writer has completed cannot be reopened, so a late batch of it leaves
+// the slot's count lowered until the sibling's last batch of it lands,
+// if it does: a sibling that resyncs or loses its target mid-grain
+// leaves it lowered for good. Only a
+// producer that commits partial grains with a sync hint below the
+// grain's slices is sent in more than one batch, so only its grains are
+// exposed.
+func commitArrivedGrain(writer *mxl.Writer, idx uint64, open *partialGrain) (grainCommit, error) {
+	hdr, err := writer.GrainInfo(idx)
+	if err != nil {
+		return grainCommit{}, fmt.Errorf("GrainInfo(%d): %w", idx, err)
+	}
+	var reason invalidReason
+	switch {
+	case hdr.Index != idx:
+		reason = invalidIndexMismatch
+	case hdr.Invalid():
+		reason = invalidFromSource
+	}
+	data := writer.Config().Common.Format == mxl.FormatData
+	ga, err := writer.OpenGrain(idx)
+	if err != nil {
+		if errors.Is(err, mxl.ErrInvalidArg) {
+			return grainCommit{}, fmt.Errorf("OpenGrain(%d): %w: %w", idx, errGrainAlreadyCommitted, err)
+		}
+		return grainCommit{}, fmt.Errorf("OpenGrain(%d): %w", idx, err)
+	}
+	valid, flags := hdr.ValidSlices, uint32(0)
+	switch {
+	case reason != "" && !data:
+		valid = ga.TotalSlices
+	case reason == invalidIndexMismatch:
+		valid = 0
+	case !data && open != nil && open.idx == idx:
+		valid = max(valid, open.valid)
+	}
+	if reason != "" {
+		flags = mxl.GrainFlagInvalid
+	}
+	if err := ga.Commit(valid, flags); err != nil {
+		return grainCommit{}, fmt.Errorf("Commit(%d): %w", idx, err)
+	}
+	if !data && valid < ga.TotalSlices {
+		if open != nil {
+			*open = partialGrain{idx: idx, valid: valid}
+		}
+		// The grain's payload is counted once, with its last batch.
+		return grainCommit{reason: reason}, nil
+	}
+	if open != nil {
+		*open = partialGrain{}
+	}
+	return grainCommit{bytes: uint64(ga.GrainSize), reason: reason, done: true}, nil
+}
+
+// grainCommit is what one commit of an arrived grain did.
+type grainCommit struct {
+	// bytes is the grain's payload, counted with the commit that
+	// completes it.
+	bytes uint64
+	// reason says why the grain was committed invalid, empty for a
+	// valid one.
+	reason invalidReason
+	// done says the commit completed the grain.
+	done bool
+}
+
+// recordGrainCommit tells rec what one commit of grain idx did. An
+// arrival a sibling mirror already committed arrived all the same, and
+// counts for this mirror too.
+func recordGrainCommit(rec TargetRecorder, idx uint64, c grainCommit, err error) {
+	switch {
+	case errors.Is(err, errGrainAlreadyCommitted):
+		rec.Write(nil, idx, 1)
+	case err != nil:
+		rec.Write(err, idx, 1)
+	case c.reason == invalidFromSource:
+		rec.WriteContent(ContentInvalid, idx, 1)
+	case c.reason == invalidIndexMismatch:
+		rec.WriteContent(ContentMissing, idx, 1)
+	case c.done:
+		rec.Write(nil, idx, 1)
+	}
+}
+
+// recordSampleCommit tells rec what one commit of the count samples
+// ending at head did.
+func recordSampleCommit(rec TargetRecorder, head uint64, count int, err error) {
+	switch {
+	case err == nil, errors.Is(err, errSamplesAlreadyCommitted):
+		rec.Write(nil, head, uint64(count))
+	default:
+		rec.Write(err, head, 1)
+	}
+}
+
+// partialGrain is a video grain a flow's writer holds open and the
+// valid slices committed of it. The zero value raises no commit.
+type partialGrain struct {
+	idx   uint64
+	valid uint16
+}
+
+// runTargetSampleProgressLoop drives a libmxl-fabrics Target for a
+// continuous (audio) flow until ctx is canceled or ReadSamples reports
+// a non-recoverable error. It mirrors runTargetProgressLoop: the
+// blocking ReadSamples advances the libfabric event + completion
+// queues and parks until a run arrives. There is no
+// completeness gate here - TransferSamples carries no slice range, so
+// a run of samples arrives whole or not at all. For every run of
+// samples ReadSamples reports as arrived, commit does the
+// OpenSamples + Commit dance on the local FlowWriter so consumer
+// FlowReaders see them. Errors are classified as in the grain loop:
+// idle and transient are retried, anything else fires onFatal so the
+// reconciler rebuilds the fabric side.
+func runTargetSampleProgressLoop(
+	ctx context.Context,
+	done chan struct{},
+	readSamples ReadSamplesFunc,
+	commit CommitSamplesFunc,
+	onFatal func(),
+	tracker commitTracker,
+) {
+	defer close(done)
+	l := ctrl.Log.WithName("target-sample-progress")
+	const transientSleep = 1 * time.Millisecond
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		head, count, err := readSamples()
+		switch kind := classifyFabricError(err); {
+		case err == nil:
+			if err := commit(head, count); err != nil {
+				if !errors.Is(err, errSamplesAlreadyCommitted) {
+					l.Error(err, "commit received samples", "headIndex", head, "count", count)
+					break
+				}
+				// The arrival's range is already in the ring and the
+				// writer's head is past it, as when another mirror of
+				// this flow into this node committed it first. A retried
+				// commit can never succeed, and waiting on the arrival
+				// stops the loop reading the next one. The commit
+				// function has already counted the arrival if a
+				// sibling's commit vouches for it.
+				l.V(1).Info("dropping already-committed sample arrival",
+					"headIndex", head, "count", count, "error", err.Error())
+				break
+			}
+			if tracker != nil {
+				tracker.recordCommit(head, time.Now())
+			}
+		case kind == fabricIdle:
+			// The blocking read already waited out its timeout.
+		case kind == fabricTransient:
+			// Disturbed, not broken: the handles are still usable, so
+			// poll again instead of rebuilding the fabric side.
+			l.V(1).Info("ReadSamples disturbed, retrying",
+				"error", err.Error(), "class", kind.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(transientSleep):
+			}
+		default:
+			l.Error(err, "ReadSamples - target is no longer safe to poll, exiting loop",
+				"class", kind.String())
+			if onFatal != nil {
+				onFatal()
+			}
+			return
+		}
+	}
+}
+
+// commitArrivedSamples advances the local flow's head for a run of
+// samples whose payload was already filled in by the remote
+// initiator's RDMA write. OpenSamples returns a writable view aliasing
+// the ring; we leave the bytes untouched and Commit so the flow
+// metadata catches up, mirroring commitArrivedGrain.
+// The returned byte count is the committed run across all channels.
+// libmxl publishes no per-sample width, but the write access carries
+// the stride between two channels' ring buffers, which is the word
+// size times the buffer length the flow config states.
+// errSamplesAlreadyCommitted reports an arrival whose sample range
+// does not advance past the last committed head, which libmxl would
+// reject. The remote write carrying it has already landed in the
+// ring, so the range is stale, not lost -- the mirror's source
+// retransmitted or overlapped it, or a sibling mirror of the flow
+// committed it -- and the only work left is to consume the arrival so
+// the ingress can move on. sharedFlow.commitSamples decides it from
+// libmxl's rejection and the head it tracks, because libmxl answers
+// other misfits, such as a run longer than half the ring, with the same
+// invalid argument.
+var errSamplesAlreadyCommitted = errors.New("samples already committed")
+
+func commitArrivedSamples(writer *mxl.Writer, head uint64, count int) (uint64, error) {
+	sa, err := writer.OpenSamples(head, count)
+	if err != nil {
+		return 0, fmt.Errorf("OpenSamples(%d,%d): %w", head, count, err)
+	}
+	if err := sa.Commit(); err != nil {
+		return 0, fmt.Errorf("CommitSamples(%d,%d): %w", head, count, err)
+	}
+	bufferLength := uint64(writer.Config().Continuous.BufferLength)
+	if bufferLength == 0 {
+		return 0, nil
+	}
+	return uint64(count) * (sa.Stride / bufferLength) * sa.ChannelCount, nil
+}
+
+// errLocalWriter is why a target does not open on a flow a process on
+// this node already writes.
+var errLocalWriter = errors.New("a process on this node writes the flow")
+
+// prepareFlowDir readies the directory of flow id in domain for a
+// target writing def: a flow another process here writes is that
+// process's (errLocalWriter), and a directory of another geometry is
+// cleared. A flow the domain does not list, as a flow a target opens
+// usually is not yet, has neither and is not looked up: on mxlfs a
+// lookup of a flow directory that is not there waits for it to appear.
+func prepareFlowDir(domain, id, def string, retire func(domain, id string)) error {
+	listed, err := apimxlfs.Listed(domain, id+flowDirSuffix)
+	if err != nil {
+		return fmt.Errorf("%w: list domain: %w", errOpenWriterFailed, err)
+	}
+	if !listed {
+		return nil
+	}
+	dir := filepath.Join(domain, id+".mxl-flow")
+	n, err := foreignWriters(filepath.Join(dir, "data"))
+	if err != nil {
+		return fmt.Errorf("%w: check local writers: %w", errOpenWriterFailed, err)
+	}
+	if n > 0 {
+		return errLocalWriter
+	}
+	return clearOtherGeometry(dir, def, retire)
+}
+
+// foreignWriters is flowlocks.ForeignWriters and flowWriters
+// flowlocks.Writers; tests replace them.
+var (
+	foreignWriters = flowlocks.ForeignWriters
+	flowWriters    = flowlocks.Writers
+)
+
+// errOtherGeometry is why a target does not open yet on a directory
+// laid out in another geometry that a writer here still holds.
+var errOtherGeometry = errors.New("the flow directory here has another geometry and a writer still holds it")
+
+// clearOtherGeometry removes the flow directory dir when it was laid out
+// from a definition of another geometry than def. libmxl opens a flow
+// that exists as it is, so the target would otherwise write the flow
+// into a ring of the old layout. A placeholder held there is retired
+// first; a directory another writer still holds is left, and the open
+// fails until it is released.
+func clearOtherGeometry(dir, def string, retire func(domain, id string)) error {
+	onDisk, err := os.ReadFile(filepath.Join(dir, "flow_def.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err == nil && placeholder.SameGeometry(onDisk, []byte(def)) {
+		return nil
+	}
+	return clearFlowDir(dir, retire, errOtherGeometry)
+}
+
+// errOtherHints is why a target does not open yet on an audio flow
+// created with other batch size hints that a writer here still holds.
+var errOtherHints = errors.New("the flow here has other batch size hints and a writer still holds it")
+
+// clearFlowDir removes the flow directory dir after retiring a
+// placeholder held there, or returns held when another writer still
+// holds it.
+func clearFlowDir(dir string, retire func(domain, id string), held error) error {
+	domain, id := filepath.Dir(dir), strings.TrimSuffix(filepath.Base(dir), ".mxl-flow")
+	if retire != nil {
+		retire(domain, id)
+	}
+	// Closing the last writer deletes the flow, as retiring a placeholder
+	// or closing the target's own writer before this does, and on mxlfs a
+	// lookup of the deleted flow would wait for it to come back.
+	listed, err := apimxlfs.Listed(domain, id+flowDirSuffix)
+	if err != nil {
+		return fmt.Errorf("list %s: %w", domain, err)
+	}
+	if !listed {
+		return nil
+	}
+	n, err := flowWriters(filepath.Join(dir, "data"))
+	if err != nil {
+		return fmt.Errorf("check writers of %s: %w", dir, err)
+	}
+	if n > 0 {
+		return held
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("remove %s: %w", dir, err)
+	}
+	return nil
+}
+
+// replaceOtherGeometry closes the live target of key when the flow's
+// definition has since changed geometry: the producer came back in
+// another layout, and the ring the target registered can only take the
+// old one. The open that follows lays the flow out anew. Geometry is
+// checked on mxlfs only. On any domain an audio target is also replaced
+// when the origin's batch size hints have changed, since its
+// bounce-buffer entries hold one batch of the old sync hint.
+func (r *TargetReconciler) replaceOtherGeometry(ctx context.Context, key types.NamespacedName, flowName string) {
+	r.mu.Lock()
+	entry := r.targets[key]
+	r.mu.Unlock()
+	if entry == nil || entry.def == "" {
+		return
+	}
+	var flow mxlv1alpha1.MxlFlow
+	if err := r.Get(ctx, types.NamespacedName{Name: flowName}, &flow); err != nil || len(flow.Spec.Definition.Raw) == 0 {
+		return
+	}
+	switch {
+	case r.Retire != nil && !placeholder.SameGeometry([]byte(entry.def), flow.Spec.Definition.Raw):
+		log.FromContext(ctx).Info("flow changed geometry; replacing the target", "flow", flowName)
+	case placeholder.HintsOf(&flow).Differ(entry.cfg):
+		log.FromContext(ctx).Info("flow changed batch size hints; replacing the target", "flow", flowName)
+	default:
+		return
+	}
+	r.closeEntry(key, r.localFlowDisposition(ctx, flowName))
+}
+
+// flowIDFromDef reads the id a flow definition carries.
+func flowIDFromDef(def string) (string, bool) {
+	var v struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal([]byte(def), &v) != nil || v.ID == "" {
+		return "", false
+	}
+	return strings.ToLower(v.ID), true
+}
+
+// StopFlow tears down every target writing flow id in the domain at
+// directory domain, leaving the flow in place: a local writer has taken
+// it over.
+func (r *TargetReconciler) StopFlow(domain, id string) {
+	r.mu.Lock()
+	var keys []types.NamespacedName
+	for key, e := range r.targets {
+		if e.handles != nil && e.handles.DomainPath() == domain && strings.EqualFold(e.flowID, id) {
+			keys = append(keys, key)
+		}
+	}
+	r.mu.Unlock()
+	for _, key := range keys {
+		r.closeEntry(key, keepFlow)
+	}
+}
+
+// closeEntry drops a mirror from the live set and tears its handles
+// down, reporting whether the teardown completed within the grace. An
+// entry that was not live counts as torn down.
+func (r *TargetReconciler) closeEntry(key types.NamespacedName, disp flowDisposition) bool {
+	r.mu.Lock()
+	entry := r.targets[key]
+	delete(r.targets, key)
+	delete(r.attempts, key)
+	r.mu.Unlock()
+	if entry == nil {
+		return true
+	}
+	return closeTargetHandles(entry, disp, r.teardownGrace())
+}
+
+// localFlowDisposition decides what a teardown should do with the
+// local flow. A flow whose published Origin location names this node
+// belongs to a local producer: the mirror filled that directory until
+// the producer took it over, and offering it for deletion would take
+// the producer's flow with it.
+//
+// A lookup failure answers keepFlow. Reclaiming a mirror copy late
+// costs disk on one node until the next teardown; removing a live
+// producer's flow costs the flow.
+func (r *TargetReconciler) localFlowDisposition(ctx context.Context, flowName string) flowDisposition {
+	var flow mxlv1alpha1.MxlFlow
+	if err := r.Get(ctx, types.NamespacedName{Name: flowName}, &flow); err != nil {
+		if apierrors.IsNotFound(err) {
+			return dropFlow
+		}
+		return keepFlow
+	}
+	for _, loc := range flow.Status.Locations {
+		if loc.NodeName == r.NodeName && loc.Phase == mxlv1alpha1.MxlFlowLocationOrigin {
+			return keepFlow
+		}
+	}
+	return dropFlow
+}
+
+// dispatchRecovery routes the stuck-handshake watchdog's spawn
+// through the recoverFn seam when set, falling back to the cgo-
+// dependent recoverFromFatalError in production. The runTargetProgressLoop
+// onFatal callback continues to invoke recoverFromFatalError
+// directly: that path only fires on a fatal ReadGrain return, which
+// the tests cannot reach without real libmxl-fabrics anyway.
+func (r *TargetReconciler) dispatchRecovery(key types.NamespacedName) {
+	if r.recoverFn != nil {
+		r.recoverFn(key)
+		return
+	}
+	r.recoverFromFatalError(key)
+}
+
+// recoverFromFatalError rebuilds the libmxl-fabrics side of a mirror
+// whose Target died asynchronously, keeping the mxl.Writer alive so
+// consumer FlowReaders stay valid across the recovery. The new
+// descriptor is published (MxlFlowMirrorTarget and the hash in
+// mirror.status) so the source side picks up the rotation through its
+// existing watch.
+//
+// The TargetInfo publish is part of the rebuild's success criteria,
+// not an afterthought: a source initiator holding the pre-rebuild
+// address keeps posting against an endpoint nobody answers, which
+// wedges its send queue until it is reopened. A publish that cannot
+// be completed therefore drops the entry rather than returning with
+// a live fabric side the source will never reach, and the next
+// Reconcile rebuilds target and publish together.
+//
+// Must be invoked from a goroutine other than the progress loop
+// itself: we wait on the loop's done channel before touching the
+// entry's resources.
+func (r *TargetReconciler) recoverFromFatalError(key types.NamespacedName) {
+	l := ctrl.Log.WithName("target-recover").WithValues("mirror", key)
+
+	r.mu.Lock()
+	entry := r.targets[key]
+	r.mu.Unlock()
+	if entry == nil {
+		return
+	}
+
+	// One recovery is one attempt against the shared budget, whoever
+	// spawned it: the watchdog adds nothing of its own, so a loop that
+	// dies fatally on every rebuild runs out here rather than cycling
+	// forever. recordCommit resets the budget once a fresh commit
+	// lands, so only consecutive failures accumulate.
+	if attempts := entry.recoveryAttempts.Add(1); attempts > maxStuckRebuilds {
+		l.Info("fatal recovery cap reached; dropping entry",
+			"attempts", attempts)
+		r.dropFailedEntry(key, entry)
+		return
+	}
+
+	// Park the flusher: a Degraded transition published while the
+	// fabric side is being rebuilt would race the Materializing write
+	// below and oscillate the phase under load.
+	entry.recovering.Store(true)
+	defer entry.recovering.Store(false)
+
+	// Cancel the previous progress loop before waiting on its done
+	// channel. The onFatal caller has already exited the loop, so the
+	// cancel is a no-op for that path. The stuck-handshake watchdog
+	// caller has not: ReadGrain keeps reporting ErrNotReady on a wedge
+	// that no fatal signal will resolve, so without the explicit cancel
+	// the wait below would block forever and pin entry.recovering=true.
+	// The flusher would then skip every subsequent tick, no further
+	// recovery would ever spawn, and the cap branch could never fire.
+	//
+	// The wait is bounded for the same reason the cancel is explicit: a
+	// loop parked inside libmxl-fabrics never returns, and waiting on
+	// it forever pins recovering=true, which is exactly the state this
+	// is trying to leave. On a timeout the old loop still owns the
+	// fabric handles, so the rebuild is abandoned rather than pulled
+	// out from under it; recoveryAttempts still counts the try, so the
+	// watchdog's cap retires the entry after maxStuckRebuilds of them.
+	if !entry.stopProgressLoop(r.teardownGrace()) {
+		l.Info("progress loop did not exit; skipping fabric-side rebuild",
+			"grace", r.teardownGrace())
+		return
+	}
+
+	// Tear down the fabric side; KEEP the writer so the flow file
+	// on disk and consumer FlowReader handles stay valid.
+	//
+	// Taken out from under lifecycle: a teardown that lands here owns
+	// the handles instead, and closing them from both sides is a
+	// double free.
+	entry.lifecycle.Lock()
+	if entry.closed {
+		entry.lifecycle.Unlock()
+		return
+	}
+	oldInfo, oldTarget := entry.info, entry.target
+	writer, handles, provider, want := entry.writer, entry.handles, entry.provider, entry.boundInterface
+	entry.info, entry.target, entry.infoStr = nil, nil, ""
+	entry.lifecycle.Unlock()
+
+	if oldInfo != nil {
+		_ = oldInfo.Close()
+	}
+	if oldTarget != nil {
+		_ = oldTarget.Close()
+	}
+
+	// Publish Materializing so observers see the in-flight rebuild.
+	// The flusher flips Phase back to Ready on the first commit the
+	// new progress loop records.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entry.phaseMu.Lock()
+	if entry.dropped {
+		entry.phaseMu.Unlock()
+		return
+	}
+	if mirror, err := r.fetchMirror(ctx, key); err != nil {
+		if !apierrors.IsNotFound(err) {
+			l.Error(err, "get mirror during recovery")
+		}
+	} else {
+		// A repoint can have moved the mirror onto another fabric
+		// since the fabric side last opened; the source dials the one
+		// spec.provider names now.
+		if p, err := providerForSetup(mirror); err == nil {
+			provider = p
+		}
+		// The same for a placement moved onto another interface. An
+		// unplaced mirror keeps the interface it had.
+		if w := placedInterface(mirror.Spec.Placement, true); w != "" {
+			want = w
+		}
+		if mirror.Status.Phase != mxlv1alpha1.MxlFlowMirrorMaterializing {
+			if err := r.applyTargetStatus(ctx, mirror, mxlv1alpha1.MxlFlowMirrorMaterializing, nil); err != nil && !apierrors.IsNotFound(err) {
+				l.Error(err, "mark Materializing during recovery")
+			}
+		}
+	}
+	entry.phaseMu.Unlock()
+
+	target, info, s, bound, err := r.openFabricSideDispatch(handles, writer, provider, want)
+	if err != nil {
+		l.Error(err, "rebuild fabric side")
+		// Drop the entry so the next Reconcile rebuilds from scratch
+		// (closing the writer too, which will invalidate readers).
+		r.mu.Lock()
+		delete(r.targets, key)
+		r.mu.Unlock()
+		if w := entry.abandon(); w != nil {
+			_ = w.Close()
+		}
+		return
+	}
+	if !r.startProgressLoop(entry, key, target, info, s) {
+		// Torn down while the fabric side was being rebuilt. The
+		// teardown has already passed this entry by, so release what
+		// this rebuild opened rather than leaving a loop driving a
+		// mirror nothing will ever cancel again.
+		l.Info("mirror torn down during rebuild; releasing the fabric side it opened")
+		if info != nil {
+			_ = info.Close()
+		}
+		if target != nil {
+			_ = target.Close()
+		}
+		return
+	}
+	r.mu.Lock()
+	entry.lifecycle.Lock()
+	entry.provider = provider
+	entry.boundInterface = bound
+	entry.lifecycle.Unlock()
+	r.mu.Unlock()
+
+	mirror, err := r.fetchMirror(ctx, key)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			l.Error(err, "get mirror during recovery")
+		}
+		// The mirror is gone or unreadable: nothing to publish the
+		// fresh TargetInfo to, so the fabric side just opened will
+		// never be dialed. Drop the entry rather than stranding it.
+		r.dropFailedEntry(key, entry)
+		return
+	}
+	// The rebuilt fabric side has a fresh descriptor; the source side
+	// picks the rotation up through its watch on this field. A source
+	// still holding the pre-rebuild address posts against an endpoint
+	// nobody answers and its send queue never drains, so the publish
+	// is the rebuild's success criteria: on failure the entry drops
+	// and the next Reconcile rebuilds fabric side and publish together.
+	if err := r.applyTargetInfo(ctx, mirror, s, entry.syncHint(), bound); err != nil {
+		l.Error(err, "publish rebuilt TargetInfo")
+		r.dropFailedEntry(key, entry)
+		return
+	}
+	entry.phaseMu.Lock()
+	if entry.dropped {
+		entry.phaseMu.Unlock()
+		return
+	}
+	err = r.applyTargetStatus(ctx, mirror, mxlv1alpha1.MxlFlowMirrorReady, nil)
+	entry.phaseMu.Unlock()
+	if err != nil {
+		l.Error(err, "publish rebuilt status")
+		r.dropFailedEntry(key, entry)
+		return
+	}
+	l.Info("rebuilt fabric side after fatal read")
+}
+
+// dropFailedEntry removes an entry whose fabric side cannot serve its
+// mirror: the recovery cap is spent, the rebuild failed, or the
+// rebuilt TargetInfo could not be published. It publishes Failed so
+// an operator sees a dead state instead of whatever the flusher last
+// wrote, tears the entry down the way the recovery failure path does
+// (the writer closes too, invalidating consumer FlowReaders), and
+// wakes the next Reconcile through the status write so the whole
+// target side is rebuilt from scratch rather than left in memory
+// with nothing driving it.
+//
+// Not closeEntry: the flusher must not be waited on from here when
+// this runs on the flusher goroutine's own spawn chain. The
+// flusher's cap branch already tears down without waiting; this path
+// matches it for every other caller.
+func (r *TargetReconciler) dropFailedEntry(key types.NamespacedName, entry *targetEntry) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	entry.phaseMu.Lock()
+	entry.dropped = true
+	if mirror, err := r.fetchMirror(ctx, key); err == nil {
+		_ = r.applyTargetStatus(ctx, mirror, mxlv1alpha1.MxlFlowMirrorFailed, &metav1.Condition{
+			Type:    mxlv1alpha1.ConditionTypeTargetProgress,
+			Status:  metav1.ConditionFalse,
+			Reason:  ReasonStuckHandshakeCapReached,
+			Message: fmt.Sprintf("fabric side unrecoverable after %d attempts", maxStuckRebuilds),
+		})
+	}
+	entry.phaseMu.Unlock()
+	r.mu.Lock()
+	if r.targets[key] == entry {
+		delete(r.targets, key)
+	}
+	r.mu.Unlock()
+	// The progress loop must release its libmxl handles before the
+	// writer closes underneath it. A loop parked inside libmxl-fabrics
+	// never returns, so the wait is bounded and a loop that outlasts
+	// the grace keeps the writer: an orphaned handle beats a double
+	// free.
+	if !entry.stopProgressLoop(r.teardownGrace()) {
+		entry.releaseRing()
+		return
+	}
+	if writer := entry.abandon(); writer != nil {
+		_ = writer.Close()
+	}
+}
+
+// fetchMirror reads the freshest cached MxlFlowMirror so the SSA
+// payload built from it carries the current Generation. Status writes
+// must never reuse a stale Generation: the operator's
+// observedGeneration gate depends on it being current.
+func (r *TargetReconciler) fetchMirror(ctx context.Context, key types.NamespacedName) (*mxlv1alpha1.MxlFlowMirror, error) {
+	var mirror mxlv1alpha1.MxlFlowMirror
+	if err := r.Get(ctx, key, &mirror); err != nil {
+		return nil, err
+	}
+	return &mirror, nil
+}
+
+// flowDisposition says what should happen to the local flow when a
+// target entry's writer is given up.
+type flowDisposition bool
+
+const (
+	// dropFlow offers the flow for deletion. libmxl removes it when
+	// this writer turns out to be its last holder, which is what
+	// reclaims a mirror's copy once nothing needs it.
+	dropFlow flowDisposition = false
+	// keepFlow gives the writer up and leaves the flow in place. Used
+	// wherever something other than this entry owns the flow: another
+	// entry on this node, or a local producer that has taken over the
+	// flow the mirror was filling.
+	keepFlow flowDisposition = true
+)
+
+// closeTargetHandles stops an entry's flusher and progress loop and
+// releases the libmxl handles they were driving, reporting whether the
+// goroutines actually exited.
+//
+// The entry's handles are taken under lifecycle in one step, so a
+// recovery running concurrently either sees an entry that is still
+// live and owns its handles, or one that is closed and owns none.
+//
+// The waits are bounded by grace, and the handles are released only if
+// both goroutines returned: freeing a handle underneath a loop still
+// polling it faults inside cgo. A loop that misses the grace period
+// therefore keeps what it is using and the entry is abandoned instead,
+// which leaks one target and one writer on a node whose fabric is
+// already broken. That is the deliberate trade: the alternative is an
+// unbounded wait on a goroutine that is not coming back, and every
+// caller of this is on the critical path of a deletion or a rebuild.
+func closeTargetHandles(e *targetEntry, disp flowDisposition, grace time.Duration) bool {
+	e.lifecycle.Lock()
+	if e.closed {
+		e.lifecycle.Unlock()
+		return true
+	}
+	e.closed = true
+	cancel, done := e.cancel, e.done
+	flusherCancel, flusherDone := e.flusherCancel, e.flusherDone
+	info, target, writer := e.info, e.target, e.writer
+	e.info, e.target, e.writer = nil, nil, nil
+	e.lifecycle.Unlock()
+	defer e.releaseRing()
+
+	if flusherCancel != nil {
+		flusherCancel()
+	}
+	if cancel != nil {
+		cancel()
+	}
+	if !waitClosed(flusherDone, grace) || !waitClosed(done, grace) {
+		return false
+	}
+
+	if info != nil {
+		_ = info.Close()
+	}
+	if target != nil {
+		_ = target.Close()
+	}
+	if writer != nil {
+		if disp == keepFlow {
+			_ = writer.Detach()
+		} else {
+			_ = writer.Close()
+		}
+	}
+	return true
+}
+
+// applyTargetInfo publishes a new descriptor: first into the mirror's
+// MxlFlowMirrorTarget, then its hash into status.targetInfoHash, so a
+// source that sees the hash finds the object it names or one about to
+// reach its cache. Called only where a descriptor is produced - the
+// initial open and each fabric-side rebuild - so an unchanged
+// descriptor costs nothing for the life of the mirror.
+// targetMaxSyncBatchSizeHint, the sync hint of the writer the
+// descriptor serves, goes in the same payload, so the source never
+// reads one without the other.
+//
+// Owning the field alone is what makes that safe. SSA releases what a
+// field manager omits, but only that manager's claim: progress payloads
+// written under targetFieldOwner never mention targetInfoHash, so they
+// cannot release a claim they never held. The same manager wrote
+// status.targetInfo before it was removed, so the first apply without
+// it releases that claim and the apiserver drops the field.
+//
+// targetInterface, the address the descriptor's endpoint is bound to,
+// goes in the same payload for the same reason.
+func (r *TargetReconciler) applyTargetInfo(ctx context.Context, mirror *mxlv1alpha1.MxlFlowMirror, info string, syncHint uint32, bound string) error {
+	if err := applyMirrorTarget(ctx, r.Client, mirror, info); err != nil {
+		return err
+	}
+	patch := &unstructured.Unstructured{}
+	patch.SetGroupVersionKind(mxlv1alpha1.GroupVersion.WithKind("MxlFlowMirror"))
+	patch.SetNamespace(mirror.Namespace)
+	patch.SetName(mirror.Name)
+	status := map[string]any{"targetInfoHash": mxlv1alpha1.TargetInfoHash(info)}
+	if syncHint > 0 {
+		status["targetMaxSyncBatchSizeHint"] = int64(syncHint)
+	}
+	if bound != "" {
+		status["targetInterface"] = bound
+	}
+	if err := unstructured.SetNestedField(patch.Object, status, "status"); err != nil {
+		return fmt.Errorf("build targetInfoHash payload: %w", err)
+	}
+	return r.Status().Patch(ctx, patch, client.Apply,
+		client.FieldOwner(targetInfoFieldOwner),
+		client.ForceOwnership,
+	)
+}
+
+// applyTargetStatus writes mirror.status via server-side apply with
+// FieldOwner=mxl-target-gateway. It is the only path that mutates
+// status on this reconciler, so it is where cond takes the live
+// condition's LastTransitionTime while its status holds (callers leave
+// the field unset) and where every write stamps observedGeneration off
+// the freshly-cached object.
+//
+// cond is optional; nil omits the conditions key from the SSA payload
+// so the manager does not claim ownership of a field it has nothing to
+// say about. status.targetInfoHash is deliberately absent:
+// applyTargetInfo owns it under its own field manager. The commit time
+// is never part of it; the target's heartbeat Lease carries it.
+//
+// targetAttemptCount is not optional: it rides on every payload
+// because SSA with a single FieldOwner releases ownership of a field
+// a later payload omits, and the apiserver then strips it. Sourcing
+// it from the live counter also keeps it honest - a write from any
+// path (flusher, recovery, teardown) reports the current failure run,
+// which is zero for as long as the target is open.
+func (r *TargetReconciler) applyTargetStatus(
+	ctx context.Context,
+	mirror *mxlv1alpha1.MxlFlowMirror,
+	phase mxlv1alpha1.MxlFlowMirrorPhase,
+	cond *metav1.Condition,
+) error {
+	patch := &unstructured.Unstructured{}
+	patch.SetGroupVersionKind(mxlv1alpha1.GroupVersion.WithKind("MxlFlowMirror"))
+	patch.SetNamespace(mirror.Namespace)
+	patch.SetName(mirror.Name)
+	r.mu.Lock()
+	attempts := r.attempts.count(client.ObjectKeyFromObject(mirror))
+	entry := r.targets[client.ObjectKeyFromObject(mirror)]
+	r.mu.Unlock()
+
+	// Every target-side status write lands here: the phase-only
+	// transitions, surfaceTargetFailure, the Failed path and the
+	// flusher's progress condition. Emitting from the funnel rather
+	// than from each caller is what stops a writer added later from
+	// silently skipping events, which is exactly how the first pass at
+	// this missed six of the seven.
+	key := client.ObjectKeyFromObject(mirror)
+	if cond != nil {
+		recordProgress(r.Recorder, key, cond.Type, cond.Reason, cond.Message)
+		c := r.published.carry(key, meta.FindStatusCondition(mirror.Status.Conditions, cond.Type), *cond)
+		cond = &c
+	}
+	if phase != "" && phase != mirror.Status.Phase {
+		recordPhase(r.Recorder, key, mirror.Status.Phase, phase)
+	}
+	status := map[string]any{
+		"phase":              string(phase),
+		"observedGeneration": mirror.Generation,
+		"targetAttemptCount": int64(attempts),
+	}
+	if cond != nil {
+		status["conditions"] = []any{map[string]any{
+			"type":               cond.Type,
+			"status":             string(cond.Status),
+			"reason":             cond.Reason,
+			"message":            cond.Message,
+			"lastTransitionTime": cond.LastTransitionTime.UTC().Format(time.RFC3339),
+		}}
+	}
+	if err := unstructured.SetNestedField(patch.Object, status, "status"); err != nil {
+		return fmt.Errorf("build SSA payload: %w", err)
+	}
+	if err := r.Status().Patch(ctx, patch, client.Apply,
+		client.FieldOwner(targetFieldOwner),
+		client.ForceOwnership,
+	); err != nil {
+		return err
+	}
+	if cond != nil {
+		r.published.written(key, *cond)
+	} else if entry != nil {
+		// A payload without the condition releases it. The flusher
+		// publishes it again on its next tick: a moving commit time
+		// does not write the status, so nothing else would before the
+		// next phase change.
+		entry.statusReleased.Store(true)
+	}
+	return nil
+}
+
+// surfaceTargetFailure publishes phase plus a TargetProgress=False
+// condition carrying the reason the target side could not be
+// established yet. Best-effort: a failed status write must not mask
+// the original error the caller returns/requeues on, so the result is
+// intentionally ignored. It exists so a target-open failure shows up
+// in MxlFlowMirror status (and `kubectl describe`) instead of the
+// mirror wedging silently at an empty phase -- the producer, the
+// consumer, and the cluster diagnostics only observe the CR, never the
+// gateway log. Only reached on the pre-Ready path (the Reconcile
+// fast-path returns earlier for a live, fresh, Ready mirror), so this
+// never demotes a healthy mirror.
+//
+// The phase is the caller's to choose: a failure that has just started
+// is still Materializing, one that has repeated past
+// maxTargetOpenAttempts is Degraded.
+func (r *TargetReconciler) surfaceTargetFailure(ctx context.Context, mirror *mxlv1alpha1.MxlFlowMirror, phase mxlv1alpha1.MxlFlowMirrorPhase, reason, message string) {
+	_ = r.applyTargetStatus(ctx, mirror, phase, &metav1.Condition{
+		Type:    mxlv1alpha1.ConditionTypeTargetProgress,
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: message,
+	})
+}
+
+// degradedAfter returns the configured grain-commit freshness window,
+// falling back to defaultDegradedAfter when unset.
+func (r *TargetReconciler) degradedAfter() time.Duration {
+	if r.DegradedAfter > 0 {
+		return r.DegradedAfter
+	}
+	return defaultDegradedAfter
+}
+
+// teardownGrace returns how long a teardown waits for the per-mirror
+// goroutines it cancelled, falling back to defaultTeardownGrace.
+func (r *TargetReconciler) teardownGrace() time.Duration {
+	if r.TeardownGrace > 0 {
+		return r.TeardownGrace
+	}
+	return defaultTeardownGrace
+}
+
+// stuckHandshakeAfter returns the configured silent-wedge timeout the
+// flusher uses to escalate a non-progressing target into recovery,
+// falling back to defaultStuckHandshakeAfter when unset.
+func (r *TargetReconciler) stuckHandshakeAfter() time.Duration {
+	if r.StuckHandshakeAfter > 0 {
+		return r.StuckHandshakeAfter
+	}
+	return defaultStuckHandshakeAfter
+}
+
+// flushInterval returns the configured per-mirror flusher tick,
+// falling back to defaultTargetFlushInterval when unset.
+func (r *TargetReconciler) flushInterval() time.Duration {
+	if r.FlushInterval > 0 {
+		return r.FlushInterval
+	}
+	return defaultTargetFlushInterval
+}
+
+// lastGrainFresh reports whether the target's heartbeat is within the
+// degraded window. A nil pointer (no heartbeat Lease, so no grain
+// committed since the gateway took the mirror up) counts as stale - the
+// fast-path must fall through so a fresh handshake gets a chance to
+// produce one.
+func (r *TargetReconciler) lastGrainFresh(t *time.Time) bool {
+	if t == nil {
+		return false
+	}
+	return time.Since(*t) < r.degradedAfter()
+}
+
+// targetProgressState is the TargetProgress condition + status
+// fields the per-mirror flusher publishes via server-side apply.
+type targetProgressState struct {
+	phase        mxlv1alpha1.MxlFlowMirrorPhase
+	status       metav1.ConditionStatus
+	reason       string
+	message      string
+	lastCommitAt *time.Time
+}
+
+// startFlusher launches the per-mirror status flusher. The flusher
+// ticks at r.flushInterval() and publishes TargetProgress only when
+// the observed phase has transitioned, so a steady-state mirror
+// produces zero status writes.
+//
+// A torn-down entry gets no flusher: it is gone from r.targets, so
+// nothing would ever cancel one started against it.
+func (r *TargetReconciler) startFlusher(key types.NamespacedName, entry *targetEntry) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	entry.lifecycle.Lock()
+	if entry.closed || entry.flusherCancel != nil {
+		entry.lifecycle.Unlock()
+		cancel()
+		return
+	}
+	entry.flusherCancel = cancel
+	entry.flusherDone = done
+	entry.lifecycle.Unlock()
+
+	go r.runFlusher(ctx, done, key, entry)
+}
+
+// runFlusher is the per-mirror status flusher loop. Tracks the most
+// recently observed state so a steady stream of grains does not
+// turn into a steady stream of API writes.
+//
+// `last` is updated *before* the publish call: a transient publish
+// failure leaves the next tick with a correct previous-state
+// reference, so a subsequent Ready->Degraded->Recovered transition
+// renders the correct reason even when an external observer races
+// the post-publish bookkeeping. A failed publish leaves the state
+// unsent, and the current state is published once the backoff allows,
+// whether or not it has changed since: a Degraded mirror's state stops
+// changing, so waiting for a change would leave a lost Degraded write
+// unpublished for as long as the mirror stays down.
+func (r *TargetReconciler) runFlusher(ctx context.Context, done chan struct{}, key types.NamespacedName, entry *targetEntry) {
+	defer close(done)
+	t := time.NewTicker(r.flushInterval())
+	defer t.Stop()
+
+	var last targetProgressState
+	var watch handshakeWatch
+	var retry publishBackoff
+	beat := heartbeat{side: mxlv1alpha1.MirrorSideTarget, owner: targetFieldOwner, mirror: key, holder: r.NodeName}
+	first, unsent := true, false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		// The recovery path owns Phase + Conditions while it rebuilds
+		// the fabric side. Skip the tick so the flusher's Degraded
+		// write does not race the recovery's Materializing publish.
+		// Its phase-only writes release TargetProgress, so the state is
+		// published again once it is done, changed or not: a moving
+		// commit time does not write the status.
+		if entry.statusReleased.Swap(false) {
+			unsent = true
+		}
+		if entry.recovering.Load() {
+			unsent = true
+			continue
+		}
+		// Stuck-handshake watchdog. Two wedge shapes need recovery:
+		//
+		// neverHandshook: a libmxl-fabrics target whose remote
+		// initiator never sent FI_CONNECTED keeps reporting
+		// ErrNotReady forever - the progress loop never raises
+		// onFatal, so recoverFromFatalError never fires, and the
+		// flusher would otherwise just oscillate between Ready and
+		// Degraded as time goes by. Spawn recovery when no commit has
+		// landed since the fabric side opened, the source is sending
+		// into it (its heartbeat postdates the open, or the
+		// source reports TransfersNotLanding), *and* either the
+		// stuck-handshake window has passed since the open or the
+		// shorter sending-into-silence window has passed since the
+		// source was first seen sending: zero commits alone cannot
+		// distinguish a wedged handshake from a flow whose producer
+		// simply is not sending.
+		// Without the source-activity gate an idle flow loops
+		// spawn->cap->drop->reopen forever - each reopen resets
+		// fabricOpenedAt, the window elapses again, and the cycle
+		// closes the writer (and every consumer FlowReader) every few
+		// seconds for as long as the producer stays quiet.
+		//
+		// postHandshakeWedge: the handshake succeeded and at least
+		// one grain committed, then the fabric side wedged silently.
+		// commits > commitsAtFabricOpen makes neverHandshook false
+		// forever, so it cannot catch this. Cross-side coordination
+		// via the source's heartbeat distinguishes a wedge ("source
+		// is sending but target is not committing") from a legitimately
+		// idle flow ("source is not sending either"); idle flows must
+		// not trigger recovery.
+		//
+		// A nil fabricOpenedAt guards entries that the flusher runs
+		// against without a real openTarget/recovery handoff (existing
+		// flusher tests construct bare targetEntry values and drive
+		// the flusher directly): the watchdog must not fire on an
+		// entry whose fabric side was never actually opened.
+		if r.wedged(ctx, key, entry, &watch) {
+			if entry.recoveryAttempts.Load() >= maxStuckRebuilds {
+				// Cap reached: rebuilds keep failing to attract a
+				// commit. Publish a terminal Phase=Failed so operators
+				// see an explicit dead state, tear down the entry the
+				// way recoverFromFatalError's failure path does, and
+				// exit the flusher. The next Reconcile rebuilds the
+				// entry from scratch through openTarget.
+				//
+				// closeEntry must NOT be called from here:
+				// closeTargetHandles waits on flusherDone and the
+				// flusher is the goroutine that closes it on return,
+				// so a closeEntry from this point would deadlock the
+				// flusher on its own done channel. The teardown below
+				// matches recoverFromFatalError's drop-entry exit
+				// shape: cancel progress loop, wait for done, delete
+				// from r.targets, close writer, return.
+				log.FromContext(ctx).Error(nil,
+					"stuck handshake; recovery cap reached, dropping entry",
+					"mirror", key,
+					"attempts", entry.recoveryAttempts.Load())
+				if mirror, err := r.fetchMirror(ctx, key); err == nil {
+					_ = r.applyTargetStatus(ctx, mirror, mxlv1alpha1.MxlFlowMirrorFailed, &metav1.Condition{
+						Type:    mxlv1alpha1.ConditionTypeTargetProgress,
+						Status:  metav1.ConditionFalse,
+						Reason:  ReasonStuckHandshakeCapReached,
+						Message: fmt.Sprintf("no commits in %s across %d rebuild attempts", r.stuckHandshakeAfter(), maxStuckRebuilds),
+					})
+				}
+				r.mu.Lock()
+				delete(r.targets, key)
+				r.mu.Unlock()
+				// Mirror recoverFromFatalError's ordering (target.go
+				// drop-entry exit): the progress loop must release its
+				// libmxl handles before Close runs underneath it. The
+				// wait is bounded for the same reason as every other
+				// teardown, and a loop that outlasts it keeps the
+				// writer rather than having it closed from under it.
+				if !entry.stopProgressLoop(r.teardownGrace()) {
+					log.FromContext(ctx).Info(
+						"stuck handshake cap: progress loop did not exit, abandoning libmxl handles",
+						"mirror", key, "grace", r.teardownGrace())
+					entry.releaseRing()
+					return
+				}
+				if writer := entry.abandon(); writer != nil {
+					// Invalidates consumer FlowReaders, matching
+					// recoverFromFatalError's failure exit.
+					_ = writer.Close()
+				}
+				return
+			}
+			if entry.recovering.CompareAndSwap(false, true) {
+				// CompareAndSwap, not Load+Store: two flusher ticks
+				// observing "not recovering" simultaneously would
+				// otherwise both spawn recoverFromFatalError on the
+				// same entry. CAS makes the spawn atomic. The
+				// goroutine clears recovering via the deferred
+				// Store(false) inside recoverFromFatalError.
+				//
+				// Re-check the wedge predicate after acquiring the
+				// gate: a progress-loop commit landing between the
+				// read above and the CAS would update commits +
+				// lastCommitAt and reset recoveryAttempts via
+				// recordCommit. Without the re-check the watchdog
+				// would still spawn a rebuild against an entry that
+				// just made progress, which both wastes the rebuild
+				// budget and would be visible as an extra
+				// recoveryAttempts bump after the reset. Re-fetching
+				// the mirror covers the post-handshake variant: a
+				// source heartbeat that lands in the same window
+				// must be observed before the spawn commits.
+				if !r.wedged(ctx, key, entry, &watch) {
+					entry.recovering.Store(false)
+					continue
+				}
+				// recoverFromFatalError counts the attempt: it owns
+				// the budget so the watchdog and a fatally-exited
+				// loop's onFatal spawn count against one shared cap
+				// instead of each other.
+				log.FromContext(ctx).Info("stuck handshake; triggering recovery",
+					"mirror", key, "attempt", entry.recoveryAttempts.Load()+1)
+				go r.dispatchRecovery(key)
+			}
+			// Skip the Degraded write this tick: publishing it would
+			// flap Ready->Degraded->Materializing->Ready around the
+			// rebuild. The watchdog and the would-be Degraded write
+			// fire on the same discriminator, so the recovery must
+			// take precedence.
+			continue
+		}
+		state := observedTargetState(entry, r.degradedAfter(), last)
+		// Nothing observed yet: avoid publishing a placeholder
+		// TargetProgress before the handshake has had a chance to
+		// hand any grain to the writer.
+		if state.reason == "" {
+			continue
+		}
+		if state.lastCommitAt != nil {
+			beat.renew(ctx, r.Client, *state.lastCommitAt, r.flushInterval())
+		}
+		if !first && !unsent && targetStateEqual(state, last) {
+			continue
+		}
+		last = state
+		first = false
+		now := time.Now()
+		if !retry.due(now) {
+			unsent = true
+			continue
+		}
+		if err := r.publishTargetProgress(ctx, key, state, entry); err != nil {
+			retry.failed(now, r.flushInterval())
+			unsent = true
+			ctrl.Log.WithName("target-flush").Error(err, "publish",
+				"mirror", key, "reason", state.reason, "retryIn", retry.wait)
+			continue
+		}
+		retry.succeeded()
+		unsent = false
+	}
+}
+
+// wedged reports whether the entry's fabric side shows either wedge
+// shape the flusher's watchdog recovers from; see runFlusher. The
+// watchdog asks it twice, before and after taking the recovery gate,
+// and both answers have to come from the same predicate: a re-check
+// that is stricter than the first look discards every spawn the
+// first look asks for.
+func (r *TargetReconciler) wedged(ctx context.Context, key types.NamespacedName, entry *targetEntry, w *handshakeWatch) bool {
+	openedAt := entry.fabricOpenedAt.Load()
+	if openedAt == nil {
+		return false
+	}
+	commits, atOpen := entry.commits.Load(), entry.commitsAtFabricOpen.Load()
+	if commits == atOpen {
+		mirror, err := r.fetchMirror(ctx, key)
+		if err != nil || !sourceIsDelivering(mirror, heartbeatAt(ctx, r.Client, mirror, mxlv1alpha1.MirrorSideSource), *openedAt) {
+			w.reset()
+			return false
+		}
+		since := w.sendingSince(*openedAt, time.Now())
+		return time.Since(*openedAt) > r.stuckHandshakeAfter() ||
+			time.Since(since) > r.sendingIntoSilenceAfter()
+	}
+	lastCommit := entry.lastCommitAt.Load()
+	if commits < atOpen || lastCommit == nil {
+		return false
+	}
+	mirror, err := r.fetchMirror(ctx, key)
+	if err != nil {
+		return false
+	}
+	sent := heartbeatAt(ctx, r.Client, mirror, mxlv1alpha1.MirrorSideSource)
+	return sent != nil && sent.Sub(*lastCommit) > r.stuckHandshakeAfter()
+}
+
+// handshakeWatch remembers, for the fabric side opened at openedAt,
+// the first flusher tick that saw the source sending into it. Only the
+// flusher goroutine touches it.
+type handshakeWatch struct {
+	openedAt time.Time
+	since    time.Time
+}
+
+func (w *handshakeWatch) reset() { *w = handshakeWatch{} }
+
+// sendingSince returns when the source was first seen sending into the
+// fabric side opened at openedAt, starting the count at now when this
+// is the first such tick or the fabric side has been opened again.
+func (w *handshakeWatch) sendingSince(openedAt, now time.Time) time.Time {
+	if w.since.IsZero() || !w.openedAt.Equal(openedAt) {
+		w.openedAt, w.since = openedAt, now
+	}
+	return w.since
+}
+
+func (r *TargetReconciler) sendingIntoSilenceAfter() time.Duration {
+	if r.SendingIntoSilenceAfter > 0 {
+		return r.SendingIntoSilenceAfter
+	}
+	return defaultSendingIntoSilenceAfter
+}
+
+// observedTargetState derives the TargetProgress state the flusher
+// should publish from the entry's atomics. previous is consulted so
+// a Degraded->Ready transition can publish ReasonRecovered instead
+// of ReasonHandshakeComplete, and so that Recovered stays sticky
+// across subsequent in-Ready ticks instead of churning back to
+// HandshakeComplete and clobbering the recovery signal.
+func observedTargetState(entry *targetEntry, degradedAfter time.Duration, previous targetProgressState) targetProgressState {
+	lastAt := entry.lastCommitAt.Load()
+	if lastAt == nil {
+		// Reconcile sets Phase=Ready the moment the fabric side opens,
+		// before any grain has arrived. Staying silent here leaves that
+		// optimistic Ready standing for the lifetime of a target that
+		// never receives one, which is what a mirror pointed at a
+		// departed source node looks like: Ready, no TargetProgress
+		// condition, no heartbeat. Once the open is older than the
+		// freshness window, report the absence for what it is.
+		openedAt := entry.fabricOpenedAt.Load()
+		if openedAt == nil || time.Since(*openedAt) < degradedAfter {
+			return targetProgressState{}
+		}
+		return targetProgressState{
+			phase:   mxlv1alpha1.MxlFlowMirrorDegraded,
+			status:  metav1.ConditionFalse,
+			reason:  mxlv1alpha1.ReasonNoGrains,
+			message: "no grain commits since the fabric side opened",
+		}
+	}
+	if time.Since(*lastAt) < degradedAfter {
+		reason := mxlv1alpha1.ReasonHandshakeComplete
+		message := "grain commits observed"
+		switch {
+		case previous.phase == mxlv1alpha1.MxlFlowMirrorDegraded:
+			reason = mxlv1alpha1.ReasonRecovered
+			message = "grain commits resumed after stall"
+		case previous.reason == mxlv1alpha1.ReasonRecovered:
+			// Stay sticky on Recovered: a flap back to
+			// HandshakeComplete would erase the "this mirror has
+			// recovered from a stall" signal that operators rely on.
+			reason = mxlv1alpha1.ReasonRecovered
+			message = previous.message
+		}
+		t := *lastAt
+		return targetProgressState{
+			phase:        mxlv1alpha1.MxlFlowMirrorReady,
+			status:       metav1.ConditionTrue,
+			reason:       reason,
+			message:      message,
+			lastCommitAt: &t,
+		}
+	}
+	t := *lastAt
+	return targetProgressState{
+		phase:        mxlv1alpha1.MxlFlowMirrorDegraded,
+		status:       metav1.ConditionFalse,
+		reason:       mxlv1alpha1.ReasonNoGrains,
+		message:      "no grain commits within freshness window",
+		lastCommitAt: &t,
+	}
+}
+
+// targetStateEqual reports whether two states would publish a status
+// an observer could tell apart. The commit time is not part of the
+// status: it is the target's heartbeat, which the flusher renews in the
+// target's heartbeat Lease, so a stuck gateway is still told from a
+// live one without rewriting the whole mirror every few seconds.
+func targetStateEqual(a, b targetProgressState) bool {
+	return a.phase == b.phase && a.status == b.status && a.reason == b.reason && a.message == b.message
+}
+
+// sameQuantum reports whether two progress timestamps are close enough
+// that republishing the later one would tell an observer nothing it
+// could act on. Grains commit far faster than any consumer of this
+// status reacts, so comparing at full resolution turns a steady flow
+// into one etcd write and one cluster-wide watch fan-out per tick.
+func sameQuantum(a, b time.Time) bool {
+	d := a.Sub(b)
+	if d < 0 {
+		d = -d
+	}
+	return d < statusQuantum
+}
+
+// publishTargetProgress writes the TargetProgress condition and Phase
+// onto the MxlFlowMirror's status. The mirror is re-fetched from the
+// cache on every call so the SSA payload stamps the current Generation
+// rather than a value captured at flusher start. TargetInfoHash is not
+// part of it: applyTargetInfo owns that field under its own manager.
+func (r *TargetReconciler) publishTargetProgress(ctx context.Context, key types.NamespacedName, state targetProgressState, entry *targetEntry) error {
+	mirror, err := r.fetchMirror(ctx, key)
+	if err != nil {
+		return fmt.Errorf("get mirror for status flush: %w", err)
+	}
+	cond := metav1.Condition{
+		Type:    mxlv1alpha1.ConditionTypeTargetProgress,
+		Status:  state.status,
+		Reason:  state.reason,
+		Message: state.message,
+	}
+	return r.applyTargetStatus(ctx, mirror, state.phase, &cond)
+}
+
+// SetupWithManager wires the reconciler into the controller-runtime
+// Manager.
+func (r *TargetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.targets == nil {
+		r.targets = make(map[types.NamespacedName]*targetEntry)
+	}
+	if r.attempts == nil {
+		r.attempts = make(attemptTable[targetOpenInputs])
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&mxlv1alpha1.MxlFlowMirror{}).
+		Named("mxlflowmirror-target").
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: targetConcurrentReconciles,
+		}).
+		Complete(r)
+}

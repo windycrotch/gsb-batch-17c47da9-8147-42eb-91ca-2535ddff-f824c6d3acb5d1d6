@@ -1,0 +1,828 @@
+package intent
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/qvest-digital/mxl-k8s/agent/internal/podlookup"
+	mxlv1alpha1 "github.com/qvest-digital/mxl-k8s/api/v1alpha1"
+)
+
+const flowID = "11111111-2222-3333-4444-555555555555"
+
+func newScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(mxlv1alpha1.AddToScheme(s))
+	return s
+}
+
+func TestFlowIDFromPath(t *testing.T) {
+	cases := []struct {
+		name   string
+		domain string
+		path   string
+		want   string
+		ok     bool
+	}{
+		{
+			name:   "canonical",
+			domain: "/run/mxl/domain",
+			path:   "/run/mxl/domain/" + flowID + ".mxl-flow/flow_def.json",
+			want:   flowID,
+			ok:     true,
+		},
+		{
+			name:   "trailing slash on domain still matches",
+			domain: "/run/mxl/domain/",
+			path:   "/run/mxl/domain/" + flowID + ".mxl-flow/flow_def.json",
+			want:   flowID,
+			ok:     true,
+		},
+		{
+			name:   "different domain root rejected",
+			domain: "/run/mxl/domain",
+			path:   "/run/other/" + flowID + ".mxl-flow/flow_def.json",
+			ok:     false,
+		},
+		{
+			name:   "access file under flow directory accepted",
+			domain: "/run/mxl/domain",
+			path:   "/run/mxl/domain/" + flowID + ".mxl-flow/access",
+			want:   flowID,
+			ok:     true,
+		},
+		{
+			name:   "flow directory itself accepted",
+			domain: "/run/mxl/domain",
+			path:   "/run/mxl/domain/" + flowID + ".mxl-flow",
+			want:   flowID,
+			ok:     true,
+		},
+		{
+			name:   "deeper path under flow directory accepted",
+			domain: "/run/mxl/domain",
+			path:   "/run/mxl/domain/" + flowID + ".mxl-flow/grains/00001",
+			want:   flowID,
+			ok:     true,
+		},
+		{
+			name:   "missing flow suffix rejected",
+			domain: "/run/mxl/domain",
+			path:   "/run/mxl/domain/" + flowID + "/flow_def.json",
+			ok:     false,
+		},
+		{
+			name:   "empty id rejected",
+			domain: "/run/mxl/domain",
+			path:   "/run/mxl/domain/.mxl-flow/flow_def.json",
+			ok:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := FlowIDFromPath(tc.domain, tc.path)
+			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestMirrorName_MatchesOperatorAlgorithm(t *testing.T) {
+	// The operator and the agent must converge on identical names so
+	// the gateway sees exactly one MxlFlowMirror per (flow, target
+	// node). Pin the result here so any drift in either codepath
+	// surfaces with a failed test.
+	cases := []struct {
+		flowID string
+		target string
+		want   string
+	}{
+		{flowID, "worker-1", flowID + "--worker-1"},
+		{"ABCDABCD-1234-5678-9ABC-DEF012345678", "Worker-A",
+			"abcdabcd-1234-5678-9abc-def012345678--worker-a"},
+		{flowID, "ip-10.0.0.1.eu-central-1.compute",
+			flowID + "--ip-10-0-0-1-eu-central-1-compute"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			got := MirrorName(tc.flowID, tc.target)
+			assert.Equal(t, tc.want, got)
+			errs := validation.IsDNS1123Subdomain(got)
+			assert.Empty(t, errs, "MirrorName output not DNS-1123: %v", errs)
+		})
+	}
+}
+
+func TestMaterialize_LocalFlow_ReturnsImmediately(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	d := &Dispatcher{
+		Client:      c,
+		Resolver:    &podlookup.Resolver{Client: c, NodeName: "n1"},
+		DomainPath:  "/run/mxl/domain",
+		NodeName:    "n1",
+		FlowChecker: func(string) bool { return true },
+	}
+
+	err := d.Materialize(context.Background(), 42, "/run/mxl/domain/"+flowID+".mxl-flow/flow_def.json")
+	require.NoError(t, err,
+		"a flow already materialized on this node must not trigger a mirror "+
+			"creation; the shim's caller only needs the file to exist before it retries")
+}
+
+func TestMaterialize_InvalidPath_ErrorsWithoutSideEffects(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	d := &Dispatcher{
+		Client:      c,
+		Resolver:    &podlookup.Resolver{Client: c, NodeName: "n1"},
+		DomainPath:  "/run/mxl/domain",
+		NodeName:    "n1",
+		FlowChecker: func(string) bool { return false },
+	}
+
+	err := d.Materialize(context.Background(), 42, "/etc/passwd")
+	require.Error(t, err)
+
+	var list mxlv1alpha1.MxlFlowMirrorList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Empty(t, list.Items,
+		"a malformed path must never lead to a mirror Create; if it does, "+
+			"a buggy shim can spam unrelated mirrors into the cluster")
+}
+
+// waitingReader is a reader blocked in its open until the request is
+// answered or its own wait runs out; once gone, its pid resolves to
+// nothing.
+type waitingReader struct {
+	pod  *corev1.Pod
+	gone atomic.Bool
+}
+
+func (r *waitingReader) PodForPID(context.Context, int32) (*corev1.Pod, error) {
+	if r.gone.Load() {
+		return nil, os.ErrNotExist
+	}
+	return r.pod, nil
+}
+
+// The refusal for a flow no MxlFlow names must name the missing flow
+// even when the reader is already gone: a pod lookup error in its place
+// hides that the flow id matches nothing in the cluster, which is the
+// only reason no mirror can come.
+func TestMaterialize_MissingFlow_ReportedOverPodLookup(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).Build()
+	reader := &waitingReader{}
+	reader.gone.Store(true)
+	d := &Dispatcher{
+		Client:      c,
+		Resolver:    reader,
+		DomainPath:  "/run/mxl/domain",
+		NodeName:    "n1",
+		FlowChecker: func(string) bool { return false },
+	}
+
+	err := d.Materialize(context.Background(), 42, "/run/mxl/domain/"+flowID+".mxl-flow/data")
+	require.Error(t, err)
+	assert.Equal(t, "MxlFlow not yet known cluster-wide", err.Error(),
+		"a flow with no MxlFlow at all is not the same as one whose "+
+			"Origins are all stale; the shim is told which")
+}
+
+// On an mxlfs mounted with wait=, looking up a missing flow name waits
+// for the flow as long as the reader's own open does, so a local check
+// that waits returns only once the reader has given up and its pid
+// resolves to nothing. The pod is resolved before any such check, or a
+// reader that gives up is never mirrored to.
+func TestMaterialize_ResolvesPodBeforeLocalCheck(t *testing.T) {
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+		Status: mxlv1alpha1.MxlFlowStatus{Locations: []mxlv1alpha1.MxlFlowLocation{
+			{NodeName: "n-src", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+		}},
+	}
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}, &mxlv1alpha1.MxlFlowMirror{}).
+		WithObjects(flow).Build()
+	reader := &waitingReader{pod: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "media", Name: "viewer", UID: "uid-viewer"}}}
+	d := &Dispatcher{
+		Client:     c,
+		Resolver:   reader,
+		DomainPath: "/run/mxl/domain",
+		NodeName:   "n-target",
+		Provider:   mxlv1alpha1.ProviderTCP,
+		FlowChecker: func(string) bool {
+			reader.gone.Store(true)
+			return false
+		},
+		MaterializeTimeout: 50 * time.Millisecond,
+	}
+
+	err := d.Materialize(context.Background(), 42, "/run/mxl/domain/"+flowID+".mxl-flow/data")
+	require.Error(t, err, "no gateway fills the mirror here, so the wait times out")
+	assert.NotContains(t, err.Error(), "pod lookup")
+
+	var list mxlv1alpha1.MxlFlowMirrorList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Len(t, list.Items, 1, "the reader's mirror is made although it gave up meanwhile")
+}
+
+// The local check finds a flow by listing the domain, so a flow that is
+// there counts and one that is not does not, whichever directory holds
+// the domain.
+func TestFlowExistsLocally_ListsTheDomain(t *testing.T) {
+	domain := t.TempDir()
+	d := &Dispatcher{DomainPath: domain}
+	ref := mxlv1alpha1.FlowRef{ID: flowID}
+
+	require.False(t, d.flowExistsLocally(ref))
+
+	flowDir := filepath.Join(domain, flowID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.False(t, d.flowExistsLocally(ref), "a directory without flow_def.json holds no flow yet")
+
+	require.NoError(t, os.WriteFile(filepath.Join(flowDir, "flow_def.json"), []byte(`{}`), 0o644))
+	require.True(t, d.flowExistsLocally(ref))
+}
+
+func TestMaterialize_SourceIsLocalNode_NoOps(t *testing.T) {
+	// When the flow's origin is the same node the dispatcher runs on,
+	// Materialize returns without creating any mirror. This protects
+	// against the agent racing its own MxlFlow publish - the writer
+	// is local; the file will appear shortly.
+	scheme := newScheme(t)
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n1", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(flow).
+		Build()
+
+	d := &Dispatcher{
+		Client:      c,
+		Resolver:    &podlookup.Resolver{Client: c, NodeName: "n1"},
+		DomainPath:  "/run/mxl/domain",
+		NodeName:    "n1",
+		FlowChecker: func(string) bool { return false },
+	}
+	res, err := d.resolveSourceNode(context.Background(), mxlv1alpha1.FlowRef{ID: flowID})
+	require.NoError(t, err)
+	require.True(t, res.Found)
+	assert.Equal(t, "n1", res.Node)
+
+	// No mirror has been created at this point.
+	var list mxlv1alpha1.MxlFlowMirrorList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Empty(t, list.Items)
+}
+
+func TestWaitReady_FailedPhase_ReturnsError(t *testing.T) {
+	scheme := newScheme(t)
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "m"},
+		Status: mxlv1alpha1.MxlFlowMirrorStatus{
+			Phase: mxlv1alpha1.MxlFlowMirrorFailed,
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		WithObjects(mirror).
+		Build()
+
+	d := &Dispatcher{
+		Client:       c,
+		PollInterval: 5 * time.Millisecond,
+	}
+	err := d.waitReady(context.Background(), mirror)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Failed phase")
+}
+
+func TestWaitReady_ContextDeadline_PropagatesError(t *testing.T) {
+	scheme := newScheme(t)
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "m"},
+		Status: mxlv1alpha1.MxlFlowMirrorStatus{
+			Phase: mxlv1alpha1.MxlFlowMirrorMaterializing,
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		WithObjects(mirror).
+		Build()
+
+	d := &Dispatcher{
+		Client:       c,
+		PollInterval: 5 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	err := d.waitReady(ctx, mirror)
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"the per-request timeout must surface as DeadlineExceeded so the "+
+			"shim's caller stays out of an indefinite wait when the gateway "+
+			"never materializes the mirror")
+}
+
+// A target gateway publishes the descriptor as an MxlFlowMirrorTarget
+// and names it on the mirror by hash, the only sign the descriptor
+// exists, so a Ready mirror carrying it is ready.
+func TestWaitReady_ReadyWithTargetInfoHash_ReturnsNil(t *testing.T) {
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "m"},
+		Status: mxlv1alpha1.MxlFlowMirrorStatus{
+			Phase:          mxlv1alpha1.MxlFlowMirrorReady,
+			TargetInfoHash: mxlv1alpha1.TargetInfoHash("info"),
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		WithObjects(mirror).
+		Build()
+	d := &Dispatcher{Client: c, PollInterval: 5 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	require.NoError(t, d.waitReady(ctx, mirror))
+}
+
+func TestWaitReady_ReadyButNoDescriptorHash_KeepsPolling(t *testing.T) {
+	// A Ready phase with no descriptor hash is a half-published
+	// state from the gateway. The dispatcher must keep polling so a
+	// transient missing-field race doesn't return success early.
+	scheme := newScheme(t)
+	mirror := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "m"},
+		Status: mxlv1alpha1.MxlFlowMirrorStatus{
+			Phase: mxlv1alpha1.MxlFlowMirrorReady,
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		WithObjects(mirror).
+		Build()
+
+	d := &Dispatcher{
+		Client:       c,
+		PollInterval: 5 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := d.waitReady(ctx, mirror)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestEnsureMirror_Idempotent(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		Build()
+
+	d := &Dispatcher{
+		Client:     c,
+		DomainPath: "/run/mxl/domain",
+		NodeName:   "n1",
+		Provider:   mxlv1alpha1.ProviderTCP,
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "consumer", UID: "uid-1"},
+	}
+
+	first, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	assert.Equal(t, MirrorName(flowID, "n1"), first.Name)
+	assert.Equal(t, "n-src", first.Spec.SourceNode)
+	assert.Equal(t, "n1", first.Spec.TargetNode)
+	assert.Equal(t, mxlv1alpha1.ProviderTCP, first.Spec.Provider)
+
+	// Same call again must return the same name (no AlreadyExists
+	// surfacing up). The reconciler relies on this idempotence so
+	// the agent and the operator can race-create without errors.
+	second, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+	assert.Equal(t, first.Name, second.Name)
+}
+
+// TestEnsureMirror_StampsIntentLabels asserts the contract the
+// operator's intent-GC controller depends on: every mirror the
+// agent creates must carry LabelCreatedByIntent (with the local
+// node name as value) and LabelRequestorPodUID (with the consumer
+// pod's UID), and Spec.Requestor must name the pod. Without these
+// the GC cannot tell intent-created mirrors apart from
+// receiver-created ones and cannot detect pod replacement.
+func TestEnsureMirror_StampsIntentLabels(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		Build()
+
+	d := &Dispatcher{
+		Client:     c,
+		DomainPath: "/run/mxl/domain",
+		NodeName:   "n-target",
+		Provider:   mxlv1alpha1.ProviderTCP,
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "consumer", UID: "uid-42"},
+	}
+
+	got, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+
+	var live mxlv1alpha1.MxlFlowMirror
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Namespace: "ns", Name: got.Name}, &live))
+
+	assert.Equal(t, "n-target", live.Labels[mxlv1alpha1.LabelCreatedByIntent],
+		"LabelCreatedByIntent must carry the local node name so the GC "+
+			"can tell which agent stamped the mirror")
+	assert.Equal(t, "uid-42", live.Labels[mxlv1alpha1.LabelRequestorPodUID],
+		"LabelRequestorPodUID lets a label selector find every mirror "+
+			"tied to a given pod UID without unmarshalling spec")
+	require.NotNil(t, live.Spec.Requestor)
+	assert.Equal(t, "consumer", live.Spec.Requestor.Name)
+	assert.Equal(t, "ns", live.Spec.Requestor.Namespace)
+	assert.Equal(t, "uid-42", live.Spec.Requestor.UID)
+	_, receiverLabel := live.Labels[mxlv1alpha1.LabelCreatedByReceiver]
+	assert.False(t, receiverLabel,
+		"a mirror the agent created must not carry the receiver label; "+
+			"the receiver reconciler would then try to GC it and race "+
+			"the intent reconciler")
+}
+
+// nodeCaps builds an MxlNodeCapabilities for a node advertising the
+// named providers. Seeded via WithObjects so the fake client persists
+// the status the resolver reads.
+func nodeCaps(node string, providers ...mxlv1alpha1.MxlFabricsProvider) *mxlv1alpha1.MxlNodeCapabilities {
+	caps := &mxlv1alpha1.MxlNodeCapabilities{
+		ObjectMeta: metav1.ObjectMeta{Name: node},
+		Spec:       mxlv1alpha1.MxlNodeCapabilitiesSpec{NodeName: node},
+	}
+	for _, p := range providers {
+		caps.Status.Providers = append(caps.Status.Providers,
+			mxlv1alpha1.MxlFabricsProviderCapability{Name: p})
+	}
+	return caps
+}
+
+// TestEnsureMirror_ResolvesProviderFromCapabilities asserts that with
+// no explicit override the agent stamps the mirror with a concrete
+// provider resolved from the source and target nodes' capabilities,
+// preferring verbs over the tcp both nodes also advertise.
+func TestEnsureMirror_ResolvesProviderFromCapabilities(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			nodeCaps("n-src", mxlv1alpha1.ProviderTCP, mxlv1alpha1.ProviderVerbs),
+			nodeCaps("n1", mxlv1alpha1.ProviderTCP, mxlv1alpha1.ProviderVerbs),
+		).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		Build()
+
+	// Provider left empty: the dispatcher must resolve, not default to
+	// auto.
+	d := &Dispatcher{Client: c, DomainPath: "/run/mxl/domain", NodeName: "n1"}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "consumer", UID: "uid-1"},
+	}
+
+	got, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+	assert.Equal(t, mxlv1alpha1.ProviderVerbs, got.Spec.Provider,
+		"the resolver must prefer verbs, the highest-preference provider "+
+			"both nodes advertise")
+}
+
+// TestEnsureMirror_FallsBackToTCPWithoutCapabilities asserts that when
+// neither node has published MxlNodeCapabilities the agent still stamps
+// a concrete provider (tcp) rather than leaving the mirror on auto,
+// which the gateway would reject.
+func TestEnsureMirror_FallsBackToTCPWithoutCapabilities(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		Build()
+
+	d := &Dispatcher{Client: c, DomainPath: "/run/mxl/domain", NodeName: "n1"}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "consumer", UID: "uid-1"},
+	}
+
+	got, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+	assert.Equal(t, mxlv1alpha1.ProviderTCP, got.Spec.Provider)
+	assert.NotEqual(t, mxlv1alpha1.ProviderAuto, got.Spec.Provider,
+		"a mirror must never be created with provider auto")
+}
+
+// TestEnsureMirror_ExistingReceiverMirror_LeftIntact asserts that
+// when the receiver reconciler has already created a mirror for the
+// same (flow, target node), the agent reuses it without rewriting
+// ownership: no intent label is added, the receiver label stays,
+// and Spec.Requestor remains nil. Otherwise the two reconcilers
+// would both claim the mirror and race on deletion.
+func TestEnsureMirror_ExistingReceiverMirror_LeftIntact(t *testing.T) {
+	scheme := newScheme(t)
+	existing := &mxlv1alpha1.MxlFlowMirror{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns",
+			Name:      MirrorName(flowID, "n-target"),
+			Labels: map[string]string{
+				mxlv1alpha1.LabelCreatedByReceiver: "rcv-1",
+			},
+		},
+		Spec: mxlv1alpha1.MxlFlowMirrorSpec{
+			FlowID:     flowID,
+			SourceNode: "n-src",
+			TargetNode: "n-target",
+			Provider:   mxlv1alpha1.ProviderTCP,
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		WithObjects(existing).
+		Build()
+
+	d := &Dispatcher{
+		Client:     c,
+		DomainPath: "/run/mxl/domain",
+		NodeName:   "n-target",
+		Provider:   mxlv1alpha1.ProviderTCP,
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "consumer", UID: "uid-7"},
+	}
+
+	got, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+	assert.Equal(t, existing.Name, got.Name)
+
+	var live mxlv1alpha1.MxlFlowMirror
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Namespace: "ns", Name: existing.Name}, &live))
+
+	assert.Equal(t, "rcv-1", live.Labels[mxlv1alpha1.LabelCreatedByReceiver],
+		"the receiver label must survive: deleting it would orphan the "+
+			"mirror from the receiver's GC pass")
+	_, intentLabel := live.Labels[mxlv1alpha1.LabelCreatedByIntent]
+	assert.False(t, intentLabel,
+		"the agent must not claim co-ownership of a receiver-owned "+
+			"mirror; the intent reconciler would then race the receiver "+
+			"reconciler to delete it")
+	assert.Nil(t, live.Spec.Requestor,
+		"writing Spec.Requestor onto a receiver-owned mirror would "+
+			"trip the intent GC into deleting it when the consumer "+
+			"pod goes away, even though the receiver still wants it")
+}
+
+// fakeLeaseChecker hands back a canned IsFresh answer per (flowID,
+// node) pair so tests can drive resolveSourceNode's skip-stale logic
+// without spinning up a coordination.k8s.io fake.
+type fakeLeaseChecker struct {
+	fresh map[string]bool
+}
+
+func (f *fakeLeaseChecker) IsFresh(_ context.Context, flowID, node string) (bool, time.Time, error) {
+	v, ok := f.fresh[flowID+"/"+node]
+	return ok && v, time.Time{}, nil
+}
+
+func TestResolveSourceNode_SkipsStaleOriginByLease(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				// Stale Origin first: the dispatcher must skip it and
+				// keep scanning rather than return it.
+				{NodeName: "n-stale", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+				{NodeName: "n-fresh", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(flow).
+		Build()
+	d := &Dispatcher{
+		Client:   c,
+		NodeName: "n1",
+		Lease: &fakeLeaseChecker{fresh: map[string]bool{
+			flowID + "/n-fresh": true,
+			// n-stale intentionally absent: missing = not fresh.
+		}},
+	}
+
+	res, err := d.resolveSourceNode(ctx, mxlv1alpha1.FlowRef{ID: flowID})
+	require.NoError(t, err)
+	assert.True(t, res.Found,
+		"a second Origin with a fresh Lease must be the dispatcher's "+
+			"answer even when an earlier Origin entry is present but stale; "+
+			"otherwise a partitioned producer permanently masks a recovered one")
+	assert.Equal(t, "n-fresh", res.Node)
+}
+
+func TestResolveSourceNode_AllStaleOriginsReturnsNotOK(t *testing.T) {
+	ctx := context.Background()
+	scheme := newScheme(t)
+	flow := &mxlv1alpha1.MxlFlow{
+		ObjectMeta: metav1.ObjectMeta{Name: flowID},
+		Spec:       mxlv1alpha1.MxlFlowSpec{ID: flowID},
+		Status: mxlv1alpha1.MxlFlowStatus{
+			Locations: []mxlv1alpha1.MxlFlowLocation{
+				{NodeName: "n-stale-1", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+				{NodeName: "n-stale-2", Phase: mxlv1alpha1.MxlFlowLocationOrigin},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlow{}).
+		WithObjects(flow).
+		Build()
+	d := &Dispatcher{
+		Client:   c,
+		NodeName: "n1",
+		Lease:    &fakeLeaseChecker{fresh: map[string]bool{}},
+	}
+
+	res, err := d.resolveSourceNode(ctx, mxlv1alpha1.FlowRef{ID: flowID})
+	require.NoError(t, err)
+	assert.False(t, res.Found,
+		"when every Origin's Lease is expired the dispatcher must report "+
+			"no source; routing a Materialize call at a stale Origin would "+
+			"only hand the shim back a 'no grains' wait until the timeout")
+	assert.True(t, res.AllStale,
+		"every Origin candidate was rejected by the Lease check, which is "+
+			"a different answer from the flow being unknown")
+}
+
+// TestEnsureMirror_ExplicitProviderBypassesResolution asserts that a
+// concrete Provider override on the dispatcher is stamped verbatim,
+// even when the nodes' capabilities would resolve to a different
+// provider. The override is the per-cluster escape hatch that skips
+// resolution entirely.
+func TestEnsureMirror_ExplicitProviderBypassesResolution(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(
+			nodeCaps("n-src", mxlv1alpha1.ProviderVerbs),
+			nodeCaps("n1", mxlv1alpha1.ProviderVerbs),
+		).
+		WithStatusSubresource(&mxlv1alpha1.MxlFlowMirror{}).
+		Build()
+
+	d := &Dispatcher{
+		Client:     c,
+		DomainPath: "/run/mxl/domain",
+		NodeName:   "n1",
+		Provider:   mxlv1alpha1.ProviderTCP,
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "p", UID: "u"},
+	}
+
+	got, err := d.ensureMirror(context.Background(), mxlv1alpha1.FlowRef{ID: flowID}, "n-src", pod)
+	require.NoError(t, err)
+
+	var live mxlv1alpha1.MxlFlowMirror
+	require.NoError(t, c.Get(context.Background(),
+		types.NamespacedName{Namespace: "ns", Name: got.Name}, &live))
+	assert.Equal(t, mxlv1alpha1.ProviderTCP, live.Spec.Provider,
+		"an explicit Provider override must be stamped verbatim and skip "+
+			"resolution, even when the nodes both advertise verbs")
+}
+
+var _ = client.IgnoreNotFound
+
+// A flow in a second MxlDomain is materialised with its identity on
+// every node but not tracked, so no mirror can be arranged for it. The
+// shim turns the refusal into ENOENT for the consumer, which says
+// nothing about why, so the refusal itself has to name the domain and
+// the fact that it is not mirrored; and no mirror is created.
+func TestMaterialize_UnmirroredDomain_RefusesAndSaysWhy(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"domain", "scratch"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(root, dir), 0o755))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(root, "scratch", "domain_def.json"),
+		[]byte(`{"id":"3310f209-9351-47c0-b9a2-14c59b6a4c23"}`), 0o644))
+
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	d := &Dispatcher{
+		Client:      c,
+		Resolver:    &podlookup.Resolver{Client: c, NodeName: "n1"},
+		DomainPath:  filepath.Join(root, "domain"),
+		NodeName:    "n1",
+		FlowChecker: func(string) bool { return false },
+	}
+
+	path := filepath.Join(root, "scratch", flowID+".mxl-flow", "flow_def.json")
+	err := d.Materialize(context.Background(), 42, path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"scratch"`)
+	assert.Contains(t, err.Error(), "does not mirror")
+
+	err = d.NotifyProducerAttached(context.Background(), 42,
+		filepath.Join(root, "scratch", flowID+".mxl-flow", "data"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not mirror")
+
+	var list mxlv1alpha1.MxlFlowMirrorList
+	require.NoError(t, c.List(context.Background(), &list))
+	assert.Empty(t, list.Items)
+
+	// A path in no domain at all is still refused, with the plain reason.
+	err = d.Materialize(context.Background(), 42, filepath.Join(root, "other", flowID+".mxl-flow"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a flow path")
+}
+
+// libmxl probes a missing flow through several calls, and a consumer
+// retries, so one refused open arrives as a burst of requests. Logging
+// each would bury everything else; the reason is logged once per path
+// per window, and every request is still refused.
+func TestRefusalLogIsDeduplicated(t *testing.T) {
+	d := &Dispatcher{DomainPath: "/run/mxl/domain", NodeName: "n1"}
+	now := time.Unix(1000, 0)
+	d.nowFn = func() time.Time { return now }
+
+	assert.True(t, d.shouldLogRefusal("/run/mxl/other/a.mxl-flow/data"))
+	assert.False(t, d.shouldLogRefusal("/run/mxl/other/a.mxl-flow/data"))
+	assert.True(t, d.shouldLogRefusal("/run/mxl/other/b.mxl-flow/data"), "another flow")
+	now = now.Add(refusalLogWindow + time.Second)
+	assert.True(t, d.shouldLogRefusal("/run/mxl/other/a.mxl-flow/data"), "after the window")
+}
+
+// On mxlfs a lookup by name of a flow directory that is not there waits for
+// it, so the local check looks a flow up by name only once the domain
+// listing has returned it.
+func TestFlowExistsLocally_LooksUpOnlyListedFlows(t *testing.T) {
+	domain := t.TempDir()
+	const listedID = "22222222-2222-4222-8222-222222222222"
+	flowDir := filepath.Join(domain, listedID+".mxl-flow")
+	require.NoError(t, os.Mkdir(flowDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(flowDir, "flow_def.json"), []byte(`{}`), 0o644))
+
+	var looked []string
+	stat := statFlowDef
+	statFlowDef = func(name string) (os.FileInfo, error) {
+		looked = append(looked, name)
+		return stat(name)
+	}
+	t.Cleanup(func() { statFlowDef = stat })
+
+	d := &Dispatcher{DomainPath: domain}
+	require.False(t, d.flowExistsLocally(mxlv1alpha1.FlowRef{ID: flowID}))
+	assert.Empty(t, looked, "a flow the listing did not return was looked up by name")
+
+	require.True(t, d.flowExistsLocally(mxlv1alpha1.FlowRef{ID: listedID}))
+	assert.Equal(t, []string{filepath.Join(flowDir, "flow_def.json")}, looked)
+}

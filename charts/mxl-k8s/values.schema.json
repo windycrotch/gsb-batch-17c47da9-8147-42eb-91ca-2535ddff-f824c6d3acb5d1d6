@@ -1,0 +1,3341 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "agent": {
+      "description": "Agent: per-node DaemonSet that watches the MXL domain via fanotify, publishes flow state, and serves the LD_PRELOAD intent socket.",
+      "properties": {
+        "affinity": {
+          "required": [],
+          "title": "affinity",
+          "type": "object"
+        },
+        "args": {
+          "items": {
+            "required": []
+          },
+          "title": "args",
+          "type": "array"
+        },
+        "containerSecurityContext": {
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "properties": {
+                "add": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "add",
+                  "type": "array"
+                },
+                "drop": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [
+                "add",
+                "drop"
+              ],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            },
+            "runAsNonRoot": {
+              "default": "false",
+              "description": "fanotify on /run/mxl/domain reads host inodes, so the agent currently runs as root. PSA-restricted environments cannot host the agent without a policy exception.",
+              "required": [],
+              "title": "runAsNonRoot"
+            }
+          },
+          "required": [
+            "allowPrivilegeEscalation",
+            "readOnlyRootFilesystem",
+            "capabilities"
+          ],
+          "title": "containerSecurityContext",
+          "type": "object"
+        },
+        "csi": {
+          "description": "CSI node plugin that delivers the domain to pods as an inline ephemeral volume (driver mxl.qvest-digital.com), with the volume attributes domain (an MxlDomain name; empty for the primary domain) and access (read, the default, or write). Requires mxlfs.enabled. A publish is refused, and retried by the kubelet, until the agent has mounted the domain or left it plain. Write access is granted to any pod that asks for it in its volume attributes, and the domain directory is mode 0777, so a pod with write access can create, overwrite or remove any flow in the domain.",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "kubeletDir": {
+              "default": "/var/lib/kubelet",
+              "description": "The kubelet's root directory on the node.",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "kubeletDir"
+            },
+            "registrar": {
+              "properties": {
+                "image": {
+                  "properties": {
+                    "repository": {
+                      "default": "registry.k8s.io/sig-storage/csi-node-driver-registrar",
+                      "title": "repository",
+                      "type": "string"
+                    },
+                    "tag": {
+                      "default": "v2.15.0",
+                      "title": "tag",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "repository",
+                    "tag"
+                  ],
+                  "title": "image",
+                  "type": "object"
+                },
+                "resources": {
+                  "properties": {
+                    "limits": {
+                      "required": [],
+                      "title": "limits",
+                      "type": "object"
+                    },
+                    "requests": {
+                      "properties": {
+                        "cpu": {
+                          "default": "5m",
+                          "title": "cpu",
+                          "type": "string"
+                        },
+                        "memory": {
+                          "default": "16Mi",
+                          "title": "memory",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "cpu",
+                        "memory"
+                      ],
+                      "title": "requests",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "requests",
+                    "limits"
+                  ],
+                  "title": "resources",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "image",
+                "resources"
+              ],
+              "title": "registrar",
+              "type": "object"
+            }
+          },
+          "required": [
+            "enabled",
+            "registrar"
+          ],
+          "title": "csi"
+        },
+        "enabled": {
+          "default": true,
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "extraContainers": {
+          "items": {
+            "required": []
+          },
+          "title": "extraContainers",
+          "type": "array"
+        },
+        "extraEnv": {
+          "items": {
+            "required": []
+          },
+          "title": "extraEnv",
+          "type": "array"
+        },
+        "extraVolumeMounts": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumeMounts",
+          "type": "array"
+        },
+        "extraVolumes": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumes",
+          "type": "array"
+        },
+        "flags": {
+          "properties": {
+            "claimStatusLabel": {
+              "default": "",
+              "description": "Pod label naming a pod's dmf-k8s MediaFunctionClaim, in the pod's namespace. When set, the agent writes each such claim's status.io from the flows its pods on the node are observed to read and write, and gets RBAC for mediafunctionclaims. dmf-k8s names a function's Helm release after its claim, so app.kubernetes.io/instance names it. Empty disables.",
+              "required": [],
+              "title": "claimStatusLabel"
+            },
+            "domainPath": {
+              "default": "/run/mxl/domain",
+              "description": " pattern: ^/.+ @schema",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "domainPath"
+            },
+            "healthProbeBindAddress": {
+              "default": ":8081",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "healthProbeBindAddress"
+            },
+            "intentApiBurst": {
+              "default": "100",
+              "description": "Client-side burst above intentApiQps.",
+              "required": [],
+              "title": "intentApiBurst"
+            },
+            "intentApiQps": {
+              "default": "50",
+              "description": "Client-side request rate of a second API client, which serves pod lookups and on-demand mirrors: what a reader's open, or its wait on a missing flow, asks of the API server. Its limit is its own, so readers asking for many flows do not spend the rate flow publishing and Lease renewal run on.",
+              "required": [],
+              "title": "intentApiQps"
+            },
+            "intentMirrorBurst": {
+              "default": 8,
+              "description": "Most mirrors the agent creates on demand for one pod within intentMirrorBurstWindow, so a process opening every flow at once, as a glob over the domain does, gets only a few at a time. The history is the agent's memory and starts afresh when the agent restarts. 0 is unlimited.",
+              "minimum": 0,
+              "title": "intentMirrorBurst",
+              "type": "integer"
+            },
+            "intentMirrorBurstWindow": {
+              "default": "10s",
+              "description": " type: string pattern: ^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$ @schema",
+              "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$",
+              "title": "intentMirrorBurstWindow",
+              "type": "string"
+            },
+            "intentMirrorsPerNode": {
+              "default": 128,
+              "description": "Most live mirrors the agent creates on demand onto its node, for all pods together, over their lifetimes. 0 is unlimited.",
+              "minimum": 0,
+              "title": "intentMirrorsPerNode",
+              "type": "integer"
+            },
+            "intentMirrorsPerPod": {
+              "default": 64,
+              "description": "Most live mirrors the agent creates on demand for one pod, the mirrors a process opening a flow absent here asks for. Such a mirror lives as long as the pod, read or not, so this is a cap on what the pod accumulates over its lifetime; intentMirrorBurst is what stops a glob. A refused request is logged and recorded as an event on the pod: a process waiting on the open gets ENOENT, and one that already opened the flow's placeholder on an mxlfs domain is asked for again while it runs if the burst limit refused it; a refusal by this count is final. Mirrors an MxlReceiver or a redundancy set declares are not counted; one the agent handed to the pod because it still reads it after its requestor went is. 0 is unlimited.",
+              "minimum": 0,
+              "title": "intentMirrorsPerPod",
+              "type": "integer"
+            },
+            "intentSocket": {
+              "default": "/run/mxl/agent.sock",
+              "description": " pattern: ^/.+ @schema",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "intentSocket"
+            },
+            "kubeApiBurst": {
+              "default": "100",
+              "description": "Client-side burst above kubeApiQps. 0 leaves the client-go default in place.",
+              "required": [],
+              "title": "kubeApiBurst"
+            },
+            "kubeApiQps": {
+              "default": "50",
+              "description": "Client-side request rate to the API server. A node holding many flows spends one Get and one Update per flow per renewal pass; at the client-go default of 5 the loop blocks rather than fails, stretching past the Lease duration it exists to keep fresh. 0 leaves the client-go default in place.",
+              "required": [],
+              "title": "kubeApiQps"
+            },
+            "materializeTimeout": {
+              "default": "5s",
+              "title": "materializeTimeout",
+              "type": "string"
+            },
+            "metricsBindAddress": {
+              "default": ":8080",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "metricsBindAddress"
+            },
+            "observedRefreshInterval": {
+              "default": "5m",
+              "description": "How old a flow location's lastObserved may grow before the agent stamps it again; must be positive. Each stamp is a write of the whole MxlFlow status. Flow directories appearing and vanishing are rescanned every 30s regardless, so 30s or less stamps on every rescan.",
+              "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$",
+              "title": "observedRefreshInterval",
+              "type": "string"
+            },
+            "provider": {
+              "default": "",
+              "description": "Explicit libmxl-fabrics provider stamped onto on-demand (intent-driven) mirrors, bypassing per-node resolution. Empty (or \"auto\") resolves a concrete provider from the source and target nodes' MxlNodeCapabilities; set a concrete value to force one cluster-wide.",
+              "enum": [
+                "",
+                "tcp",
+                "verbs",
+                "efa",
+                "shm",
+                "auto"
+              ],
+              "required": [],
+              "title": "provider"
+            },
+            "resyncPeriod": {
+              "default": "30s",
+              "title": "resyncPeriod",
+              "type": "string"
+            },
+            "shimPath": {
+              "default": "/run/mxl/libmxl-intent.so",
+              "description": "Where the agent drops the copy of libmxl-intent.so its image carries, on every start. A consumer that already mounts hostPath.run for the intent socket preloads the shim from there instead of copying it out of the carrier image with an initContainer. Keep the path under hostPath.run, or consumer pods cannot see it. Empty disables the drop.",
+              "pattern": "^$|^/.+",
+              "required": [],
+              "title": "shimPath"
+            },
+            "zapLogLevel": {
+              "default": "info",
+              "description": " enum: [\"debug\", \"info\", \"warn\", \"error\"] @schema",
+              "enum": [
+                "debug",
+                "info",
+                "warn",
+                "error"
+              ],
+              "required": [],
+              "title": "zapLogLevel"
+            }
+          },
+          "required": [
+            "materializeTimeout",
+            "resyncPeriod"
+          ],
+          "title": "flags",
+          "type": "object"
+        },
+        "hostPID": {
+          "default": "true",
+          "description": "Run the agent in the host PID namespace. Required for the intent socket's SO_PEERCRED-based pod identification: without it the connecting consumer pod's PID is not visible to the agent and the on-demand mirror materialization path silently fails. mxlfs.enabled requires it.",
+          "required": [],
+          "title": "hostPID"
+        },
+        "hostPath": {
+          "description": "hostPath layout. The agent mounts the whole /run/mxl so the intent socket lands on the host where consumer pods can see it.",
+          "properties": {
+            "run": {
+              "default": "/run/mxl",
+              "description": " pattern: ^/.+ @schema",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "run"
+            },
+            "type": {
+              "default": "DirectoryOrCreate",
+              "description": " enum: [\"DirectoryOrCreate\", \"Directory\"] @schema",
+              "enum": [
+                "DirectoryOrCreate",
+                "Directory"
+              ],
+              "required": [],
+              "title": "type"
+            }
+          },
+          "required": [],
+          "title": "hostPath"
+        },
+        "image": {
+          "properties": {
+            "digest": {
+              "default": "",
+              "description": " pattern: ^$|^sha256:[0-9a-f]{64}$ @schema",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$",
+              "required": [],
+              "title": "digest"
+            },
+            "pullPolicy": {
+              "default": "",
+              "description": " enum: [\"\", \"Always\", \"IfNotPresent\", \"Never\"] @schema",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "required": [],
+              "title": "pullPolicy"
+            },
+            "repository": {
+              "default": "agent",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "description": "Image tag. Empty defaults to the chart appVersion prefixed with \"v\": the agent image is released under the chart version. Set this or image.digest.",
+              "required": [],
+              "title": "tag"
+            }
+          },
+          "required": [
+            "repository"
+          ],
+          "title": "image",
+          "type": "object"
+        },
+        "initContainers": {
+          "items": {
+            "required": []
+          },
+          "title": "initContainers",
+          "type": "array"
+        },
+        "livenessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds"
+          ],
+          "title": "livenessProbe",
+          "type": "object"
+        },
+        "metrics": {
+          "properties": {
+            "service": {
+              "properties": {
+                "enabled": {
+                  "default": true,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "port": {
+                  "default": "8080",
+                  "description": " minimum: 1 maximum: 65535 @schema",
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "required": [],
+                  "title": "port"
+                },
+                "type": {
+                  "default": "ClusterIP",
+                  "description": " enum: [\"ClusterIP\", \"NodePort\", \"LoadBalancer\"] @schema",
+                  "enum": [
+                    "ClusterIP",
+                    "NodePort",
+                    "LoadBalancer"
+                  ],
+                  "required": [],
+                  "title": "type"
+                }
+              },
+              "required": [
+                "enabled"
+              ],
+              "title": "service",
+              "type": "object"
+            },
+            "serviceMonitor": {
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "interval": {
+                  "default": "30s",
+                  "title": "interval",
+                  "type": "string"
+                },
+                "labels": {
+                  "required": [],
+                  "title": "labels",
+                  "type": "object"
+                },
+                "metricRelabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "metricRelabelings",
+                  "type": "array"
+                },
+                "relabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "relabelings",
+                  "type": "array"
+                },
+                "scrapeTimeout": {
+                  "default": "10s",
+                  "title": "scrapeTimeout",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "enabled",
+                "interval",
+                "scrapeTimeout",
+                "labels",
+                "relabelings",
+                "metricRelabelings"
+              ],
+              "title": "serviceMonitor",
+              "type": "object"
+            }
+          },
+          "required": [
+            "service",
+            "serviceMonitor"
+          ],
+          "title": "metrics",
+          "type": "object"
+        },
+        "nodeSelector": {
+          "required": [],
+          "title": "nodeSelector",
+          "type": "object"
+        },
+        "podAnnotations": {
+          "required": [],
+          "title": "podAnnotations",
+          "type": "object"
+        },
+        "podLabels": {
+          "required": [],
+          "title": "podLabels",
+          "type": "object"
+        },
+        "podSecurityContext": {
+          "description": "Pod-level security context, rendered into the pod spec as given. The agent mounts the same host run directory as the gateway and writes to it, so an SELinux-enabled node needs seLinuxOptions here for the reason documented on gateway.podSecurityContext.",
+          "required": [],
+          "title": "podSecurityContext"
+        },
+        "priorityClassName": {
+          "default": "",
+          "title": "priorityClassName",
+          "type": "string"
+        },
+        "readinessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 2,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds"
+          ],
+          "title": "readinessProbe",
+          "type": "object"
+        },
+        "resources": {
+          "properties": {
+            "limits": {
+              "required": [],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "properties": {
+                "cpu": {
+                  "default": "25m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "32Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ],
+          "title": "resources",
+          "type": "object"
+        },
+        "serviceAccount": {
+          "properties": {
+            "annotations": {
+              "required": [],
+              "title": "annotations",
+              "type": "object"
+            },
+            "automountServiceAccountToken": {
+              "default": true,
+              "title": "automountServiceAccountToken",
+              "type": "boolean"
+            },
+            "create": {
+              "default": true,
+              "title": "create",
+              "type": "boolean"
+            },
+            "labels": {
+              "required": [],
+              "title": "labels",
+              "type": "object"
+            },
+            "name": {
+              "default": "",
+              "title": "name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "create",
+            "name",
+            "annotations",
+            "labels",
+            "automountServiceAccountToken"
+          ],
+          "title": "serviceAccount",
+          "type": "object"
+        },
+        "tolerations": {
+          "items": {
+            "required": []
+          },
+          "title": "tolerations",
+          "type": "array"
+        },
+        "topologySpreadConstraints": {
+          "items": {
+            "required": []
+          },
+          "title": "topologySpreadConstraints",
+          "type": "array"
+        },
+        "updateStrategy": {
+          "properties": {
+            "rollingUpdate": {
+              "properties": {
+                "maxUnavailable": {
+                  "default": 1,
+                  "title": "maxUnavailable",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "maxUnavailable"
+              ],
+              "title": "rollingUpdate",
+              "type": "object"
+            },
+            "type": {
+              "default": "RollingUpdate",
+              "description": " enum: [\"RollingUpdate\", \"OnDelete\"] @schema",
+              "enum": [
+                "RollingUpdate",
+                "OnDelete"
+              ],
+              "required": [],
+              "title": "type"
+            }
+          },
+          "required": [
+            "rollingUpdate"
+          ],
+          "title": "updateStrategy",
+          "type": "object"
+        }
+      },
+      "required": [
+        "enabled",
+        "updateStrategy",
+        "image",
+        "args",
+        "flags",
+        "serviceAccount",
+        "podAnnotations",
+        "podLabels",
+        "priorityClassName",
+        "nodeSelector",
+        "tolerations",
+        "affinity",
+        "topologySpreadConstraints",
+        "resources",
+        "containerSecurityContext",
+        "livenessProbe",
+        "readinessProbe",
+        "extraEnv",
+        "extraVolumes",
+        "extraVolumeMounts",
+        "extraContainers",
+        "initContainers",
+        "metrics"
+      ],
+      "title": "agent"
+    },
+    "cleanup": {
+      "description": "Pre-delete lifecycle hooks. The domain wipe removes stale .mxl-flow directories under gateway.flags.domainPath at chart uninstall, because they live on a hostPath and survive namespace and CRD teardown.",
+      "properties": {
+        "preDeleteDomainWipe": {
+          "properties": {
+            "enabled": {
+              "default": "true",
+              "description": "Wipe stale .mxl-flow directories under gateway.flags.domainPath during helm uninstall, closing the cold-reinstall lifecycle bug where surviving hostPath state from a prior install causes the agent classifier to default the dirs to Origin on the next install (ghost source-side initiator).  Set to false if either applies:   - producers (libmxl writers) are still mmap-attached to files     under domainPath at uninstall time. rm -rf does not crash     producers (mmap regions survive unlink), but their writes     are orphaned from any new consumer. Drain producers first,     then uninstall.   - host state under domainPath is intentionally reused across     chart reinstalls (advanced; expect to clean up manually to     avoid the ghost-initiator bug).",
+              "required": [],
+              "title": "enabled"
+            },
+            "guardImage": {
+              "default": "bitnami/kubectl:1.31",
+              "description": "Image used by the nodecount-guard init-container. Must carry a kubectl binary on PATH.",
+              "required": [],
+              "title": "guardImage"
+            },
+            "image": {
+              "default": "busybox:1.38",
+              "description": "Image used by the cleanup Job. Pinned tag (no :latest).",
+              "required": [],
+              "title": "image"
+            },
+            "nodeCount": {
+              "default": "1",
+              "description": "Effective node count for the agent DaemonSet. An under-set value yields a partial wipe; the nodecount-guard init-container fails the chart with a clear error in that case.",
+              "minimum": 1,
+              "required": [],
+              "title": "nodeCount"
+            },
+            "podSecurityContext": {
+              "description": "Pod-level security context for the cleanup Job, rendered into the pod spec as given. The Job removes directories inside the domain hostPath, which is the same write an SELinux-enabled node denies the gateway, so it needs the seLinuxOptions documented on gateway.podSecurityContext. Carried separately because the Job is a helm hook and takes none of the gateway's pod settings.",
+              "required": [],
+              "title": "podSecurityContext"
+            },
+            "timeoutSeconds": {
+              "default": "120",
+              "description": "Per-pod completion timeout.",
+              "minimum": 1,
+              "required": [],
+              "title": "timeoutSeconds"
+            }
+          },
+          "required": [],
+          "title": "preDeleteDomainWipe",
+          "type": "object"
+        }
+      },
+      "required": [
+        "preDeleteDomainWipe"
+      ],
+      "title": "cleanup"
+    },
+    "crds": {
+      "description": "CRD handling. The chart installs CRDs from its crds/ directory by default. Helm only installs them on first install and never deletes or upgrades them; Flux's HelmRelease.spec.{install,upgrade}.crds governs replace semantics. Set skipInstall=true when CRDs are managed by a separate Kustomization or operator framework.",
+      "properties": {
+        "skipInstall": {
+          "default": false,
+          "title": "skipInstall",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "skipInstall"
+      ],
+      "title": "crds"
+    },
+    "dashboards": {
+      "description": " for Grafana's dashboard sidecar to discover.",
+      "properties": {
+        "annotations": {
+          "description": "Annotations on the ConfigMaps. grafana_folder places the dashboard when the sidecar runs with folderAnnotation set.",
+          "properties": {
+            "grafana_folder": {
+              "default": "MXL",
+              "title": "grafana_folder",
+              "type": "string"
+            }
+          },
+          "required": [
+            "grafana_folder"
+          ],
+          "title": "annotations"
+        },
+        "datasourceUid": {
+          "default": "prometheus",
+          "description": "uid of the Prometheus datasource the panels query. The default is what kube-prometheus-stack names its own; a Grafana provisioned otherwise states its uid here.",
+          "required": [],
+          "title": "datasourceUid"
+        },
+        "enabled": {
+          "default": "false",
+          "description": "Ship the bundled dashboards.",
+          "required": [],
+          "title": "enabled"
+        },
+        "labels": {
+          "description": "Labels the sidecar selects on. A deployment configured with a non-empty sidecar labelValue, or selecting on a release label, sets its own here.",
+          "properties": {
+            "grafana_dashboard": {
+              "default": "1",
+              "title": "grafana_dashboard",
+              "type": "string"
+            }
+          },
+          "required": [
+            "grafana_dashboard"
+          ],
+          "title": "labels"
+        },
+        "namespace": {
+          "default": "",
+          "description": "Namespace to place the ConfigMaps in. Empty uses the release namespace. The sidecar's searchNamespace defaults to the namespace Grafana runs in, so a Grafana installed elsewhere needs either that setting widened or this pointed at it.",
+          "required": [],
+          "title": "namespace"
+        }
+      },
+      "required": [],
+      "title": "dashboards"
+    },
+    "domains": {
+      "description": "MXL domains the chart creates as MxlDomain objects. Each one is materialised by the agent on every selected node as a directory under agent.hostPath.run carrying domain_def.json, the identity BCP-007-03 NMOS nodes publish as mxl_domain_id. Flows are tracked and mirrored between nodes in the domain whose directory is the base of agent.flags.domainPath and in every domain without a directory, which lives at domains/\u003cid\u003e; one in any other directory is materialised on each node but not mirrored. Set an empty list to manage MxlDomains outside the chart.",
+      "items": {
+        "anyOf": [
+          {
+            "properties": {
+              "description": {
+                "default": "",
+                "description": "domain_def.json description.",
+                "required": [],
+                "title": "description"
+              },
+              "directory": {
+                "default": "domain",
+                "description": "Directory below the runtime root, immutable. The base of agent.flags.domainPath for the primary domain; empty places the domain at domains/\u003cid\u003e.",
+                "required": [],
+                "title": "directory"
+              },
+              "historyDuration": {
+                "default": "",
+                "description": "Ring depth libmxl gives new flows, written to options.json (e.g. \"2s\"). Empty leaves options.json alone.",
+                "required": [],
+                "title": "historyDuration"
+              },
+              "id": {
+                "default": "",
+                "description": "Domain identity, a lowercase UUID. Empty keeps the id an existing object already has, and generates one on first install. Set it where it has to be known ahead of time or has to survive the object being deleted. Also set it wherever the chart is rendered without access to the cluster (helm template, helm diff, Argo CD, a GitOps render step): there the lookup finds nothing and every render generates a new id, which the API server then refuses as a change to an immutable field.",
+                "required": [],
+                "title": "id"
+              },
+              "label": {
+                "default": "",
+                "description": "domain_def.json label.",
+                "required": [],
+                "title": "label"
+              },
+              "name": {
+                "default": "default",
+                "description": "Object name.",
+                "required": [],
+                "title": "name"
+              },
+              "nodeSelector": {
+                "description": "Nodes the domain is materialised on. Empty is every agent node.",
+                "required": [],
+                "title": "nodeSelector",
+                "type": "object"
+              },
+              "tags": {
+                "description": "domain_def.json tags, each an array of strings.",
+                "required": [],
+                "title": "tags",
+                "type": "object"
+              }
+            },
+            "required": [],
+            "type": "object"
+          }
+        ],
+        "required": []
+      },
+      "required": [],
+      "title": "domains"
+    },
+    "exporter": {
+      "description": " serves Prometheus metrics for every flow materialized on it. A domain is shared by every pod on its node, so one DaemonSet covers the node and reports each flow once; a second reader of the same domain would only repeat it.",
+      "properties": {
+        "affinity": {
+          "required": [],
+          "title": "affinity",
+          "type": "object"
+        },
+        "args": {
+          "description": "Extra raw args appended after the rendered flags.",
+          "items": {
+            "required": []
+          },
+          "required": [],
+          "title": "args"
+        },
+        "containerSecurityContext": {
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "properties": {
+                "drop": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [
+                "drop"
+              ],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "allowPrivilegeEscalation",
+            "readOnlyRootFilesystem",
+            "capabilities"
+          ],
+          "title": "containerSecurityContext",
+          "type": "object"
+        },
+        "enabled": {
+          "default": "false",
+          "description": "Deploy the exporter DaemonSet.",
+          "required": [],
+          "title": "enabled"
+        },
+        "extraEnv": {
+          "items": {
+            "required": []
+          },
+          "title": "extraEnv",
+          "type": "array"
+        },
+        "extraVolumeMounts": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumeMounts",
+          "type": "array"
+        },
+        "extraVolumes": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumes",
+          "type": "array"
+        },
+        "flags": {
+          "description": "key=value.",
+          "properties": {
+            "domainPath": {
+              "default": "/run/mxl/domain",
+              "description": "Absolute path of the MXL domain directory to report on. Must resolve to the same domain the agent watches, below hostPath.run.",
+              "required": [],
+              "title": "domainPath"
+            },
+            "flowLifetime": {
+              "default": "5m",
+              "description": "How long a departed flow keeps being exported with mxl_flow_present at 0, so a flow that ends between two scrapes leaves a record rather than a gap. One sweep of gateway.flags.domainGcInterval, so the metric set describes the domain as it is rather than as it was.",
+              "required": [],
+              "title": "flowLifetime"
+            },
+            "healthProbeBindAddress": {
+              "default": ":8081",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "healthProbeBindAddress"
+            },
+            "metricsBindAddress": {
+              "default": ":8080",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "metricsBindAddress"
+            },
+            "scanPeriod": {
+              "default": "5s",
+              "description": "How often the domain directory is re-listed for flows that appeared or disappeared. Scrapes read the cache this maintains.",
+              "required": [],
+              "title": "scanPeriod"
+            },
+            "zapLogLevel": {
+              "default": "info",
+              "description": " enum: [\"debug\", \"info\", \"warn\", \"error\"] @schema",
+              "enum": [
+                "debug",
+                "info",
+                "warn",
+                "error"
+              ],
+              "required": [],
+              "title": "zapLogLevel"
+            }
+          },
+          "required": [],
+          "title": "flags"
+        },
+        "hostPath": {
+          "description": "hostPath layout. The exporter mounts the runtime root read-only; it opens libmxl flow readers and never writes into the domain.",
+          "properties": {
+            "run": {
+              "default": "/run/mxl",
+              "title": "run",
+              "type": "string"
+            },
+            "type": {
+              "default": "Directory",
+              "description": " enum: [\"\", \"DirectoryOrCreate\", \"Directory\"] @schema",
+              "enum": [
+                "",
+                "DirectoryOrCreate",
+                "Directory"
+              ],
+              "required": [],
+              "title": "type"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "title": "hostPath"
+        },
+        "image": {
+          "properties": {
+            "digest": {
+              "default": "",
+              "description": "Image digest. Wins over tag when set. @schema pattern: ^$|^sha256:[0-9a-f]{64}$ @schema",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$",
+              "required": [],
+              "title": "digest"
+            },
+            "pullPolicy": {
+              "default": "",
+              "description": " enum: [\"\", \"Always\", \"IfNotPresent\", \"Never\"] @schema",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "required": [],
+              "title": "pullPolicy"
+            },
+            "repository": {
+              "default": "exporter",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "description": "Image tag. Empty defaults to the chart appVersion prefixed with \"v\": the exporter image is released under the chart version. Set this or image.digest.",
+              "required": [],
+              "title": "tag"
+            }
+          },
+          "required": [
+            "repository"
+          ],
+          "title": "image",
+          "type": "object"
+        },
+        "livenessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 20,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds",
+            "periodSeconds"
+          ],
+          "title": "livenessProbe",
+          "type": "object"
+        },
+        "metrics": {
+          "properties": {
+            "service": {
+              "properties": {
+                "enabled": {
+                  "default": true,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "port": {
+                  "default": "8080",
+                  "description": " minimum: 1 maximum: 65535 @schema",
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "required": [],
+                  "title": "port"
+                },
+                "type": {
+                  "default": "ClusterIP",
+                  "description": " enum: [\"ClusterIP\", \"NodePort\", \"LoadBalancer\"] @schema",
+                  "enum": [
+                    "ClusterIP",
+                    "NodePort",
+                    "LoadBalancer"
+                  ],
+                  "required": [],
+                  "title": "type"
+                }
+              },
+              "required": [
+                "enabled"
+              ],
+              "title": "service",
+              "type": "object"
+            },
+            "serviceMonitor": {
+              "properties": {
+                "enabled": {
+                  "default": "false",
+                  "description": "Create a ServiceMonitor. Requires the monitoring.coreos.com CRDs to be installed cluster-wide.",
+                  "required": [],
+                  "title": "enabled"
+                },
+                "interval": {
+                  "default": "30s",
+                  "title": "interval",
+                  "type": "string"
+                },
+                "labels": {
+                  "required": [],
+                  "title": "labels",
+                  "type": "object"
+                },
+                "metricRelabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "metricRelabelings",
+                  "type": "array"
+                },
+                "relabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "relabelings",
+                  "type": "array"
+                },
+                "scrapeTimeout": {
+                  "default": "10s",
+                  "title": "scrapeTimeout",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interval",
+                "scrapeTimeout",
+                "labels",
+                "relabelings",
+                "metricRelabelings"
+              ],
+              "title": "serviceMonitor",
+              "type": "object"
+            }
+          },
+          "required": [
+            "service",
+            "serviceMonitor"
+          ],
+          "title": "metrics",
+          "type": "object"
+        },
+        "mirrorHeartbeats": {
+          "properties": {
+            "enabled": {
+              "default": "true",
+              "description": "Publish mxl_mirror_heartbeat_age_seconds from the heartbeat Leases the gateways renew in the release namespace: seconds since each mirror side last made progress, reported by the exporter on the node of the gateway serving that side. Disabling it drops the metric and the exporter's read access to those Leases. Where the exporter cannot read them, as with rbac.create=false and no grant of its own, the metric stays empty and the rest is served.",
+              "required": [],
+              "title": "enabled"
+            }
+          },
+          "required": [],
+          "title": "mirrorHeartbeats",
+          "type": "object"
+        },
+        "nodeSelector": {
+          "required": [],
+          "title": "nodeSelector",
+          "type": "object"
+        },
+        "podAnnotations": {
+          "required": [],
+          "title": "podAnnotations",
+          "type": "object"
+        },
+        "podLabels": {
+          "required": [],
+          "title": "podLabels",
+          "type": "object"
+        },
+        "podSecurityContext": {
+          "description": "Pod-level security context, rendered into the pod spec as given. The exporter mounts the host run directory read-only and never writes into the domain, so it does not need the seLinuxOptions that gateway.podSecurityContext documents.",
+          "required": [],
+          "title": "podSecurityContext"
+        },
+        "priorityClassName": {
+          "default": "",
+          "title": "priorityClassName",
+          "type": "string"
+        },
+        "readinessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 2,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            },
+            "periodSeconds": {
+              "default": 10,
+              "title": "periodSeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds",
+            "periodSeconds"
+          ],
+          "title": "readinessProbe",
+          "type": "object"
+        },
+        "resources": {
+          "properties": {
+            "limits": {
+              "required": [],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "properties": {
+                "cpu": {
+                  "default": "25m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "64Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ],
+          "title": "resources",
+          "type": "object"
+        },
+        "serviceAccount": {
+          "properties": {
+            "annotations": {
+              "required": [],
+              "title": "annotations",
+              "type": "object"
+            },
+            "automountServiceAccountToken": {
+              "default": true,
+              "title": "automountServiceAccountToken",
+              "type": "boolean"
+            },
+            "create": {
+              "default": true,
+              "title": "create",
+              "type": "boolean"
+            },
+            "labels": {
+              "required": [],
+              "title": "labels",
+              "type": "object"
+            },
+            "name": {
+              "default": "",
+              "description": "ServiceAccount name. Empty falls back to the generated name.",
+              "required": [],
+              "title": "name"
+            }
+          },
+          "required": [
+            "create",
+            "annotations",
+            "labels",
+            "automountServiceAccountToken"
+          ],
+          "title": "serviceAccount",
+          "type": "object"
+        },
+        "tolerations": {
+          "items": {
+            "required": []
+          },
+          "title": "tolerations",
+          "type": "array"
+        },
+        "topology": {
+          "properties": {
+            "enabled": {
+              "default": "true",
+              "description": "Publish mxl_flow_location_info from the MxlFlow CRs. That is what names the producing node (phase Origin), so dashboards do not need media functions to label themselves. Disabling it drops the metric and the exporter's API access to MxlFlow.",
+              "required": [],
+              "title": "enabled"
+            }
+          },
+          "required": [],
+          "title": "topology",
+          "type": "object"
+        },
+        "updateStrategy": {
+          "properties": {
+            "rollingUpdate": {
+              "properties": {
+                "maxUnavailable": {
+                  "default": 1,
+                  "title": "maxUnavailable",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "maxUnavailable"
+              ],
+              "title": "rollingUpdate",
+              "type": "object"
+            },
+            "type": {
+              "default": "RollingUpdate",
+              "title": "type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "rollingUpdate",
+            "type"
+          ],
+          "title": "updateStrategy",
+          "type": "object"
+        }
+      },
+      "required": [
+        "updateStrategy",
+        "image",
+        "topology",
+        "mirrorHeartbeats",
+        "serviceAccount",
+        "podAnnotations",
+        "podLabels",
+        "priorityClassName",
+        "nodeSelector",
+        "tolerations",
+        "affinity",
+        "extraEnv",
+        "extraVolumes",
+        "extraVolumeMounts",
+        "resources",
+        "containerSecurityContext",
+        "livenessProbe",
+        "readinessProbe",
+        "metrics"
+      ],
+      "title": "exporter"
+    },
+    "gateway": {
+      "description": "Gateway: per-node DaemonSet that owns libmxl-fabrics handles and moves grains across the wire. Runs with hostNetwork so the fabric endpoint binds the node interface.",
+      "properties": {
+        "affinity": {
+          "required": [],
+          "title": "affinity",
+          "type": "object"
+        },
+        "args": {
+          "items": {
+            "required": []
+          },
+          "title": "args",
+          "type": "array"
+        },
+        "containerSecurityContext": {
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "properties": {
+                "add": {
+                  "description": "Additional caps beyond what rdma.enabled implies.",
+                  "items": {
+                    "required": []
+                  },
+                  "required": [],
+                  "title": "add"
+                },
+                "drop": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [
+                "drop"
+              ],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            },
+            "runAsNonRoot": {
+              "default": false,
+              "title": "runAsNonRoot",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "allowPrivilegeEscalation",
+            "runAsNonRoot",
+            "readOnlyRootFilesystem",
+            "capabilities"
+          ],
+          "title": "containerSecurityContext",
+          "type": "object"
+        },
+        "dnsPolicy": {
+          "default": "ClusterFirstWithHostNet",
+          "description": " enum: [\"ClusterFirst\", \"ClusterFirstWithHostNet\", \"Default\", \"None\"] @schema",
+          "enum": [
+            "ClusterFirst",
+            "ClusterFirstWithHostNet",
+            "Default",
+            "None"
+          ],
+          "required": [],
+          "title": "dnsPolicy"
+        },
+        "enabled": {
+          "default": true,
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "extraContainers": {
+          "items": {
+            "required": []
+          },
+          "title": "extraContainers",
+          "type": "array"
+        },
+        "extraEnv": {
+          "items": {
+            "required": []
+          },
+          "title": "extraEnv",
+          "type": "array"
+        },
+        "extraVolumeMounts": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumeMounts",
+          "type": "array"
+        },
+        "extraVolumes": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumes",
+          "type": "array"
+        },
+        "flags": {
+          "properties": {
+            "bindAddress": {
+              "default": "$(POD_IP)",
+              "description": "Bind address for libmxl-fabrics endpoints. Default uses the downward-API POD_IP so each gateway binds its node IP. It narrows the providers that name an interface by IP, tcp and verbs; efa names one by its EFA GID and shm by the host's name, and neither is held to it. An explicit empty string (\"\") emits `--bind-address=` (bare equals), which suppresses the POD_IP fallback so libfabric picks the interface; useful when the gateway runs on a Multus-attached NAD and the RDMA fabric is a secondary netdev.",
+              "required": [],
+              "title": "bindAddress"
+            },
+            "degradedAfter": {
+              "default": "10s",
+              "description": "Grain-commit inactivity after which the target gateway demotes a mirror to Degraded. Same threshold gates the Reconcile fast-path so a stale Ready status falls through to re-establish.",
+              "required": [],
+              "title": "degradedAfter"
+            },
+            "domainGcGrace": {
+              "default": "2m",
+              "description": "How long after start the first reclaim sweep is held back. A restarted gateway has no writer attached to the mirror copies it was serving, and a consumer's reader does not protect them, so a sweep inside this window would delete flows consumers are still reading and the reconciler is about to re-establish. Must outlast the reconciler's re-establish path.",
+              "required": [],
+              "title": "domainGcGrace"
+            },
+            "domainGcInterval": {
+              "default": "5m",
+              "description": "How often libmxl reclaims flow directories no writer holds. The criterion is libmxl's own: a writer keeps a shared lock for as long as it is attached, so a live producer or mirror writer is never a candidate however long since its last grain. Set to 0 to disable reclaiming.",
+              "required": [],
+              "title": "domainGcInterval"
+            },
+            "domainGcScaffoldGrace": {
+              "default": "10m",
+              "description": "How old a half-built flow directory must be before it is reclaimed. libmxl builds a flow under a temporary name and renames it into place, removing it on every unwinding exit, so only a death that skips unwinding leaves one -- and libmxl's own collection walks published flows, so nothing sees it afterwards. A producer SIGKILLed part way through allocating its ring therefore leaves the whole allocation in the shared domain, at the node's expense rather than its own. Whether a writer still holds the scaffold is decided by the same lock libmxl uses; this only spans the moment between the data file being created and locked. Negative disables it.",
+              "required": [],
+              "title": "domainGcScaffoldGrace"
+            },
+            "domainPath": {
+              "default": "/run/mxl/domain",
+              "description": " pattern: ^/.+ @schema",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "domainPath"
+            },
+            "fabricCidr": {
+              "description": "CIDRs the fabric interfaces must fall inside. Empty considers every address libmxl-fabrics reports, which on a node with several NICs includes the ones carrying ST 2110 essence, cluster traffic, or out-of-band management. Set this to the subnet of the MXL fabric to keep mirrors off them. Applies to both what a node advertises and what a mirror binds.",
+              "items": {
+                "required": []
+              },
+              "required": [],
+              "title": "fabricCidr"
+            },
+            "fabricDevice": {
+              "description": "Device names the fabric interfaces must match, as the provider names them (the kernel netdev name for tcp, the NIC name libfabric reports otherwise). Empty considers every device. Useful where the fabric shares a subnet with other traffic.",
+              "items": {
+                "required": []
+              },
+              "required": [],
+              "title": "fabricDevice"
+            },
+            "fabricMaxUtilization": {
+              "default": 0,
+              "description": "Percent of an interface's or budget's capacity placement may commit on this gateway's nodes. 0 leaves it to operator.flags.placementMaxUtilization.",
+              "maximum": 100,
+              "minimum": 0,
+              "title": "fabricMaxUtilization",
+              "type": "integer"
+            },
+            "fabricMinLinkSpeed": {
+              "default": "",
+              "description": "Minimum link speed a fabric interface must report, as a quantity in bits per second (for example 25G). Empty imposes no floor. An interface whose provider reports no link speed is rejected when this is set, which includes interfaces with no physical NIC behind them.",
+              "required": [],
+              "title": "fabricMinLinkSpeed"
+            },
+            "fabricPortCapacity": {
+              "description": "Capacity overrides for mirror placement, each `\u003cmatch\u003e=\u003cquantity\u003e` in bits per second, where match is a device name, an address or a CIDR and the first match wins. An interface no entry matches is planned at the link speed its provider reports; one reporting none is never counted full.",
+              "items": {
+                "required": []
+              },
+              "required": [],
+              "title": "fabricPortCapacity"
+            },
+            "fabricSharedBudget": {
+              "description": "Caps several fabric interfaces share, each `\u003cscope\u003e=\u003cquantity\u003e[:\u003cmode\u003e]` in bits per second. Scope `nic` makes one cap per PCI device over its functions, `host` one over every interface of the node. Mode `ingress` (the default) counts mirrors received, `egress` mirrors sent, `combined` both against one cap. Empty declares none.",
+              "items": {
+                "required": []
+              },
+              "required": [],
+              "title": "fabricSharedBudget"
+            },
+            "healthProbeBindAddress": {
+              "default": ":8081",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "healthProbeBindAddress"
+            },
+            "kubeApiBurst": {
+              "default": "100",
+              "description": "Client-side burst above kubeApiQps. 0 leaves the client-go default in place.",
+              "required": [],
+              "title": "kubeApiBurst"
+            },
+            "kubeApiQps": {
+              "default": "50",
+              "description": "Client-side request rate to the API server. A node holding many flows spends one Get and one Update per flow per renewal pass; at the client-go default of 5 the loop blocks rather than fails, stretching past the Lease duration it exists to keep fresh. 0 leaves the client-go default in place.",
+              "required": [],
+              "title": "kubeApiQps"
+            },
+            "metricsBindAddress": {
+              "default": ":8080",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "metricsBindAddress"
+            },
+            "placementWait": {
+              "default": "10s",
+              "description": "How long the target side of a mirror the operator has not placed waits before binding the first interface, on a node offering more than one. The operator places within its own reconcile, so a running operator adds no delay; this bounds the wait when it is down or slow.",
+              "pattern": "^[0-9]+(ns|us|ms|s|m|h)$",
+              "required": [],
+              "title": "placementWait"
+            },
+            "pprofBindAddress": {
+              "default": "",
+              "description": "Bind address for the net/http/pprof endpoint. Empty disables; otherwise must be a loopback bind (127.0.0.1: or localhost:). Use kubectl port-forward to reach the endpoint; see docs/diagnostics/perf-shortfall.md for the capture recipe.",
+              "pattern": "^$|^(127\\.0\\.0\\.1|localhost):[0-9]+$",
+              "required": [],
+              "title": "pprofBindAddress"
+            },
+            "probePeriod": {
+              "default": "5m",
+              "description": "Shortest interval between two libmxl-fabrics interface enumerations. Status still refreshes every resyncPeriod from the last result. Each enumeration sweeps every provider libfabric was built with and warns about those it finds no device for.",
+              "required": [],
+              "title": "probePeriod"
+            },
+            "providers": {
+              "description": "Upper bound on the libmxl-fabrics providers a gateway may advertise and use. Each node publishes this list intersected with what libmxl-fabrics finds on it, so `any` advertises the hardware that is present and nothing else. Narrow it to keep a provider out of consideration on every node.",
+              "items": {
+                "enum": [
+                  "tcp",
+                  "verbs",
+                  "efa",
+                  "shm",
+                  "any",
+                  "auto"
+                ],
+                "required": []
+              },
+              "required": [],
+              "title": "providers"
+            },
+            "rdmaEnumerationGrace": {
+              "default": "10m",
+              "description": "How long that discrepancy holds before the probe fails. Measured across consecutive enumerations, so it spans several probePeriod rather than letting one decide it.",
+              "required": [],
+              "title": "rdmaEnumerationGrace"
+            },
+            "rdmaEnumerationLiveness": {
+              "default": "false",
+              "description": "Fail the liveness probe while the host exposes RDMA devices that no enumerated provider accounts for. libfabric fixes a provider's device list at the first enumeration, so a gateway that started before the hardware was usable never revisits it and only a restart does. Off by default: a node whose devices the built providers cannot drive reports the same discrepancy, and there a restart loops instead of recovering. The RDMADevicesEnumerated condition reports the state either way.",
+              "required": [],
+              "title": "rdmaEnumerationLiveness"
+            },
+            "readerStallAfter": {
+              "default": "20s",
+              "description": "How long a source-side reader may report an unchanged head index, having never transferred a grain, before SourceProgress reports ReaderNotAdvancing.",
+              "required": [],
+              "title": "readerStallAfter"
+            },
+            "resyncPeriod": {
+              "default": "60s",
+              "description": "How often the gateway refreshes MxlNodeCapabilities. Every pass reads each RDMA port state out of sysfs; on irdma that read takes the kernel global rtnl lock, so this is also how often a node contends for it against pod sandbox setup.",
+              "required": [],
+              "title": "resyncPeriod"
+            },
+            "zapLogLevel": {
+              "default": "info",
+              "description": " enum: [\"debug\", \"info\", \"warn\", \"error\"] @schema",
+              "enum": [
+                "debug",
+                "info",
+                "warn",
+                "error"
+              ],
+              "required": [],
+              "title": "zapLogLevel"
+            }
+          },
+          "required": [],
+          "title": "flags",
+          "type": "object"
+        },
+        "hostNetwork": {
+          "default": "true",
+          "description": "hostNetwork is required because the libmxl-fabrics TargetInfo embeds the host:port a peer dials; a CNI overlay IP would not be reachable cross-node.",
+          "required": [],
+          "title": "hostNetwork"
+        },
+        "hostPath": {
+          "properties": {
+            "domain": {
+              "default": "/run/mxl/domain",
+              "description": " pattern: ^/.+ @schema",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "domain"
+            },
+            "domains": {
+              "default": "/run/mxl/domains",
+              "description": "Where every MxlDomain without a directory lives, one subdirectory per id. Must be domains/ below the runtime root the primary domain sits in.",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "domains"
+            },
+            "type": {
+              "default": "DirectoryOrCreate",
+              "description": " enum: [\"DirectoryOrCreate\", \"Directory\"] @schema",
+              "enum": [
+                "DirectoryOrCreate",
+                "Directory"
+              ],
+              "required": [],
+              "title": "type"
+            }
+          },
+          "required": [],
+          "title": "hostPath",
+          "type": "object"
+        },
+        "image": {
+          "properties": {
+            "digest": {
+              "default": "",
+              "description": " pattern: ^$|^sha256:[0-9a-f]{64}$ @schema",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$",
+              "required": [],
+              "title": "digest"
+            },
+            "pullPolicy": {
+              "default": "",
+              "description": " enum: [\"\", \"Always\", \"IfNotPresent\", \"Never\"] @schema",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "required": [],
+              "title": "pullPolicy"
+            },
+            "repository": {
+              "default": "gateway",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "description": "Image tag. Empty defaults to the chart appVersion prefixed with \"v\": the gateway image is released under the chart version. Set this or image.digest.",
+              "required": [],
+              "title": "tag"
+            }
+          },
+          "required": [
+            "repository"
+          ],
+          "title": "image",
+          "type": "object"
+        },
+        "initContainers": {
+          "items": {
+            "required": []
+          },
+          "title": "initContainers",
+          "type": "array"
+        },
+        "livenessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds"
+          ],
+          "title": "livenessProbe",
+          "type": "object"
+        },
+        "metrics": {
+          "properties": {
+            "service": {
+              "properties": {
+                "enabled": {
+                  "default": true,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "port": {
+                  "default": "8080",
+                  "description": " minimum: 1 maximum: 65535 @schema",
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "required": [],
+                  "title": "port"
+                },
+                "type": {
+                  "default": "ClusterIP",
+                  "description": " enum: [\"ClusterIP\", \"NodePort\", \"LoadBalancer\"] @schema",
+                  "enum": [
+                    "ClusterIP",
+                    "NodePort",
+                    "LoadBalancer"
+                  ],
+                  "required": [],
+                  "title": "type"
+                }
+              },
+              "required": [
+                "enabled"
+              ],
+              "title": "service",
+              "type": "object"
+            },
+            "serviceMonitor": {
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "interval": {
+                  "default": "30s",
+                  "title": "interval",
+                  "type": "string"
+                },
+                "labels": {
+                  "required": [],
+                  "title": "labels",
+                  "type": "object"
+                },
+                "metricRelabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "metricRelabelings",
+                  "type": "array"
+                },
+                "relabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "relabelings",
+                  "type": "array"
+                },
+                "scrapeTimeout": {
+                  "default": "10s",
+                  "title": "scrapeTimeout",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "enabled",
+                "interval",
+                "scrapeTimeout",
+                "labels",
+                "relabelings",
+                "metricRelabelings"
+              ],
+              "title": "serviceMonitor",
+              "type": "object"
+            }
+          },
+          "required": [
+            "service",
+            "serviceMonitor"
+          ],
+          "title": "metrics",
+          "type": "object"
+        },
+        "nodeSelector": {
+          "required": [],
+          "title": "nodeSelector",
+          "type": "object"
+        },
+        "podAnnotations": {
+          "required": [],
+          "title": "podAnnotations",
+          "type": "object"
+        },
+        "podLabels": {
+          "required": [],
+          "title": "podLabels",
+          "type": "object"
+        },
+        "podSecurityContext": {
+          "description": "Pod-level security context, rendered into the pod spec as given.  An SELinux-enabled node needs seLinuxOptions here. The domain is a hostPath, and Kubernetes never relabels one: the hostPath volume plugin reports SELinuxRelabel false and declines SELinux context mounts, so the directory keeps the type the host gives it. Under /run that is usually run_t, while the container is confined to a pod type, and every write to the domain is denied.  seLinuxOptions labels the container process rather than the directory, which makes it the only lever available from a chart. Which type is accepted depends on the policy loaded on the node, so no value is correct everywhere and this stays empty.  In permissive mode the write still succeeds and each denial only emits an audit record set, so the cost is invisible until the node's audit backlog overruns and records are lost.",
+          "required": [],
+          "title": "podSecurityContext"
+        },
+        "priorityClassName": {
+          "default": "",
+          "title": "priorityClassName",
+          "type": "string"
+        },
+        "rdma": {
+          "properties": {
+            "enabled": {
+              "default": "false",
+              "description": "Add the capability the verbs/efa providers need: IPC_LOCK, which exempts their memory registrations from RLIMIT_MEMLOCK.",
+              "required": [],
+              "title": "enabled"
+            },
+            "extraEnv": {
+              "items": {
+                "required": []
+              },
+              "title": "extraEnv",
+              "type": "array"
+            },
+            "infinibandHostPath": {
+              "default": "/dev/infiniband",
+              "description": " pattern: ^/.+ @schema",
+              "pattern": "^/.+",
+              "required": [],
+              "title": "infinibandHostPath"
+            },
+            "infinibandHostPathType": {
+              "default": "Directory",
+              "description": "hostPath type for the InfiniBand mount. `Directory` holds the pod in ContainerCreating on a node where the path is absent, which is a deliberate failure on a DaemonSet that is only meant to run on RDMA-capable nodes, and a hang on one that is not.",
+              "enum": [
+                "Directory",
+                "DirectoryOrCreate"
+              ],
+              "required": [],
+              "title": "infinibandHostPathType"
+            },
+            "mountInfiniband": {
+              "default": "true",
+              "description": "Bind-mount the host's InfiniBand device directory into the gateway. Only consulted when rdma.enabled is set. A bind mount alone does not pass the cgroup-v2 device controller, so a node whose devices come from a device plugin wants this off and `resourceName` set instead.",
+              "required": [],
+              "title": "mountInfiniband"
+            },
+            "resourceName": {
+              "default": "",
+              "description": "Extended-resource name advertised by a Kubernetes device plugin. `devic.es/rdma` from generic-device-plugin and `rdma/hca_shared_devices` from k8s-rdma-shared-dev-plugin cover on-prem verbs; `vpc.amazonaws.com/efa` from aws-efa-k8s-device-plugin covers EFA; a site may advertise something else entirely. When non-empty, the gateway container gets `\u003cresourceName\u003e: 1` on both requests and limits. Empty disables the request.  The request is what grants the container its cgroup device permissions, and it also makes the pod unschedulable on any node not advertising the resource -- which is why a cluster with mixed hardware needs `gateway.variants` rather than one DaemonSet.",
+              "required": [],
+              "title": "resourceName"
+            },
+            "verbsAckTimeout": {
+              "default": 14,
+              "description": "Local ACK timeout of the verbs provider's RC queue pairs, as the exponent n of 4.096us x 2^n: 14 is 67ms. 1 to 31, or -1. Set as FI_VERBS_ACK_TIMEOUT when rdma.enabled and the providers include verbs (or any). Only the libfabric patch carried by the go-mxl image reads it. -1 leaves it unset, and a queue pair keeps the timeout RDMA-CM computes. No effect on a device whose driver does not program a queue pair's ACK timeout, such as irdma.",
+              "maximum": 31,
+              "minimum": -1,
+              "not": {
+                "const": 0,
+                "required": []
+              },
+              "title": "verbsAckTimeout",
+              "type": "integer"
+            },
+            "wait": {
+              "properties": {
+                "driver": {
+                  "default": "",
+                  "description": "Driver of the device's bus device the wait accepts, the basename of /sys/class/infiniband/\u003cdevice\u003e/device/driver: efa for the AWS Elastic Fabric Adapter, mlx5_core for a ConnectX, whose RDMA module mlx5_ib is not what that link names. Empty accepts any device, so on a node whose boot already brings up another RDMA device with an ACTIVE port the wait ends at once; set the driver there. Only consulted when rdma.wait.seconds is above 0.",
+                  "required": [],
+                  "title": "driver"
+                },
+                "seconds": {
+                  "default": 0,
+                  "description": "Off by default. Only for an RDMA driver loaded after the gateway pod starts, as the Kernel Module Management operator loads it on Ubuntu or Debian nodes, from a pod of its own once the kubelet runs; a driver loaded at boot needs none. libfabric fixes a provider's device list when the gateway first enumerates, so a gateway that starts before its device is usable advertises no RDMA for the life of the process, and every mirror created meanwhile resolves to a non-RDMA provider. A value above 0 adds an init container to the gateway that checks /sys/class/infiniband once a second for a device with an ACTIVE port, and ends as soon as one is there, or at the latest at the first check after this many seconds, exiting 0 either way: the gateway then starts, enumerates and falls back as it does with 0. Only consulted when rdma.enabled is set. 0 renders no init container.",
+                  "minimum": 0,
+                  "title": "seconds",
+                  "type": "integer"
+                }
+              },
+              "required": [],
+              "title": "wait",
+              "type": "object"
+            }
+          },
+          "required": [
+            "extraEnv",
+            "wait"
+          ],
+          "title": "rdma",
+          "type": "object"
+        },
+        "readinessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 2,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds"
+          ],
+          "title": "readinessProbe",
+          "type": "object"
+        },
+        "resources": {
+          "properties": {
+            "limits": {
+              "required": [],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "properties": {
+                "cpu": {
+                  "default": "100m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "128Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ],
+          "title": "resources",
+          "type": "object"
+        },
+        "serviceAccount": {
+          "properties": {
+            "annotations": {
+              "required": [],
+              "title": "annotations",
+              "type": "object"
+            },
+            "automountServiceAccountToken": {
+              "default": true,
+              "title": "automountServiceAccountToken",
+              "type": "boolean"
+            },
+            "create": {
+              "default": true,
+              "title": "create",
+              "type": "boolean"
+            },
+            "labels": {
+              "required": [],
+              "title": "labels",
+              "type": "object"
+            },
+            "name": {
+              "default": "",
+              "title": "name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "create",
+            "name",
+            "annotations",
+            "labels",
+            "automountServiceAccountToken"
+          ],
+          "title": "serviceAccount",
+          "type": "object"
+        },
+        "tolerations": {
+          "items": {
+            "required": []
+          },
+          "title": "tolerations",
+          "type": "array"
+        },
+        "topologySpreadConstraints": {
+          "items": {
+            "required": []
+          },
+          "title": "topologySpreadConstraints",
+          "type": "array"
+        },
+        "updateStrategy": {
+          "description": "DaemonSet update strategy. With mxlfs one gateway per node is assumed: a gateway clears every placeholder marker in a domain as it opens it, so a second gateway on the node would clear the markers of the first one's placeholders. With mxlfs.enabled the chart refuses a rollingUpdate.maxSurge other than 0.",
+          "properties": {
+            "rollingUpdate": {
+              "properties": {
+                "maxUnavailable": {
+                  "default": 1,
+                  "title": "maxUnavailable",
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "maxUnavailable"
+              ],
+              "title": "rollingUpdate",
+              "type": "object"
+            },
+            "type": {
+              "default": "RollingUpdate",
+              "description": " enum: [\"RollingUpdate\", \"OnDelete\"] @schema",
+              "enum": [
+                "RollingUpdate",
+                "OnDelete"
+              ],
+              "required": [],
+              "title": "type"
+            }
+          },
+          "required": [
+            "rollingUpdate"
+          ],
+          "title": "updateStrategy",
+          "type": "object"
+        },
+        "variants": {
+          "additionalProperties": {
+            "type": "object"
+          },
+          "description": "Render the gateway DaemonSet once per enabled entry instead of once, for a cluster whose nodes do not all carry the same fabric hardware. With nothing enabled -- the default -- exactly one DaemonSet renders from the values above, which is what a uniform cluster wants.  Keys name the variant and suffix the DaemonSet name, so they have to be DNS-1123 labels. Entries beyond the three below are allowed; each may override any key under `gateway`, with maps merging key by key against the values above and lists replacing wholesale.  Placement is deliberately unset on every entry. Which label marks a node's fabric is a site's choice, and a default here would not be replaced by a downstream override but merged with it, leaving a nodeSelector that demands both labels and matches no node.  Enabling two or more entries means declaring their placement, and the placements have to be complementary: two gateways on one node open the same MXL domain, reconcile the same mirrors, and write the same MxlNodeCapabilities, which is named after the node. Helm cannot read node labels, so it rejects only the combinations that guarantee overlap. Keying every variant on a distinct value of one label is what makes overlap impossible; a class defined by the absence of that label needs `affinity` with `DoesNotExist`, which a nodeSelector cannot express. See docs/RDMA.md.",
+          "properties": {
+            "efa": {
+              "description": " resource name cluster-wide, so that one is filled in. EFA node groups are conventionally tainted with the same key, which a variant selecting them has to tolerate.",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "flags": {
+                  "properties": {
+                    "providers": {
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "required": []
+                      },
+                      "title": "providers",
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "providers"
+                  ],
+                  "title": "flags",
+                  "type": "object"
+                },
+                "rdma": {
+                  "properties": {
+                    "enabled": {
+                      "default": true,
+                      "title": "enabled",
+                      "type": "boolean"
+                    },
+                    "mountInfiniband": {
+                      "default": false,
+                      "title": "mountInfiniband",
+                      "type": "boolean"
+                    },
+                    "resourceName": {
+                      "default": "vpc.amazonaws.com/efa",
+                      "title": "resourceName",
+                      "type": "string"
+                    },
+                    "wait": {
+                      "properties": {
+                        "driver": {
+                          "default": "efa",
+                          "title": "driver",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "driver"
+                      ],
+                      "title": "wait",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "mountInfiniband",
+                    "resourceName",
+                    "wait"
+                  ],
+                  "title": "rdma",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "enabled",
+                "flags",
+                "rdma"
+              ],
+              "title": "efa"
+            },
+            "tcp": {
+              "description": " schedules anywhere its placement allows.",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "flags": {
+                  "properties": {
+                    "providers": {
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "required": []
+                      },
+                      "title": "providers",
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "providers"
+                  ],
+                  "title": "flags",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "enabled",
+                "flags"
+              ],
+              "title": "tcp"
+            },
+            "verbs": {
+              "description": " plugin advertises the device is a site's choice (`devic.es/rdma` from generic-device-plugin, `rdma/hca_shared_devices` from k8s-rdma-shared-dev-plugin).",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "flags": {
+                  "properties": {
+                    "providers": {
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "string"
+                          }
+                        ],
+                        "required": []
+                      },
+                      "title": "providers",
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "providers"
+                  ],
+                  "title": "flags",
+                  "type": "object"
+                },
+                "rdma": {
+                  "properties": {
+                    "enabled": {
+                      "default": true,
+                      "title": "enabled",
+                      "type": "boolean"
+                    },
+                    "mountInfiniband": {
+                      "default": false,
+                      "title": "mountInfiniband",
+                      "type": "boolean"
+                    },
+                    "resourceName": {
+                      "default": "",
+                      "title": "resourceName",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "enabled",
+                    "mountInfiniband",
+                    "resourceName"
+                  ],
+                  "title": "rdma",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "enabled",
+                "flags",
+                "rdma"
+              ],
+              "title": "verbs"
+            }
+          },
+          "required": [],
+          "title": "variants"
+        }
+      },
+      "required": [
+        "enabled",
+        "updateStrategy",
+        "image",
+        "args",
+        "flags",
+        "hostPath",
+        "rdma",
+        "serviceAccount",
+        "podAnnotations",
+        "podLabels",
+        "priorityClassName",
+        "nodeSelector",
+        "tolerations",
+        "affinity",
+        "topologySpreadConstraints",
+        "resources",
+        "containerSecurityContext",
+        "livenessProbe",
+        "readinessProbe",
+        "extraEnv",
+        "extraVolumes",
+        "extraVolumeMounts",
+        "extraContainers",
+        "initContainers",
+        "metrics"
+      ],
+      "title": "gateway"
+    },
+    "global": {
+      "description": "Global settings inherited by every component unless overridden.",
+      "properties": {
+        "commonAnnotations": {
+          "description": "Annotations added to every object the chart renders.",
+          "required": [],
+          "title": "commonAnnotations"
+        },
+        "commonLabels": {
+          "description": "Labels added to every object the chart renders.",
+          "required": [],
+          "title": "commonLabels"
+        },
+        "image": {
+          "properties": {
+            "pullPolicy": {
+              "default": "IfNotPresent",
+              "description": "Default imagePullPolicy. Per-component override wins. @schema enum: [\"Always\", \"IfNotPresent\", \"Never\"] @schema",
+              "enum": [
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "required": [],
+              "title": "pullPolicy"
+            },
+            "pullSecrets": {
+              "description": "Image pull secrets, applied to every Pod.",
+              "items": {
+                "required": []
+              },
+              "required": [],
+              "title": "pullSecrets"
+            },
+            "registry": {
+              "default": "ghcr.io/qvest-digital/mxl-k8s",
+              "description": "Container registry prefix. Per-component image.repository is appended to this.",
+              "required": [],
+              "title": "registry"
+            }
+          },
+          "required": [],
+          "title": "image",
+          "type": "object"
+        }
+      },
+      "required": [
+        "image"
+      ],
+      "title": "global"
+    },
+    "mxlfs": {
+      "description": "mxlfs, a memory filesystem for MXL domains, on every domain. Off, every domain is a plain directory and the chart renders none of the following.  On, the agent mounts an mxlfs (mode=0777,wait=5000) on each domain directory it materialises, before writing into it, and runs privileged for Bidirectional propagation of the runtime root. A directory that is already an mxlfs is left alone. Where the mount fails, as on a node whose kernel has no mxlfs module, or where the directory already holds flows, the domain stays a plain directory: the agent logs the error and records a MxlfsUnavailable warning event on the Node.  The agent, gateway and operator run with --mxlfs, which adds placeholders for flows absent on a node, lazy ring allocation and MxlFlowRedundancySets, with the RBAC they need; the CRD must be installed. The gateway runs in the host PID namespace, so it sees the flocks of local producers through /proc/locks. The gateway and the exporter wait in an init container for mxlfs.ready, which the agent writes to the runtime root once it has mounted or left plain the domains known at its start, and see later mounts through HostToContainer propagation. agent.csi.enabled requires this.  MXL pods take the domain through the agent's CSI volume (agent.csi.enabled), which is published only once the agent has mounted the domain or left it plain. A pod that mounts the domain directory as a hostPath can start before the agent, as after a node restart, and create a flow in the plain directory; the agent then leaves that domain plain and records the MxlfsUnavailable event.  A placeholder is a libmxl writer the gateway holds open, one per flow with no copy on the node, and libmxl maps every grain of a discrete flow on its own: a video or data flow costs the gateway its grain count plus two memory mappings (250 + 2 for 5s of history at 50 fps), an audio flow two. Mirrors and merged outputs in the gateway add their own. The kernel caps mappings per process at vm.max_map_count, 65530 by default, which at that history is about 250 such flows across the node's mxlfs domains; past it, creating a placeholder or a mirror fails. Raise vm.max_map_count on the nodes for more.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "huge": {
+          "default": "",
+          "description": "huge= mount option of every mxlfs domain, as tmpfs's: within_size gives a file folios that end by EOF; always gives a file of at least 2 MiB one 2 MiB folio for its last partial 2 MiB, so a NIC maps a registered grain with one translation per 2 MiB instead of a page size the smallest tail folio sets, at up to 2 MiB more memory per such file (736 KiB for a 1080p v210 grain). Empty leaves the option out. An mxlfs module without it refuses a mount that names it; the agent then mounts the domain without huge= and records a MxlfsHugeRefused warning event on the Node. A change applies to a domain only when it is mounted again, at the next node reboot. @schema enum: [\"\", \"within_size\", \"always\"] @schema",
+          "enum": [
+            "",
+            "within_size",
+            "always"
+          ],
+          "required": [],
+          "title": "huge"
+        },
+        "moduleWaitSeconds": {
+          "default": 0,
+          "description": "Off by default. Only for an mxlfs module loaded after the agent pod starts, as the Kernel Module Management operator loads it on Ubuntu or Debian nodes, from a pod of its own once the kubelet runs; a module loaded at boot needs none. The agent decides each domain once: a mount that finds no mxlfs leaves the domain plain for the life of the agent process and records a MxlfsUnavailable warning event on the Node. A value above 0 adds an init container to the agent that checks /proc/filesystems for mxlfs once a second and ends as soon as it is listed, or at the latest at the first check after this many seconds, exiting 0 either way: the agent then starts and mounts or falls back to a plain directory as it does with 0. The gateway and the exporter wait for the agent's mxlfs.ready, and the agent publishes its CSI volume only once it has decided the domain, so all of them start that much later too: by up to this many seconds on a node whose module never loads. Needs mxlfs.enabled. 0 renders no init container.",
+          "minimum": 0,
+          "title": "moduleWaitSeconds",
+          "type": "integer"
+        },
+        "numa": {
+          "properties": {
+            "metrics": {
+              "properties": {
+                "enabled": {
+                  "default": "false",
+                  "description": "Export the NUMA counters of every mxlfs domain from the exporter, in every placement mode: the domain's and each flow ring's pages per NUMA node, allocations that fell back to another node, and the moves. Read on every exporter scan, never on a scrape. Needs an mxlfs module with the NUMA ioctls; with an older one the series are left out.",
+                  "required": [],
+                  "title": "enabled"
+                }
+              },
+              "required": [],
+              "title": "metrics",
+              "type": "object"
+            },
+            "placement": {
+              "properties": {
+                "flow": {
+                  "properties": {
+                    "default": {
+                      "default": "local",
+                      "description": "flow mode's numa_node= for pages nothing placed: nic mounts every domain with the NICs' node, local leaves it to the allocating process. Empty is local. @schema enum: [\"\", \"nic\", \"local\"] @schema",
+                      "enum": [
+                        "",
+                        "nic",
+                        "local"
+                      ],
+                      "required": [],
+                      "title": "default"
+                    },
+                    "release": {
+                      "properties": {
+                        "delay": {
+                          "default": "60s",
+                          "description": "How long a ring stays unheld, counted from when the agent first saw it so, before it moves; a pass that finds it held or cannot see its holds starts the count over. Covers a gateway restart, which drops the holds until its mirrors are attached again. @schema type: string pattern: ^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$ @schema",
+                          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$",
+                          "title": "delay",
+                          "type": "string"
+                        },
+                        "period": {
+                          "default": "30s",
+                          "description": "How often the agent looks for rings to move in flow mode. @schema type: string pattern: ^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$ @schema",
+                          "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$",
+                          "title": "period",
+                          "type": "string"
+                        },
+                        "rate": {
+                          "default": "512Mi",
+                          "description": "Bytes a second the agent moves, a quantity. @schema type: string pattern: ^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$ @schema",
+                          "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$",
+                          "title": "rate",
+                          "type": "string"
+                        }
+                      },
+                      "required": [],
+                      "title": "release",
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "release"
+                  ],
+                  "title": "flow",
+                  "type": "object"
+                },
+                "mode": {
+                  "default": "off",
+                  "description": "On which NUMA node the pages of the rings of mxlfs domains are allocated. off leaves it to the process that allocates them. node mounts every domain with placement.node.default as numa_node=. flow places each ring by its use: the gateway holds the ring of every flow it registers with a NIC and moves it to the NICs' node first, a target's ring is allocated there, and the agent moves a ring nothing holds to the node all local writers and readers of the flow are confined to: every CPU their threads may run on is on that node, and they may allocate from it. A flow with any other local writer or reader counts as unpinned and the agent never moves its ring, so this needs CPU pinning. A page goes to the file's own preference first, then to the mount's numa_node=, then to the allocating task's memory policy; a file has a preference only in flow mode, where a moved ring keeps it so its later pages follow it. flow needs mxlfs.enabled and gives the gateway CAP_SYS_NICE. On a node whose RDMA devices report no single NUMA node it acts as off, and the agent and gateway record a MxlfsNumaFlowUnresolved warning event on the Node. Empty is off. A change of the mount option applies to a domain only when it is mounted again, at the next node reboot. @schema enum: [\"\", \"off\", \"node\", \"flow\"] @schema",
+                  "enum": [
+                    "",
+                    "off",
+                    "node",
+                    "flow"
+                  ],
+                  "required": [],
+                  "title": "mode"
+                },
+                "node": {
+                  "properties": {
+                    "default": {
+                      "default": "auto",
+                      "description": "set makes a number the schema refuses. An mxlfs module without the option, or one that finds no memory on the node, refuses a mount that names it; the agent then mounts the domain without numa_node= and records a MxlfsNumaNodeRefused warning event on the Node. Empty is auto. @schema type: string pattern: ^$|^auto$|^[0-9]+$ @schema",
+                      "pattern": "^$|^auto$|^[0-9]+$",
+                      "title": "default",
+                      "type": "string"
+                    }
+                  },
+                  "required": [],
+                  "title": "node",
+                  "type": "object"
+                }
+              },
+              "required": [
+                "node",
+                "flow"
+              ],
+              "title": "placement",
+              "type": "object"
+            }
+          },
+          "required": [
+            "placement",
+            "metrics"
+          ],
+          "title": "numa",
+          "type": "object"
+        },
+        "waitImage": {
+          "default": "busybox:1.38",
+          "description": "Image of the init containers that wait for mxlfs.ready, for the mxlfs module and for an RDMA device (gateway.rdma.wait). Needs a POSIX sh, test, sleep, date, awk, grep and readlink.",
+          "required": [],
+          "title": "waitImage"
+        },
+        "waitResources": {
+          "description": "Resources of those init containers.",
+          "properties": {
+            "limits": {
+              "required": [],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "properties": {
+                "cpu": {
+                  "default": "1m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "4Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ],
+          "title": "waitResources"
+        }
+      },
+      "required": [
+        "enabled",
+        "numa"
+      ],
+      "title": "mxlfs"
+    },
+    "namespace": {
+      "description": "Namespace handling. Most Flux users set createNamespace on the HelmRelease and leave namespace.create=false here.",
+      "properties": {
+        "create": {
+          "default": false,
+          "title": "create",
+          "type": "boolean"
+        },
+        "name": {
+          "default": "",
+          "description": "Namespace the chart's namespaced resources land in. Falls back to .Release.Namespace when empty.",
+          "required": [],
+          "title": "name"
+        }
+      },
+      "required": [
+        "create"
+      ],
+      "title": "namespace"
+    },
+    "operator": {
+      "description": "Operator: cluster-wide reconciler for MxlReceiver, MxlFlowMirror, and related CRDs. Single Deployment.",
+      "properties": {
+        "affinity": {
+          "required": [],
+          "title": "affinity",
+          "type": "object"
+        },
+        "args": {
+          "description": "Extra raw args appended after the structured flags.",
+          "items": {
+            "required": []
+          },
+          "required": [],
+          "title": "args"
+        },
+        "containerSecurityContext": {
+          "properties": {
+            "allowPrivilegeEscalation": {
+              "default": false,
+              "title": "allowPrivilegeEscalation",
+              "type": "boolean"
+            },
+            "capabilities": {
+              "properties": {
+                "drop": {
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "required": []
+                  },
+                  "title": "drop",
+                  "type": "array"
+                }
+              },
+              "required": [
+                "drop"
+              ],
+              "title": "capabilities",
+              "type": "object"
+            },
+            "readOnlyRootFilesystem": {
+              "default": true,
+              "title": "readOnlyRootFilesystem",
+              "type": "boolean"
+            },
+            "runAsNonRoot": {
+              "default": true,
+              "title": "runAsNonRoot",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "allowPrivilegeEscalation",
+            "runAsNonRoot",
+            "readOnlyRootFilesystem",
+            "capabilities"
+          ],
+          "title": "containerSecurityContext",
+          "type": "object"
+        },
+        "enabled": {
+          "default": true,
+          "title": "enabled",
+          "type": "boolean"
+        },
+        "extraContainers": {
+          "items": {
+            "required": []
+          },
+          "title": "extraContainers",
+          "type": "array"
+        },
+        "extraEnv": {
+          "items": {
+            "required": []
+          },
+          "title": "extraEnv",
+          "type": "array"
+        },
+        "extraVolumeMounts": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumeMounts",
+          "type": "array"
+        },
+        "extraVolumes": {
+          "items": {
+            "required": []
+          },
+          "title": "extraVolumes",
+          "type": "array"
+        },
+        "flags": {
+          "description": "key=value.",
+          "properties": {
+            "gcGracePeriod": {
+              "default": "5m",
+              "description": "How long an MxlFlow must have no live copy, and an MxlFlowMirror no source it could pull from, before it is deleted. Has to outlast a producer rolling over: the flow has no Origin between the old pod releasing it and the new one publishing again, and collecting inside that window costs the stream a re-materialization for no reason. It does not gate an unclaimed mirror, which goes at once, or after a 30s handover window when its requestor pod has gone.",
+              "pattern": "^[0-9]+(ns|us|ms|s|m|h)$",
+              "required": [],
+              "title": "gcGracePeriod"
+            },
+            "healthProbeBindAddress": {
+              "default": ":8081",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "healthProbeBindAddress"
+            },
+            "leaderElect": {
+              "default": "false",
+              "description": "Enable leader election. Required for replicaCount \u003e 1.",
+              "required": [],
+              "title": "leaderElect"
+            },
+            "metricsBindAddress": {
+              "default": ":8080",
+              "description": " pattern: ^:[0-9]+$|^[0-9.]+:[0-9]+$ @schema",
+              "pattern": "^:[0-9]+$|^[0-9.]+:[0-9]+$",
+              "required": [],
+              "title": "metricsBindAddress"
+            },
+            "placementDemandWait": {
+              "default": "5s",
+              "description": "How long after its creation a mirror waits for its flow's payload rate before it is placed on the provisional demand.",
+              "pattern": "^[0-9]+(ns|us|ms|s|m|h)$",
+              "required": [],
+              "title": "placementDemandWait"
+            },
+            "placementMaxUtilization": {
+              "default": 80,
+              "description": "Percent of a fabric interface's or shared budget's capacity mirror placement may commit, on nodes whose gateway sets no gateway.flags.fabricMaxUtilization. Grains leave as line-rate bursts, so a receiver overflows before its average load reaches the link speed.",
+              "maximum": 100,
+              "minimum": 1,
+              "title": "placementMaxUtilization",
+              "type": "integer"
+            },
+            "placementOvercommit": {
+              "default": "place",
+              "description": "What happens to a mirror no interface pair has room for. place puts it on the pair with the most headroom left and reports it Overcommitted; hold leaves it unplaced and unset up, and reports it Held.",
+              "enum": [
+                "place",
+                "hold"
+              ],
+              "required": [],
+              "title": "placementOvercommit"
+            },
+            "placementPairing": {
+              "default": "prefer-same-subnet",
+              "description": "How a source interface is paired with a target interface. prefer-same-subnet keeps pairs whose addresses share a subnet when any does; same-subnet keeps only those; any keeps every pair. With every fabric port in one subnet all pairs qualify and the setting changes nothing; it matters where ports sit in separate subnets.",
+              "enum": [
+                "prefer-same-subnet",
+                "same-subnet",
+                "any"
+              ],
+              "required": [],
+              "title": "placementPairing"
+            },
+            "placementProtocolOverhead": {
+              "default": 5,
+              "description": "Percent added to a flow's published payload rate for protocol framing when it is charged to an interface.",
+              "maximum": 100,
+              "minimum": 0,
+              "title": "placementProtocolOverhead",
+              "type": "integer"
+            },
+            "placementProvisionalDemand": {
+              "default": "0",
+              "description": "Rate in bits per second charged for a flow that has not published its payload rate within placementDemandWait, as a quantity. \"0\" places such mirrors by mirror count alone.",
+              "required": [],
+              "title": "placementProvisionalDemand"
+            },
+            "zapDevel": {
+              "default": false,
+              "title": "zapDevel",
+              "type": "boolean"
+            },
+            "zapLogLevel": {
+              "default": "info",
+              "description": " enum: [\"debug\", \"info\", \"warn\", \"error\"] @schema",
+              "enum": [
+                "debug",
+                "info",
+                "warn",
+                "error"
+              ],
+              "required": [],
+              "title": "zapLogLevel"
+            }
+          },
+          "required": [
+            "zapDevel"
+          ],
+          "title": "flags"
+        },
+        "image": {
+          "properties": {
+            "digest": {
+              "default": "",
+              "description": "Image digest. Wins over tag when set. @schema pattern: ^$|^sha256:[0-9a-f]{64}$ @schema",
+              "pattern": "^$|^sha256:[0-9a-f]{64}$",
+              "required": [],
+              "title": "digest"
+            },
+            "pullPolicy": {
+              "default": "",
+              "description": "imagePullPolicy override. Empty falls back to global. @schema enum: [\"\", \"Always\", \"IfNotPresent\", \"Never\"] @schema",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ],
+              "required": [],
+              "title": "pullPolicy"
+            },
+            "repository": {
+              "default": "operator",
+              "title": "repository",
+              "type": "string"
+            },
+            "tag": {
+              "default": "",
+              "description": "Image tag. Empty defaults to the chart appVersion prefixed with \"v\": the operator image is released under the chart version. Set this or image.digest.",
+              "required": [],
+              "title": "tag"
+            }
+          },
+          "required": [
+            "repository"
+          ],
+          "title": "image",
+          "type": "object"
+        },
+        "initContainers": {
+          "items": {
+            "required": []
+          },
+          "title": "initContainers",
+          "type": "array"
+        },
+        "livenessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/healthz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 5,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds"
+          ],
+          "title": "livenessProbe",
+          "type": "object"
+        },
+        "metrics": {
+          "properties": {
+            "service": {
+              "properties": {
+                "enabled": {
+                  "default": true,
+                  "title": "enabled",
+                  "type": "boolean"
+                },
+                "port": {
+                  "default": "8080",
+                  "description": " minimum: 1 maximum: 65535 @schema",
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "required": [],
+                  "title": "port"
+                },
+                "type": {
+                  "default": "ClusterIP",
+                  "description": " enum: [\"ClusterIP\", \"NodePort\", \"LoadBalancer\"] @schema",
+                  "enum": [
+                    "ClusterIP",
+                    "NodePort",
+                    "LoadBalancer"
+                  ],
+                  "required": [],
+                  "title": "type"
+                }
+              },
+              "required": [
+                "enabled"
+              ],
+              "title": "service",
+              "type": "object"
+            },
+            "serviceMonitor": {
+              "properties": {
+                "enabled": {
+                  "default": "false",
+                  "description": "Render a Prometheus Operator ServiceMonitor. Requires the monitoring.coreos.com CRDs to be installed cluster-wide.",
+                  "required": [],
+                  "title": "enabled"
+                },
+                "interval": {
+                  "default": "30s",
+                  "title": "interval",
+                  "type": "string"
+                },
+                "labels": {
+                  "required": [],
+                  "title": "labels",
+                  "type": "object"
+                },
+                "metricRelabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "metricRelabelings",
+                  "type": "array"
+                },
+                "relabelings": {
+                  "items": {
+                    "required": []
+                  },
+                  "title": "relabelings",
+                  "type": "array"
+                },
+                "scrapeTimeout": {
+                  "default": "10s",
+                  "title": "scrapeTimeout",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "interval",
+                "scrapeTimeout",
+                "labels",
+                "relabelings",
+                "metricRelabelings"
+              ],
+              "title": "serviceMonitor",
+              "type": "object"
+            }
+          },
+          "required": [
+            "service",
+            "serviceMonitor"
+          ],
+          "title": "metrics",
+          "type": "object"
+        },
+        "nodeSelector": {
+          "required": [],
+          "title": "nodeSelector",
+          "type": "object"
+        },
+        "podAnnotations": {
+          "required": [],
+          "title": "podAnnotations",
+          "type": "object"
+        },
+        "podDisruptionBudget": {
+          "properties": {
+            "enabled": {
+              "default": false,
+              "title": "enabled",
+              "type": "boolean"
+            },
+            "minAvailable": {
+              "default": "1",
+              "description": " minimum: 1 @schema",
+              "minimum": 1,
+              "required": [],
+              "title": "minAvailable"
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "title": "podDisruptionBudget",
+          "type": "object"
+        },
+        "podLabels": {
+          "required": [],
+          "title": "podLabels",
+          "type": "object"
+        },
+        "podSecurityContext": {
+          "required": [],
+          "title": "podSecurityContext",
+          "type": "object"
+        },
+        "priorityClassName": {
+          "default": "",
+          "title": "priorityClassName",
+          "type": "string"
+        },
+        "readinessProbe": {
+          "properties": {
+            "httpGet": {
+              "properties": {
+                "path": {
+                  "default": "/readyz",
+                  "title": "path",
+                  "type": "string"
+                },
+                "port": {
+                  "default": "probe",
+                  "title": "port",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "port"
+              ],
+              "title": "httpGet",
+              "type": "object"
+            },
+            "initialDelaySeconds": {
+              "default": 2,
+              "title": "initialDelaySeconds",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "httpGet",
+            "initialDelaySeconds"
+          ],
+          "title": "readinessProbe",
+          "type": "object"
+        },
+        "replicaCount": {
+          "default": "1",
+          "description": " minimum: 1 @schema",
+          "minimum": 1,
+          "required": [],
+          "title": "replicaCount"
+        },
+        "resources": {
+          "properties": {
+            "limits": {
+              "required": [],
+              "title": "limits",
+              "type": "object"
+            },
+            "requests": {
+              "properties": {
+                "cpu": {
+                  "default": "50m",
+                  "title": "cpu",
+                  "type": "string"
+                },
+                "memory": {
+                  "default": "64Mi",
+                  "title": "memory",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "cpu",
+                "memory"
+              ],
+              "title": "requests",
+              "type": "object"
+            }
+          },
+          "required": [
+            "requests",
+            "limits"
+          ],
+          "title": "resources",
+          "type": "object"
+        },
+        "serviceAccount": {
+          "properties": {
+            "annotations": {
+              "required": [],
+              "title": "annotations",
+              "type": "object"
+            },
+            "automountServiceAccountToken": {
+              "default": true,
+              "title": "automountServiceAccountToken",
+              "type": "boolean"
+            },
+            "create": {
+              "default": true,
+              "title": "create",
+              "type": "boolean"
+            },
+            "labels": {
+              "required": [],
+              "title": "labels",
+              "type": "object"
+            },
+            "name": {
+              "default": "",
+              "description": "ServiceAccount name. Empty falls back to a generated name.",
+              "required": [],
+              "title": "name"
+            }
+          },
+          "required": [
+            "create",
+            "annotations",
+            "labels",
+            "automountServiceAccountToken"
+          ],
+          "title": "serviceAccount",
+          "type": "object"
+        },
+        "tolerations": {
+          "items": {
+            "required": []
+          },
+          "title": "tolerations",
+          "type": "array"
+        },
+        "topologySpreadConstraints": {
+          "items": {
+            "required": []
+          },
+          "title": "topologySpreadConstraints",
+          "type": "array"
+        }
+      },
+      "required": [
+        "enabled",
+        "image",
+        "serviceAccount",
+        "podAnnotations",
+        "podLabels",
+        "priorityClassName",
+        "nodeSelector",
+        "tolerations",
+        "affinity",
+        "topologySpreadConstraints",
+        "resources",
+        "podSecurityContext",
+        "containerSecurityContext",
+        "livenessProbe",
+        "readinessProbe",
+        "extraEnv",
+        "extraVolumes",
+        "extraVolumeMounts",
+        "extraContainers",
+        "initContainers",
+        "podDisruptionBudget",
+        "metrics"
+      ],
+      "title": "operator"
+    },
+    "rbac": {
+      "description": "ClusterRoles and ClusterRoleBindings for every enabled component. Set to false when RBAC is centrally managed.",
+      "properties": {
+        "create": {
+          "default": true,
+          "title": "create",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "create"
+      ],
+      "title": "rbac"
+    }
+  },
+  "required": [],
+  "type": "object"
+}

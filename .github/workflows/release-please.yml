@@ -1,0 +1,91 @@
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  # Manual escape hatch: re-run the release-please pass without
+  # waiting for a new push to main.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+
+jobs:
+  # Two release-please packages share one grouped release PR:
+  #
+  #   api  -> tag api/vX.Y.Z, changelog api/CHANGELOG.md
+  #   .    -> tag vX.Y.Z,     changelog CHANGELOG.md
+  #
+  # The root package covers every component image and the chart,
+  # which therefore all ship under one version. Whether a tag
+  # is a prerelease (1.0.0-rc.N) or a stable release (1.0.0) is
+  # controlled per package by the `prerelease` flag in
+  # .github/release-please-config.json; graduating a package is a
+  # one-line edit there.
+  #
+  # `separate-pull-requests: false` is what keeps the manifest from
+  # conflicting with itself. With one PR per package, every branch
+  # carried its own snapshot of .github/release-please-manifest.json,
+  # and release-please rewrites a branch only when that package's
+  # pending release changes -- never when main moves under it. A
+  # sibling release landing therefore left the others unmergeable,
+  # and neither workflow_dispatch (which regenerates stale contents,
+  # not a stale base) nor GitHub's "Update branch" (which refuses on
+  # conflict) recovered them. One branch that release-please owns end
+  # to end has no sibling to conflict with.
+  release-please:
+    runs-on: ubuntu-24.04
+    outputs:
+      # The root package's outputs carry no prefix: the action emits
+      # `<path>--<key>` for every package except path ".", which gets
+      # the bare key.
+      bundle_released: ${{ steps.rp.outputs.release_created }}
+      bundle_tag:      ${{ steps.rp.outputs.tag_name }}
+      api_released:    ${{ steps.rp.outputs['api--release_created'] }}
+      api_tag:         ${{ steps.rp.outputs['api--tag_name'] }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: .github/release-please-config.json
+          manifest-file: .github/release-please-manifest.json
+
+  # Once the bundle tag is cut, publish the four module images under
+  # that one version and package the chart that vendors them. Both
+  # are driven via workflow_call so the release_created output gates
+  # the call explicitly rather than through a tag-prefix filter on
+  # release:published. workflow_dispatch on either workflow covers
+  # manual recovery.
+  #
+  # Nothing runs after an api-only release: its artefact is the Go
+  # module tag, which the module proxy resolves from the tag alone.
+  # The consumer `require` lines are rewritten inside the release PR
+  # by the extra-files entries on the api package, so there is no
+  # post-release bump left to open.
+  publish-images:
+    needs: [release-please]
+    if: needs.release-please.outputs.bundle_released == 'true'
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: read
+    uses: ./.github/workflows/images.yml
+    with:
+      release_tag: ${{ needs.release-please.outputs.bundle_tag }}
+
+  package-chart:
+    needs: [release-please]
+    if: needs.release-please.outputs.bundle_released == 'true'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/chart.yml
+    with:
+      release_tag: ${{ needs.release-please.outputs.bundle_tag }}

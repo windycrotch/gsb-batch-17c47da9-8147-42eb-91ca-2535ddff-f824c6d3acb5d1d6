@@ -1,0 +1,25 @@
+# Bare-metal RoCEv2 with a dedicated RDMA fabric exposed as a
+# NetworkAttachmentDefinition. hostNetwork is off; libmxl binds
+# to the in-pod RDMA netdev (typically `net1`) picked by
+# libfabric via FI_VERBS_IFACE.
+gateway:
+  hostNetwork: false
+  dnsPolicy: ClusterFirst
+  podAnnotations:
+    k8s.v1.cni.cncf.io/networks: network/rdma-roce
+  flags:
+    providers: [verbs, shm]
+    # Explicit empty emits `--bind-address=` (bare equals) and
+    # suppresses the POD_IP fallback; libfabric then picks the
+    # in-pod RDMA netdev.
+    bindAddress: ""
+    # With no bind address narrowing the enumeration, every
+    # interface the pod can see is a candidate. Naming the fabric
+    # subnet is what keeps a mirror off the others.
+    fabricCidr: ["10.20.53.0/24"]
+  rdma:
+    enabled: true
+    resourceName: rdma/hca_shared_devices
+    extraEnv:
+      - name: FI_VERBS_IFACE
+        value: net1

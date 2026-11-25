@@ -1,0 +1,102 @@
+suite: daemonset-agent
+templates:
+  - templates/daemonset-agent.yaml
+tests:
+  - it: renders nothing when agent.enabled=false
+    set:
+      agent.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a DaemonSet with SYS_ADMIN by default
+    asserts:
+      - isKind:
+          of: DaemonSet
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.add
+          content: SYS_ADMIN
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --domain-path=/run/mxl/domain
+
+  - it: pod template name label matches the selector
+    asserts:
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/name"]
+          value: mxl-k8s-agent
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: mxl-k8s-agent
+
+  - it: mounts the whole /run/mxl so the intent socket is host-visible
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[0].hostPath.path
+          value: /run/mxl
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[0].mountPath
+          value: /run/mxl
+
+  - it: NODE_NAME comes from the downward API
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0].name
+          value: NODE_NAME
+      - equal:
+          path: spec.template.spec.containers[0].env[0].valueFrom.fieldRef.fieldPath
+          value: spec.nodeName
+
+  - it: respects custom domainPath everywhere it appears
+    set:
+      agent.flags.domainPath: /var/run/mxl/domain
+      agent.hostPath.run: /var/run/mxl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --domain-path=/var/run/mxl/domain
+      - equal:
+          path: spec.template.spec.volumes[0].hostPath.path
+          value: /var/run/mxl
+
+  - it: drops the shim inside the mounted hostPath by default
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --shim-path=/run/mxl/libmxl-intent.so
+
+  - it: leaves the shim drop out when shimPath is empty
+    set:
+      agent.flags.shimPath: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --shim-path=
+
+  # An image older than a flag rejects it, so a flag left empty must not
+  # reach the binary at all.
+  - it: renders no arg for an empty string flag
+    set:
+      agent.flags.claimStatusLabel: ""
+      agent.flags.provider: ""
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --claim-status-label=
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --provider=
+
+  - it: runs in the host PID namespace so SO_PEERCRED returns host PIDs
+    asserts:
+      - equal:
+          path: spec.template.spec.hostPID
+          value: true
+
+  - it: hostPID is configurable
+    set:
+      agent.hostPID: false
+    asserts:
+      - equal:
+          path: spec.template.spec.hostPID
+          value: false

@@ -1,0 +1,61 @@
+# Consumer pod for the RDMA demo. Uses the libmxl-intent.so shim
+# so the first mxlCreateFlowReader synchronously waits on the
+# agent rather than failing with FLOW_NOT_FOUND.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mxl-rdma-demo-reader
+  namespace: mxl-system
+  labels:
+    app.kubernetes.io/name: mxl-rdma-demo-reader
+    mxl-k8s-demo.qvest-digital.com/role: consumer
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              mxl-k8s-demo.qvest-digital.com/role: producer
+          topologyKey: kubernetes.io/hostname
+  initContainers:
+    - name: install-intent-shim
+      image: local/mxl-shim:dev
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+        - name: intent-shim
+          mountPath: /shared
+  containers:
+    - name: reader
+      image: local/mxl-demo-tools:dev
+      command: ["/opt/libmxl/bin/mxl-info"]
+      args:
+        - "-d"
+        - "/run/mxl/domain"
+      env:
+        - name: LD_PRELOAD
+          value: /opt/mxl-intent/libmxl-intent.so
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK", "SYS_RESOURCE"]
+      volumeMounts:
+        # Mount /run/mxl as a whole rather than the domain subdir and
+        # agent.sock separately. A single-file hostPath mount pins the
+        # socket's inode at container start; when the agent DaemonSet
+        # restarts it unlinks and recreates agent.sock, and an
+        # already-running consumer pod would keep talking to the
+        # orphaned inode forever. Mounting the directory re-resolves
+        # the path on every connect, so it always reaches the agent
+        # that's actually listening.
+        - name: mxl-run
+          mountPath: /run/mxl
+        - name: intent-shim
+          mountPath: /opt/mxl-intent
+          readOnly: true
+  volumes:
+    - name: mxl-run
+      hostPath:
+        path: /run/mxl
+        type: DirectoryOrCreate
+    - name: intent-shim
+      emptyDir: {}

@@ -1,0 +1,69 @@
+# Producer pod for the demo. Writes a synthetic deterministic
+# pattern into a flow on the local MXL domain using the
+# `write-grain` example binary from go-mxl. The labels pin it onto
+# its node so the receiver below can target a different one via
+# anti-affinity.
+#
+# The libmxl-intent.so shim is preloaded here for the producer half
+# of its job: when a producer lands on a node that already holds a
+# mirrored copy of the flow, libmxl opens that copy instead of
+# creating a new one, and only the shim can tell the agent the node
+# gained a producer. Without it the node keeps the Ready it published
+# for the mirrored copy and the flow ends up with no Origin at all.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mxl-tcp-demo-writer
+  namespace: mxl-system
+  labels:
+    app.kubernetes.io/name: mxl-tcp-demo-writer
+    mxl-k8s-demo.qvest-digital.com/role: producer
+spec:
+  initContainers:
+    - name: install-intent-shim
+      image: ghcr.io/qvest-digital/mxl-k8s/shim:dev
+      imagePullPolicy: IfNotPresent
+      volumeMounts:
+        - name: intent-shim
+          mountPath: /shared
+  containers:
+    - name: writer
+      image: ghcr.io/qvest-digital/mxl-k8s/demo-tools:dev
+      command: ["/usr/local/bin/write-grain"]
+      args:
+        - "-domain"
+        - "/run/mxl/domain"
+        - "-flow-def"
+        - "/etc/mxl-demo/flow-video-v210.json"
+      env:
+        - name: LD_PRELOAD
+          value: /opt/mxl-intent/libmxl-intent.so
+      # IPC_LOCK + SYS_RESOURCE: libmxl pins flow pages into RAM via
+      # mlock; tmpfs-backed shared memory needs the same to be
+      # RDMA-pinnable from the gateway sharing this domain.
+      securityContext:
+        capabilities:
+          add: ["IPC_LOCK", "SYS_RESOURCE"]
+      volumeMounts:
+        # Mount /run/mxl as a whole so both the domain subdir and the
+        # agent's intent socket land inside the pod even if the
+        # socket hasn't been created yet at scheduling time.
+        - name: mxl-run
+          mountPath: /run/mxl
+        - name: flow-config
+          mountPath: /etc/mxl-demo
+          readOnly: true
+        - name: intent-shim
+          mountPath: /opt/mxl-intent
+          readOnly: true
+  volumes:
+    - name: mxl-run
+      hostPath:
+        path: /run/mxl
+        type: DirectoryOrCreate
+    - name: flow-config
+      configMap:
+        name: mxl-demo-flow-config
+    - name: intent-shim
+      emptyDir: {}

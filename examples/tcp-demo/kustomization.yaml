@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mxl-system
+
+resources:
+  # CRDs and the operator's generated ClusterRole live in config/.
+  - ../../config/crd
+  - ../../config/rbac
+
+  - 00-namespace.yaml
+  - 01-rbac.yaml
+  - 02-agent.yaml
+  - 03-gateway.yaml
+  - 04-operator.yaml
+  - 10-writer.yaml
+  - 20-receiver.yaml
+  - 21-reader.yaml
+  - 11-writer-audio.yaml
+  - 22-receiver-audio.yaml
+  - 23-reader-audio.yaml
+
+# The demo writer (mxl-gst-testsrc) needs an NMOS flow definition
+# pointed at via --video-config-file. We ship it verbatim from
+# dmf-mxl's examples (Apache-2.0; SPDX header preserved) and mount
+# it into the writer pod as a ConfigMap.
+configMapGenerator:
+  - name: mxl-demo-flow-config
+    files:
+      - flow-video-v210.json
+      - flow-audio-f32.json
+generatorOptions:
+  disableNameSuffixHash: true

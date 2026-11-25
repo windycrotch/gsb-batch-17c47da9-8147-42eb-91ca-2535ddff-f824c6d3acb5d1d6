@@ -1,0 +1,276 @@
+{{ template "chart.header" . }}
+
+{{ template "chart.description" . }}
+
+{{/*
+No appVersion badge. appVersion now tracks the chart version, and the
+badge helm-docs renders is outside the x-release-please blocks below,
+so release-please would leave it behind on every release and the
+helm-docs drift check would fail the release pull request. The version
+appears in the install snippets that follow.
+*/}}
+{{ template "chart.typeBadge" . }}
+
+## Prerequisites
+
+- Helm >= 3.14 (chart uses `values.schema.json`).
+- Kubernetes >= 1.28.
+- Kernel >= 5.17 on every node that runs the agent (`fanotify` with
+  `FAN_REPORT_DFID_NAME`).
+- Prometheus Operator CRDs (`monitoring.coreos.com`) optional, only
+  when `*.metrics.serviceMonitor.enabled=true`.
+- The [mxlfs](https://github.com/danielclasen/mxlfs) kernel module,
+  only when `mxlfs.enabled=true`. A node without it keeps plain domain
+  directories. `mxlfs.huge` needs mxlfs 0.1.0-rc.4 or later;
+  an older module gets the domain mounted without `huge=`.
+  `mxlfs.numa.placement.mode` `node` needs an mxlfs module with
+  `numa_node=`; an older one gets the domain mounted without it. `flow`
+  and `mxlfs.numa.metrics.enabled` need the module's NUMA ioctls; with
+  an older one the rings stay where they are and the NUMA series are
+  left out.
+
+## NUMA placement
+
+`mxlfs.numa.placement.mode` decides on which NUMA node the pages of the
+rings of mxlfs domains are allocated. `off` leaves it to the process
+that allocates them. `node` mounts every domain with
+`mxlfs.numa.placement.node.default` as `numa_node=`. `flow` places
+each ring by its use: the gateway holds the ring of every flow it
+registers with a NIC from before the registration until the last one
+ends, and moves it to the NICs' node first; a target's ring is
+allocated there. The agent moves a ring nothing holds to the node every
+local writer and reader of the flow is confined to, CPUs and memory,
+which needs CPU pinning, and only once it has stayed unheld for
+`mxlfs.numa.placement.flow.release.delay`. A process is confined to a
+node when every CPU its threads may run on is on that node and it may
+allocate from it; a flow with any other local writer or reader counts as
+`unpinned` in `mxl_agent_numa_release_flows`, and the agent never moves
+its ring. On a node whose RDMA devices report no single NUMA node,
+`flow` acts as `off` and the agent and gateway record a
+`MxlfsNumaFlowUnresolved` warning event on the Node.
+
+A page goes to the file's own node preference first, then to the
+mount's `numa_node=`, then to the allocating task's memory policy. A
+file has a preference only in `flow` mode: a moved ring keeps it, so
+its later pages follow it.
+
+## Install via Helm CLI
+
+<!-- x-release-please-start-version -->
+```sh
+helm install mxl oci://ghcr.io/qvest-digital/mxl-k8s/charts/mxl-k8s \
+  --version 1.1.0-rc.61 \
+  --namespace mxl-system --create-namespace
+```
+<!-- x-release-please-end -->
+
+The chart installs the CRDs from its `crds/` directory on first
+install. Helm itself never updates or removes them, and a `helm upgrade`
+of a release installed before a CRD existed does not create it either.
+`mxlfs.enabled=true` needs the `MxlFlowRedundancySet` CRD, without which
+the agent, gateway and operator refuse to start; on such a release,
+apply the chart's CRDs before enabling mxlfs:
+
+<!-- x-release-please-start-version -->
+```sh
+helm show crds oci://ghcr.io/qvest-digital/mxl-k8s/charts/mxl-k8s \
+  --version 1.1.0-rc.61 | kubectl apply --server-side -f -
+```
+<!-- x-release-please-end -->
+
+The FluxCD example below sets `upgrade.crds: CreateReplace`, which
+creates and updates them on every upgrade.
+
+## Install via FluxCD
+
+<!-- x-release-please-start-version -->
+```yaml
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: mxl-k8s
+  namespace: flux-system
+spec:
+  type: oci
+  interval: 1h
+  url: oci://ghcr.io/qvest-digital/mxl-k8s/charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: mxl-k8s
+  namespace: mxl-system
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: mxl-k8s
+      version: "1.1.0-rc.61"
+      sourceRef:
+        kind: HelmRepository
+        name: mxl-k8s
+        namespace: flux-system
+  install:
+    createNamespace: true
+    crds: Create
+  upgrade:
+    crds: CreateReplace
+  values: {}
+```
+<!-- x-release-please-end -->
+
+Track `:dev` instead of a semver range by setting `version: ">=0.0.0-0"`
+on the HelmRelease. The chart is published as `0.0.0-dev+sha.<short>`
+on every merge to `main`; Helm encodes the `+` as `_` in the OCI tag.
+
+## Upgrading
+
+Gateways are upgraded node by node, so a mirror's source and target can
+run different releases for a while. A gateway after 1.1.0-rc.25 sends a
+data grain with no valid slice as an empty one; a target gateway of
+1.1.0-rc.25 or earlier commits that grain as full, with whatever its
+slot held, until it is upgraded too.
+
+After 1.1.0-rc.45, the gateway ServiceMonitor copies a pod's
+`mxl.qvest-digital.com/gateway-variant` label to a `variant` label on
+every gateway series, `mxl_gateway_mirror_*` included. A gateway of a
+`gateway.variants` entry therefore starts new series once on that
+upgrade: the old label set ends and one with `variant` begins, which a
+`rate()` spanning the upgrade or a rule matching the full label set sees
+as two series. Pods of the base gateway carry no variant and keep their
+label sets.
+
+1.1.0-rc.57 publishes each mirror's target descriptor in an
+`MxlFlowMirrorTarget`, names it on the mirror by `status.targetInfoHash`,
+and moves each side's progress timestamp into a heartbeat Lease in
+`mxl-system`, beside the Origin Leases, renewed every five seconds while
+grains move. It still wrote `status.targetInfo`, `status.lastGrainAt`
+and `status.lastSentAt` for gateways and agents that predate it.
+
+1.1.0-rc.60 deprecates those three fields and no longer writes or
+reads them. They stay in the CRD, so a 1.1.0-rc.57 gateway on a node
+not yet upgraded is not rejected for writing them, but nothing fills
+them any more, and the first write of each side's manager removes what
+the previous release left there. Every gateway and agent must run 1.1.0-rc.57 or later
+before upgrading to it: an older source gateway dials only
+`status.targetInfo` and never reaches its target, an older target
+gateway reads the source's progress only from `status.lastSentAt` and
+rebuilds no wedged fabric side, and an older agent waits for
+`status.targetInfo` before it reports an on-demand mirror Ready. The
+gateway refuses to start where the cluster does not serve
+`MxlFlowMirrorTarget`, so the chart's CRDs have to be applied with it.
+Anything that reads a mirror's progress or descriptor reads the
+heartbeat Leases and the `MxlFlowMirrorTarget` instead.
+
+A release after 1.1.0-rc.60 removes the three fields from the
+`MxlFlowMirror` CRD; its changelog lists the removal as a breaking
+change. The API server rejects a server-side apply that names a field
+the schema does not declare, so a gateway still writing them has every
+descriptor, progress and phase write refused. Every gateway, agent and operator must run
+1.1.0-rc.60 or later before upgrading to the release that removes them.
+
+## Bundled image versions
+
+Operator, agent, and gateway are released together with this chart
+under one repository version, so a chart at `X` bundles the images
+published as `vX`. `<component>.image.tag` ships empty and resolves to
+`v{{ "{{" }} .Chart.AppVersion {{ "}}" }}` at render time; there is no
+per-component pin to read or keep current.
+
+The bundled-versions table for each released chart appears in the
+GitHub release notes
+(`https://github.com/qvest-digital/mxl-k8s/releases/tag/v<X>`). The
+`:dev` chart published on every merge to `main` sets every tag to
+`dev` so it tracks main HEAD images.
+
+Overriding stays available per component: `--set
+<comp>.image.tag=<tag>` and `--set <comp>.image.digest=sha256:...`
+both win over the appVersion default, and a digest wins over a tag.
+
+## Common overrides
+
+### Minimal tcp deployment
+
+```yaml
+gateway:
+  flags:
+    providers: [tcp]
+  rdma:
+    enabled: false
+```
+
+### Full RDMA deployment (verbs + shm)
+
+```yaml
+operator:
+  replicaCount: 3
+  flags:
+    leaderElect: true
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+gateway:
+  flags:
+    providers: [verbs, shm]
+  rdma:
+    enabled: true
+    extraEnv:
+      - name: FI_VERBS_IFACE
+        value: net1
+```
+
+### Private registry with pinned digests
+
+```yaml
+global:
+  image:
+    registry: registry.internal.example.com/mxl-k8s
+    pullPolicy: Always
+    pullSecrets:
+      - name: registry-pull-secret
+operator:
+  image:
+    digest: sha256:<digest>
+agent:
+  image:
+    digest: sha256:<digest>
+gateway:
+  image:
+    digest: sha256:<digest>
+```
+
+### IRSA-style ServiceAccount bindings
+
+```yaml
+operator:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/mxl-operator
+```
+
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+
+{{ template "chart.valuesSection" . }}
+
+## Uninstall
+
+Helm leaves the CRDs installed when the chart is uninstalled (they
+live in `crds/`, not `templates/`). Delete them by hand if you want
+them gone:
+
+```sh
+kubectl delete crd \
+  mxldomains.mxl.qvest-digital.com \
+  mxlflows.mxl.qvest-digital.com \
+  mxlflowmirrors.mxl.qvest-digital.com \
+  mxlflowmirrortargets.mxl.qvest-digital.com \
+  mxlflowredundancysets.mxl.qvest-digital.com \
+  mxlnodecapabilities.mxl.qvest-digital.com \
+  mxlreceivers.mxl.qvest-digital.com
+```
+
+{{ template "helm-docs.versionFooter" . }}
