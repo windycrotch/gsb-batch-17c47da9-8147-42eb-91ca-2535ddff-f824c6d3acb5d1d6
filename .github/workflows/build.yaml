@@ -1,0 +1,233 @@
+name: "build"
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+
+  repository_dispatch:
+    types:
+      - trigger_build
+
+  workflow_dispatch:
+  workflow_call:
+
+  schedule:
+    - cron: '0 0 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - name: Linux - Go 1.22
+            go: '1.22'
+            build: yes
+            test: yes
+            lint: no
+            coverage: no
+
+          - name: Linux - Go 1.x
+            go: '1.x'
+            build: yes
+            test: yes
+            lint: no
+            coverage: no
+
+          - name: Linters
+            go: '1.x'
+            build: no
+            test: no
+            lint: yes
+            coverage: no
+
+          - name: Coverage
+            go: '1.x'
+            build: yes
+            test: yes
+            lint: no
+            coverage: yes
+
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        uses: roc-streaming/ci/actions/install-packages@main
+        with:
+          packages: |
+            g++ pkg-config scons ragel gengetopt
+            libuv1-dev libunwind-dev libspeexdsp-dev libsox-dev libsndfile1-dev libpulse-dev
+            libtool intltool autoconf automake make cmake meson
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: |
+            roc/go.sum
+
+      - name: Build Roc
+        run: |
+          git clone https://github.com/roc-streaming/roc-toolkit.git /tmp/roc
+          scons -C /tmp/roc -Q --build-3rdparty=openfec
+          sudo scons -C /tmp/roc -Q --build-3rdparty=openfec install
+
+      - name: Build bindings
+        if: ${{ matrix.build == 'yes' }}
+        run: |
+          cd roc
+          go list -f {{.IgnoredGoFiles}} .
+          go get -v .
+
+      - name: Run tests
+        if: ${{ matrix.test == 'yes' }}
+        run: |
+          cd roc
+          go build && go test -count=1 -covermode=count -coverprofile=coverage.out
+
+      - name: Run tests under race detector
+        if: ${{ matrix.test == 'yes' }}
+        run: |
+          cd roc
+          go build && go test -count=1 -race
+
+      - name: Run tests with cgocheck
+        if: ${{ matrix.test == 'yes' }}
+        run: |
+          cd roc
+          GOEXPERIMENT=cgocheck2 go build && go test -count=1 .
+
+      - name: Run linters
+        if: ${{ matrix.lint == 'yes' }}
+        uses: golangci/golangci-lint-action@v9
+        timeout-minutes: 20
+        with:
+          version: v2.12.2
+          working-directory: roc
+          args: --timeout=20m
+
+      - name: Send coverage report
+        if: ${{ matrix.coverage == 'yes' }}
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: roc/coverage.out
+          format: golang
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        uses: roc-streaming/ci/actions/install-packages@main
+        with:
+          packages: |
+            scons ragel gengetopt libuv speexdsp sox libsndfile cpputest
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.x'
+          cache-dependency-path: |
+            roc/go.sum
+
+      - name: Build Roc
+        run: |
+          git clone https://github.com/roc-streaming/roc-toolkit.git /tmp/roc
+          scons -C /tmp/roc -Q --build-3rdparty=openfec
+          sudo scons -C /tmp/roc -Q --build-3rdparty=openfec install
+
+      - name: Build bindings
+        run: |
+          cd roc
+          go list -f {{.IgnoredGoFiles}} .
+          go get -v .
+
+      - name: Run tests
+        run: |
+          cd roc
+          go build && go test -count=1
+
+      - name: Run tests under race detector
+        run: |
+          cd roc
+          go build && go test -count=1 -race
+
+      - name: Run tests with cgocheck
+        run: |
+          cd roc
+          GOEXPERIMENT=cgocheck2 go build && go test -count=1 .
+
+  formatting:
+    name: Code formatting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.x'
+          cache-dependency-path: |
+            roc/go.sum
+
+      - name: Run gofmt
+        run: |
+          gofmt_out="$(gofmt -s -l -d `find ./roc -name '*.go'` 2>&1)"
+          if [ -n "$gofmt_out" ]; then
+            echo "please run 'make fmt' and commit updated files"
+            echo
+            echo "${gofmt_out}"
+            exit 1
+          fi
+
+  generation:
+    name: Code generation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.x'
+          cache-dependency-path: |
+            roc/go.sum
+
+      - name: Install stringer
+        run: |
+          go install golang.org/x/tools/cmd/stringer@latest
+
+      - name: Run go generate
+        run: |
+          cd roc
+          go generate
+
+      - name: Check for git changes
+        shell: bash -e {0}
+        run: |
+          if [[ $(git status --porcelain | grep -E "^\s*[MARCD?].*\.go$") ]]; then
+            echo "please run 'make gen' and commit updated files"
+            exit 1
+          fi

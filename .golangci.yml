@@ -1,0 +1,50 @@
+version: "2"
+linters:
+  enable:
+    - dupword
+    - exhaustruct
+    - lll
+    - misspell
+    - revive
+  disable:
+    - unused
+  settings:
+    exhaustruct:
+      include:
+        - roc_.*
+    lll:
+      line-length: 100
+    staticcheck:
+      checks:
+        - "SA*"
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - exhaustruct
+        text: _ is missing
+      - linters:
+          - revive
+        text: if-return
+      - linters:
+          - revive
+        text: unused-parameter
+      - linters:
+          - dupword
+        text: long
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
