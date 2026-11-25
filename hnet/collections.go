@@ -10,9 +10,19 @@ func (collection *PlayerCollection) Add(player *Player) {
 	collection.nameMap[player.Info.Name] = player
 }
 
+// Remove detaches the player from the collection. It is a no-op when the
+// player is not present, so repeated disconnect/cleanup paths stay safe.
 func (collection *PlayerCollection) Remove(player *Player) {
-	delete(collection.idMap, player.Info.Id)
-	delete(collection.nameMap, player.Info.Name)
+	// Only delete the name mapping if it still points at this exact player.
+	// A re-login of the same account could have registered a new connection
+	// in the meantime, and we must not remove that fresh entry.
+	if current, ok := collection.idMap[player.Info.Id]; ok && current == player {
+		delete(collection.idMap, player.Info.Id)
+	}
+
+	if current, ok := collection.nameMap[player.Info.Name]; ok && current == player {
+		delete(collection.nameMap, player.Info.Name)
+	}
 }
 
 func (collection *PlayerCollection) Count() int {
@@ -35,18 +45,23 @@ func (collection *PlayerCollection) ByName(name string) *Player {
 	return nil
 }
 
-func (collection *PlayerCollection) All() []Player {
-	players := make([]Player, 0, len(collection.idMap))
+// Ptrs returns a snapshot of the currently contained players as pointers.
+// Callers must hold the server lock while using the collection.
+func (collection *PlayerCollection) Ptrs() []*Player {
+	players := make([]*Player, 0, len(collection.idMap))
 
 	for _, player := range collection.idMap {
-		players = append(players, *player)
+		players = append(players, player)
 	}
 
 	return players
 }
 
+// Broadcast sends a packet to every contained player. It must be called with
+// the server lock held: the snapshot and the writes are then atomic relative
+// to disconnects, so nothing is ever sent to a closed connection.
 func (collection *PlayerCollection) Broadcast(packetId uint32, packet Serializable) {
-	for _, player := range collection.All() {
+	for _, player := range collection.Ptrs() {
 		player.LogOutgoingPacket(packetId, packet)
 		player.SendPacket(packetId, packet)
 	}

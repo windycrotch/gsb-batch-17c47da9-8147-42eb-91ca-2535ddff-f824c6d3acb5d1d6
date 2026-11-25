@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/hexis-revival/hexagon/common"
 )
@@ -120,9 +121,15 @@ func handleStatusChange(stream *common.IOStream, player *Player) error {
 		return fmt.Errorf("failed to read status change")
 	}
 
-	if player.Stats.Status.Action == ACTION_PLAYING {
-		time := player.Stats.Status.TimeSinceChanged()
-		seconds := math.Min(time.Seconds(), 3600*5)
+	// Snapshot the previous status under the lock so it cannot change
+	// concurrently; the database write itself stays outside the lock.
+	player.Server.mutex.Lock()
+	previousAction := player.Stats.Status.Action
+	previousChanged := player.Stats.Status.LastChanged
+	player.Server.mutex.Unlock()
+
+	if previousAction == ACTION_PLAYING {
+		seconds := math.Min(time.Since(previousChanged).Seconds(), 3600*5)
 
 		// Update user's playtime
 		err := common.UpdatePlaytime(
@@ -137,11 +144,17 @@ func handleStatusChange(stream *common.IOStream, player *Player) error {
 	}
 
 	player.LogIncomingPacket(CLIENT_CHANGE_STATUS, status)
+
+	// The status update and the spectator broadcast must be atomic relative
+	// to spectators stopping/disconnecting: once stop has completed, no
+	// further status update may land on that connection.
+	player.Server.mutex.Lock()
 	player.Stats.Status = status
 
-	if player.HasSpectators() {
+	if player.Spectators.Count() > 0 {
 		player.Spectators.Broadcast(SERVER_SPECTATE_STATUS_UPDATE, player.Stats.Status)
 	}
+	player.Server.mutex.Unlock()
 
 	return nil
 }
@@ -154,6 +167,9 @@ func handleRequestStats(stream *common.IOStream, player *Player) error {
 	}
 
 	player.LogIncomingPacket(CLIENT_REQUEST_STATS, statsRequest)
+
+	player.Server.mutex.Lock()
+	defer player.Server.mutex.Unlock()
 
 	for _, userId := range statsRequest.UserIds {
 		user := player.Server.Players.ByID(userId)
@@ -175,21 +191,25 @@ func handleStartSpectating(stream *common.IOStream, player *Player) error {
 		return fmt.Errorf("failed to read spectate request")
 	}
 
+	player.LogIncomingPacket(CLIENT_START_SPECTATING, request)
+
+	// Lookup and relation change happen in one critical section: if the
+	// target disconnects at the same time, either the request fails with
+	// "not found" or it fully succeeds before teardown runs - never a
+	// dangling relation to an offline player.
+	player.Server.mutex.Lock()
+	defer player.Server.mutex.Unlock()
+
 	target := player.Server.Players.ByID(request.UserId)
 
 	if target == nil {
 		return fmt.Errorf("user %d not found", request.UserId)
 	}
 
-	player.LogIncomingPacket(CLIENT_START_SPECTATING, request)
-	return player.StartSpectating(target)
+	return player.startSpectating(target)
 }
 
 func handleStopSpectating(stream *common.IOStream, player *Player) error {
-	if !player.IsSpectating() {
-		return nil
-	}
-
 	request := ReadSpectateRequest(stream)
 
 	if request == nil {
@@ -197,7 +217,13 @@ func handleStopSpectating(stream *common.IOStream, player *Player) error {
 	}
 
 	player.LogIncomingPacket(CLIENT_STOP_SPECTATING, request)
-	return player.StopSpectating()
+
+	player.Server.mutex.Lock()
+	defer player.Server.mutex.Unlock()
+
+	// Safe with no active host (including stops against an already offline
+	// target): stopSpectating is a no-op in that case.
+	return player.stopSpectating()
 }
 
 func handleHasMap(stream *common.IOStream, player *Player) error {
@@ -213,16 +239,20 @@ func handleHasMap(stream *common.IOStream, player *Player) error {
 		UserId: player.Info.Id,
 		HasMap: request.HasMap,
 	}
-	player.Host.SendPacket(SERVER_SPECTATE_HAS_MAP, response)
 
-	return nil
-}
+	player.Server.mutex.Lock()
+	defer player.Server.mutex.Unlock()
 
-func handleSpectateFrames(stream *common.IOStream, player *Player) error {
-	if !player.HasSpectators() {
+	// The host may have gone away without an explicit stop; only forward
+	// while the relation still exists.
+	if player.Host == nil || player.Host.closed {
 		return nil
 	}
 
+	return player.Host.SendPacket(SERVER_SPECTATE_HAS_MAP, response)
+}
+
+func handleSpectateFrames(stream *common.IOStream, player *Player) error {
 	scorePack := ReadScorePack(stream)
 
 	if scorePack == nil {
@@ -230,6 +260,17 @@ func handleSpectateFrames(stream *common.IOStream, player *Player) error {
 	}
 
 	player.LogIncomingPacket(CLIENT_SPECTATE_FRAMES, scorePack)
+
+	player.Server.mutex.Lock()
+	defer player.Server.mutex.Unlock()
+
+	// Snapshot and writes are atomic with disconnects: a spectator removed
+	// concurrently never receives a frame, and no write targets a closed
+	// connection.
+	if player.Spectators.Count() == 0 {
+		return nil
+	}
+
 	player.Spectators.Broadcast(SERVER_SPECTATE_FRAMES, scorePack)
 	return nil
 }
@@ -241,7 +282,9 @@ func handleUserRelationshipAdd(stream *common.IOStream, player *Player) error {
 		return fmt.Errorf("failed to read relationship request")
 	}
 
+	player.Server.mutex.Lock()
 	target := player.Server.Players.ByID(request.UserId)
+	player.Server.mutex.Unlock()
 
 	if target == nil {
 		return fmt.Errorf("user %d not found", request.UserId)
@@ -265,7 +308,9 @@ func handleUserRelationshipRemove(stream *common.IOStream, player *Player) error
 		return fmt.Errorf("failed to read relationship request")
 	}
 
+	player.Server.mutex.Lock()
 	target := player.Server.Players.ByID(request.UserId)
+	player.Server.mutex.Unlock()
 
 	if target == nil {
 		return fmt.Errorf("user %d not found", request.UserId)
