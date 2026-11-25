@@ -259,13 +259,38 @@ err := ffgo.TwoPassTranscode("input.mp4", "output.mp4", &ffgo.EncoderOptions{
 ### HLS streaming
 
 ```go
-segmenter, err := ffgo.NewHLSSegmenter(&ffgo.HLSOptions{
-    SegmentTime:       6,
-    ListSize:          5,
-    OutputDir:         "./hls",
-    SegmentFilename:   "segment_%03d.ts",
-    PlaylistFilename:  "playlist.m3u8",
+segmenter, err := ffgo.NewHLSSegmenter("./hls/playlist.m3u8", &ffgo.HLSSegmenterConfig{
+    SegmentTime:            6 * time.Second,
+    ListSize:               5, // 0 keeps every segment
+    SegmentFilenamePattern: "./hls/segment_%03d.ts",
 })
+if err != nil {
+    return err
+}
+defer segmenter.Close()
+
+videoStream, err := segmenter.AddVideoStream(&ffgo.VideoStreamConfig{
+    Codec: ffgo.CodecIDH264, Width: 1280, Height: 720,
+})
+if err != nil {
+    return err
+}
+if err := segmenter.WriteHeader(); err != nil { // applies the config above
+    return err
+}
+
+for _, frame := range frames {
+    if err := segmenter.WriteFrame(videoStream, frame); err != nil {
+        // Once a frame fails to be written, every later WriteFrame returns the
+        // same error, so break out of the loop.
+        return err
+    }
+}
+
+// Close verifies the playlist against the segments on disk. It returns an
+// error (wrapping ffgo.ErrIncompletePlaylist) if the playlist had to be
+// repaired, and the same error on every subsequent Close call.
+return segmenter.Close()
 ```
 
 ### Custom logging

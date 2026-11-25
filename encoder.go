@@ -69,6 +69,15 @@ type Encoder struct {
 	closed        bool
 	hasVideo      bool
 	hasAudio      bool
+
+	// writeErr is the first unrecoverable write error. Once set, all further
+	// WriteFrame/WritePacket calls return it, so a broken pipeline cannot keep
+	// producing output that looks complete.
+	writeErr error
+
+	// finalErr is the result of the single finalization performed by Close.
+	// It is returned by every subsequent Close call.
+	finalErr error
 }
 
 // EncoderConfig configures encoder behavior (video-only, for compatibility).
@@ -849,7 +858,10 @@ func (e *Encoder) WritePacket(packet *Packet) error {
 	defer e.mu.Unlock()
 
 	if e.closed {
-		return errors.New("ffgo: encoder is closed")
+		return ErrClosed
+	}
+	if e.writeErr != nil {
+		return e.writeErr
 	}
 
 	if !e.copyVideo && !e.copyAudio {
@@ -900,7 +912,11 @@ func (e *Encoder) WritePacket(packet *Packet) error {
 	avcodec.SetPacketStreamIndex(packet.ptr, int32(outputStreamIdx))
 
 	// Write packet
-	return avformat.InterleavedWriteFrame(e.formatCtx, packet.ptr)
+	err := avformat.InterleavedWriteFrame(e.formatCtx, packet.ptr)
+	if err != nil {
+		e.writeErr = err
+	}
+	return err
 }
 
 // applyVideoOptions applies advanced video encoding options via av_opt_set.
@@ -1082,19 +1098,29 @@ func (e *Encoder) WriteHeader() error {
 	defer e.mu.Unlock()
 
 	if e.closed {
-		return errors.New("ffgo: encoder is closed")
+		return ErrClosed
+	}
+	if e.writeErr != nil {
+		return e.writeErr
 	}
 	return e.writeHeaderLocked()
 }
 
 // WriteFrame encodes and writes a frame.
 // The frame must have the correct format, width, and height.
+//
+// If an encoded packet cannot be written, the error is remembered and every
+// later WriteFrame call returns the same error instead of continuing to
+// produce output from a broken pipeline.
 func (e *Encoder) WriteFrame(frame Frame) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.closed {
-		return errors.New("ffgo: encoder is closed")
+		return ErrClosed
+	}
+	if e.writeErr != nil {
+		return e.writeErr
 	}
 
 	// Auto-write header if not done
@@ -1112,8 +1138,10 @@ func (e *Encoder) WriteFrame(frame Frame) error {
 
 	// Send frame to encoder
 	if err := avcodec.SendFrame(e.codecCtx, frame.ptr); err != nil {
-		// EAGAIN means we need to receive packets first
+		// EAGAIN means we need to receive packets first. Any other error is
+		// fatal for the pipeline: remember it so later writes fail too.
 		if !avutil.IsAgain(err) {
+			e.writeErr = err
 			return err
 		}
 	}
@@ -1127,6 +1155,7 @@ func (e *Encoder) WriteFrame(frame Frame) error {
 			if avutil.IsAgain(err) || avutil.IsEOF(err) {
 				return nil // No more packets available
 			}
+			e.writeErr = err
 			return err
 		}
 
@@ -1135,6 +1164,7 @@ func (e *Encoder) WriteFrame(frame Frame) error {
 
 		// Write packet
 		if err := avformat.InterleavedWriteFrame(e.formatCtx, e.packet); err != nil {
+			e.writeErr = err
 			return err
 		}
 	}
@@ -1152,7 +1182,10 @@ func (e *Encoder) WriteAudioFrame(frame Frame) error {
 	defer e.mu.Unlock()
 
 	if e.closed {
-		return errors.New("ffgo: encoder is closed")
+		return ErrClosed
+	}
+	if e.writeErr != nil {
+		return e.writeErr
 	}
 	if !e.hasAudio {
 		return errors.New("ffgo: encoder was not configured with audio")
@@ -1180,6 +1213,7 @@ func (e *Encoder) WriteAudioFrame(frame Frame) error {
 		if avutil.IsEOF(err) {
 			return nil
 		}
+		e.writeErr = err
 		return err
 	}
 
@@ -1192,6 +1226,7 @@ func (e *Encoder) WriteAudioFrame(frame Frame) error {
 			if avutil.IsEOF(err) || avutil.IsAgain(err) {
 				break
 			}
+			e.writeErr = err
 			return err
 		}
 
@@ -1206,6 +1241,7 @@ func (e *Encoder) WriteAudioFrame(frame Frame) error {
 
 		// Write packet
 		if err := avformat.InterleavedWriteFrame(e.formatCtx, e.audioPacket); err != nil {
+			e.writeErr = err
 			return err
 		}
 	}
@@ -1277,16 +1313,21 @@ func (e *Encoder) AudioSampleFormat() SampleFormat {
 }
 
 // Close finalizes and closes the encoder.
+//
+// Finalization (encoder flush + trailer) happens exactly once. If it fails the
+// error is returned, resources are still released, and later Close calls
+// return the same error without flushing or writing the trailer again. A
+// pending WriteFrame error is reported too, since the output is incomplete.
 func (e *Encoder) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if e.closed {
-		return nil
+		return e.finalErr
 	}
 	e.closed = true
 
-	var firstErr error
+	e.finalErr = e.writeErr
 
 	// Flush video encoder
 	if e.videoCodecCtx != nil && e.headerWritten {
@@ -1328,13 +1369,13 @@ func (e *Encoder) Close() error {
 
 	// Write trailer
 	if e.formatCtx != nil && e.headerWritten {
-		if err := avformat.WriteTrailer(e.formatCtx); err != nil && firstErr == nil {
-			firstErr = err
+		if err := avformat.WriteTrailer(e.formatCtx); err != nil && e.finalErr == nil {
+			e.finalErr = err
 		}
 	}
 
 	e.cleanup()
-	return firstErr
+	return e.finalErr
 }
 
 // cleanup releases all resources.

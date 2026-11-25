@@ -38,6 +38,17 @@ var (
 	// ErrDeviceEnumerationUnavailable indicates device enumeration is not available
 	// (e.g. missing shim wrappers, unsupported FFmpeg build, or platform constraints).
 	ErrDeviceEnumerationUnavailable = errors.New("ffgo: device enumeration not available")
+
+	// ErrIncompletePlaylist indicates that a generated HLS playlist referenced
+	// segments that were never committed to disk (for example because a write
+	// failed mid-stream). ffgo removes such stale entries before returning this
+	// error so downstream consumers never see a playlist pointing at missing
+	// files.
+	ErrIncompletePlaylist = errors.New("ffgo: HLS playlist is inconsistent with the segments on disk")
+
+	// ErrMuxerFinalized indicates that the muxer's trailer has already been
+	// written, so no further frames or packets can be accepted.
+	ErrMuxerFinalized = errors.New("ffgo: muxer is finalized")
 )
 
 // Error code constants re-exported from avutil

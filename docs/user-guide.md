@@ -833,6 +833,49 @@ muxer.WriteTrailer()
 muxer.Close()
 ```
 
+### Error Handling and Finalization Guarantees
+
+`Muxer` (and the lower-level `Encoder`) make the transcode pipeline consistent
+under failure and concurrent shutdown:
+
+- **Sticky write errors.** The first unrecoverable write error is remembered.
+  Every subsequent `WriteFrame`/`WritePacket` returns that same error, so a
+  broken stream cannot keep producing segments that look complete.
+- **Single, idempotent finalization.** `WriteTrailer` and `Close` share one
+  finalization step (flush encoders, write the trailer, verify HLS output).
+  It runs at most once. Calling `Close` twice, or calling `Close` while another
+  goroutine is still writing, is safe: later calls return the same result
+  without writing the trailer again or double-freeing resources.
+- **Failures are visible.** If finalization fails (including a pending write
+  error), `Close` returns a non-nil error and keeps returning it on every later
+  call.
+- **HLS output verification.** For HLS outputs, finalization parses the
+  playlist and checks that every referenced segment exists as a non-empty file.
+  Entries for segments that were never committed are removed, the entry count
+  is capped to `hls_list_size`, and an error wrapping
+  `ffgo.ErrIncompletePlaylist` is returned when a repair was needed.
+
+```go
+segmenter, _ := ffgo.NewHLSSegmenter("out/playlist.m3u8", &ffgo.HLSSegmenterConfig{
+    SegmentTime:            2 * time.Second,
+    ListSize:               5, // 0 = unlimited
+    SegmentFilenamePattern: "out/seg_%03d.ts",
+})
+// ... add streams and WriteHeader ...
+
+for _, frame := range frames {
+    if err := segmenter.WriteFrame(videoStream, frame); err != nil {
+        // Sticky: stop writing. Close still finalizes and reports the error.
+        break
+    }
+}
+
+if err := segmenter.Close(); err != nil {
+    // Wraps ErrIncompletePlaylist when the playlist had to be repaired.
+    log.Printf("HLS finalization: %v", err)
+}
+```
+
 ### Adding Subtitles
 
 ```go
