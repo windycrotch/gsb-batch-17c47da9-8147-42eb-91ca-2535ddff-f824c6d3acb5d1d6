@@ -7,6 +7,19 @@ import (
 	"github.com/gogpu/gputypes"
 )
 
+// mustFinishBundle finishes a render bundle encoder, failing the test on error.
+func mustFinishBundle(t *testing.T, enc *RenderBundleEncoder) *RenderBundle {
+	t.Helper()
+	bundle, err := enc.Finish(nil)
+	if err != nil {
+		t.Fatalf("Finish failed: %v", err)
+	}
+	if bundle == nil {
+		t.Fatal("Finish returned nil")
+	}
+	return bundle
+}
+
 func TestCreateRenderBundleEncoder(t *testing.T) {
 	inst, err := CreateInstance(nil)
 	if err != nil {
@@ -67,7 +80,10 @@ func TestRenderBundleEncoderFinish(t *testing.T) {
 	}
 
 	t.Log("Finishing render bundle encoder (empty bundle)...")
-	bundle := encoder.Finish(nil)
+	bundle, err := encoder.Finish(nil)
+	if err != nil {
+		t.Fatalf("Finish failed: %v", err)
+	}
 	if bundle == nil {
 		t.Fatal("Finish returned nil")
 	}
@@ -145,10 +161,7 @@ fn fs_main() -> @location(0) vec4<f32> {
 	bundleEncoder.SetPipeline(pipeline)
 	bundleEncoder.Draw(3, 1, 0, 0)
 
-	bundle := bundleEncoder.Finish(nil)
-	if bundle == nil {
-		t.Fatal("Finish returned nil")
-	}
+	bundle := mustFinishBundle(t, bundleEncoder)
 	defer bundle.Release()
 
 	t.Logf("RenderBundle with draw commands created: handle=%#x", bundle.Handle())
@@ -244,10 +257,7 @@ fn fs_main() -> @location(0) vec4<f32> {
 	bundleEncoder.SetVertexBuffer(0, vertexBuffer, 0, bufferSize)
 	bundleEncoder.Draw(3, 1, 0, 0)
 
-	bundle := bundleEncoder.Finish(nil)
-	if bundle == nil {
-		t.Fatal("Finish returned nil")
-	}
+	bundle := mustFinishBundle(t, bundleEncoder)
 	defer bundle.Release()
 
 	t.Logf("RenderBundle with vertex buffer created: handle=%#x", bundle.Handle())

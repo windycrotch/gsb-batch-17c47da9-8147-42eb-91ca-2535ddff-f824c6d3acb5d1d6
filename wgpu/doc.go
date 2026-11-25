@@ -143,7 +143,10 @@
 //	)
 //	bundleEncoder.SetPipeline(pipeline)
 //	bundleEncoder.Draw(3, 1, 0, 0)
-//	bundle := bundleEncoder.Finish(nil)
+//	bundle, err := bundleEncoder.Finish(nil)
+//	if err != nil {
+//	    // handle error
+//	}
 //	defer bundle.Release()
 //
 //	// Later, in a render pass:

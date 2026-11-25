@@ -293,7 +293,10 @@ fn fs_main() -> @location(0) vec4<f32> {
 	bundleEncoder.SetPipeline(pipeline)
 	bundleEncoder.DrawIndirect(indirectBuffer, 0)
 
-	bundle := bundleEncoder.Finish(nil)
+	bundle, err := bundleEncoder.Finish(nil)
+	if err != nil {
+		t.Fatalf("Finish failed: %v", err)
+	}
 	if bundle == nil {
 		t.Fatal("Finish returned nil")
 	}

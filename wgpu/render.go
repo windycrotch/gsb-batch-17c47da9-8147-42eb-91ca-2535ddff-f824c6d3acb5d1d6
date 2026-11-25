@@ -123,6 +123,9 @@ func (enc *CommandEncoder) BeginRenderPass(desc *RenderPassDescriptor) (*RenderP
 	if len(desc.ColorAttachments) == 0 {
 		return nil, &WGPUError{Op: "BeginRenderPass", Message: "no color attachments"}
 	}
+	if err := enc.beginPass("BeginRenderPass"); err != nil {
+		return nil, err
+	}
 
 	// Build native color attachments
 	nativeColorAttachments := make([]renderPassColorAttachment, len(desc.ColorAttachments))
@@ -203,26 +206,41 @@ func (enc *CommandEncoder) BeginRenderPass(desc *RenderPassDescriptor) (*RenderP
 		uintptr(unsafe.Pointer(&nativeDesc)),
 	)
 	if handle == 0 {
+		enc.abortPass()
 		return nil, &WGPUError{Op: "BeginRenderPass", Message: "wgpu returned null handle"}
 	}
 	trackResource(handle, "RenderPassEncoder")
-	return &RenderPassEncoder{handle: handle}, nil
+	return &RenderPassEncoder{handle: handle, encoder: enc}, nil
 }
 
 // SetPipeline sets the render pipeline for this pass.
-func (rpe *RenderPassEncoder) SetPipeline(pipeline *RenderPipeline) {
+// Returns an error if the pass has ended or been released, or if the
+// pipeline is nil or released.
+func (rpe *RenderPassEncoder) SetPipeline(pipeline *RenderPipeline) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || pipeline == nil || pipeline.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetPipeline"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if pipeline == nil || pipeline.handle == 0 {
+		return lifecycleError(op, ErrDependencyReleased)
 	}
 	procRenderPassEncoderSetPipeline.Call(rpe.handle, pipeline.handle) //nolint:errcheck
+	rpe.pipeline = pipeline
+	return nil
 }
 
 // SetBindGroup sets a bind group for this pass.
-func (rpe *RenderPassEncoder) SetBindGroup(groupIndex uint32, group *BindGroup, dynamicOffsets []uint32) {
+func (rpe *RenderPassEncoder) SetBindGroup(groupIndex uint32, group *BindGroup, dynamicOffsets []uint32) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || group == nil || group.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetBindGroup"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if group == nil || group.handle == 0 {
+		return lifecycleError(op, ErrDependencyReleased)
 	}
 
 	var offsetsPtr uintptr
@@ -239,13 +257,23 @@ func (rpe *RenderPassEncoder) SetBindGroup(groupIndex uint32, group *BindGroup, 
 		offsetCount,
 		offsetsPtr,
 	)
+	if rpe.bindGroups == nil {
+		rpe.bindGroups = make(map[uint32]*BindGroup)
+	}
+	rpe.bindGroups[groupIndex] = group
+	return nil
 }
 
 // SetVertexBuffer sets a vertex buffer for this pass.
-func (rpe *RenderPassEncoder) SetVertexBuffer(slot uint32, buffer *Buffer, offset, size uint64) {
+func (rpe *RenderPassEncoder) SetVertexBuffer(slot uint32, buffer *Buffer, offset, size uint64) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || buffer == nil || buffer.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetVertexBuffer"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if buffer == nil || buffer.handle == 0 {
+		return lifecycleError(op, ErrDependencyReleased)
 	}
 	procRenderPassEncoderSetVertexBuffer.Call( //nolint:errcheck
 		rpe.handle,
@@ -254,13 +282,23 @@ func (rpe *RenderPassEncoder) SetVertexBuffer(slot uint32, buffer *Buffer, offse
 		uintptr(offset),
 		uintptr(size),
 	)
+	if rpe.vertexBuffers == nil {
+		rpe.vertexBuffers = make(map[uint32]*Buffer)
+	}
+	rpe.vertexBuffers[slot] = buffer
+	return nil
 }
 
 // SetIndexBuffer sets the index buffer for this pass.
-func (rpe *RenderPassEncoder) SetIndexBuffer(buffer *Buffer, format gputypes.IndexFormat, offset, size uint64) {
+func (rpe *RenderPassEncoder) SetIndexBuffer(buffer *Buffer, format gputypes.IndexFormat, offset, size uint64) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || buffer == nil || buffer.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetIndexBuffer"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if buffer == nil || buffer.handle == 0 {
+		return lifecycleError(op, ErrDependencyReleased)
 	}
 	procRenderPassEncoderSetIndexBuffer.Call( //nolint:errcheck
 		rpe.handle,
@@ -269,13 +307,22 @@ func (rpe *RenderPassEncoder) SetIndexBuffer(buffer *Buffer, format gputypes.Ind
 		uintptr(offset),
 		uintptr(size),
 	)
+	rpe.indexBuffer = buffer
+	return nil
 }
 
 // Draw draws primitives.
-func (rpe *RenderPassEncoder) Draw(vertexCount, instanceCount, firstVertex, firstInstance uint32) {
+// Fails if the pass has ended or a resource bound to the pass (pipeline,
+// vertex/index buffer, bind group) has been released.
+func (rpe *RenderPassEncoder) Draw(vertexCount, instanceCount, firstVertex, firstInstance uint32) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.Draw"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if err := rpe.checkDependenciesLocked(op); err != nil {
+		return err
 	}
 	procRenderPassEncoderDraw.Call( //nolint:errcheck
 		rpe.handle,
@@ -284,13 +331,19 @@ func (rpe *RenderPassEncoder) Draw(vertexCount, instanceCount, firstVertex, firs
 		uintptr(firstVertex),
 		uintptr(firstInstance),
 	)
+	return nil
 }
 
 // DrawIndexed draws indexed primitives.
-func (rpe *RenderPassEncoder) DrawIndexed(indexCount, instanceCount, firstIndex uint32, baseVertex int32, firstInstance uint32) {
+func (rpe *RenderPassEncoder) DrawIndexed(indexCount, instanceCount, firstIndex uint32, baseVertex int32, firstInstance uint32) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.DrawIndexed"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if err := rpe.checkDependenciesLocked(op); err != nil {
+		return err
 	}
 	procRenderPassEncoderDrawIndexed.Call( //nolint:errcheck
 		rpe.handle,
@@ -300,6 +353,7 @@ func (rpe *RenderPassEncoder) DrawIndexed(indexCount, instanceCount, firstIndex 
 		uintptr(baseVertex),
 		uintptr(firstInstance),
 	)
+	return nil
 }
 
 // DrawIndirect draws primitives using parameters from a GPU buffer.
@@ -308,16 +362,25 @@ func (rpe *RenderPassEncoder) DrawIndexed(indexCount, instanceCount, firstIndex 
 //   - instanceCount (uint32)
 //   - firstVertex (uint32)
 //   - firstInstance (uint32)
-func (rpe *RenderPassEncoder) DrawIndirect(indirectBuffer *Buffer, indirectOffset uint64) {
+func (rpe *RenderPassEncoder) DrawIndirect(indirectBuffer *Buffer, indirectOffset uint64) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || indirectBuffer == nil || indirectBuffer.handle == 0 {
-		return
+	const op = "RenderPassEncoder.DrawIndirect"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if err := rpe.checkDependenciesLocked(op); err != nil {
+		return err
+	}
+	if indirectBuffer == nil || indirectBuffer.handle == 0 {
+		return lifecycleError(op, ErrDependencyReleased)
 	}
 	procRenderPassEncoderDrawIndirect.Call( //nolint:errcheck
 		rpe.handle,
 		indirectBuffer.handle,
 		uintptr(indirectOffset),
 	)
+	return nil
 }
 
 // DrawIndexedIndirect draws indexed primitives using parameters from a GPU buffer.
@@ -327,27 +390,38 @@ func (rpe *RenderPassEncoder) DrawIndirect(indirectBuffer *Buffer, indirectOffse
 //   - firstIndex (uint32)
 //   - baseVertex (int32)
 //   - firstInstance (uint32)
-func (rpe *RenderPassEncoder) DrawIndexedIndirect(indirectBuffer *Buffer, indirectOffset uint64) {
+func (rpe *RenderPassEncoder) DrawIndexedIndirect(indirectBuffer *Buffer, indirectOffset uint64) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || indirectBuffer == nil || indirectBuffer.handle == 0 {
-		return
+	const op = "RenderPassEncoder.DrawIndexedIndirect"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if err := rpe.checkDependenciesLocked(op); err != nil {
+		return err
+	}
+	if indirectBuffer == nil || indirectBuffer.handle == 0 {
+		return lifecycleError(op, ErrDependencyReleased)
 	}
 	procRenderPassEncoderDrawIndexedIndirect.Call( //nolint:errcheck
 		rpe.handle,
 		indirectBuffer.handle,
 		uintptr(indirectOffset),
 	)
+	return nil
 }
 
 // SetViewport sets the viewport used during the rasterization stage.
 // x, y: top-left corner of the viewport in pixels
 // width, height: dimensions of the viewport in pixels
 // minDepth, maxDepth: depth range for the viewport (typically 0.0 to 1.0)
-func (rpe *RenderPassEncoder) SetViewport(x, y, width, height, minDepth, maxDepth float32) {
+func (rpe *RenderPassEncoder) SetViewport(x, y, width, height, minDepth, maxDepth float32) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetViewport"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
 	}
+	defer rpe.mu.Unlock()
 	procRenderPassEncoderSetViewport.Call( //nolint:errcheck
 		rpe.handle,
 		uintptr(math.Float32bits(x)),
@@ -357,17 +431,20 @@ func (rpe *RenderPassEncoder) SetViewport(x, y, width, height, minDepth, maxDept
 		uintptr(math.Float32bits(minDepth)),
 		uintptr(math.Float32bits(maxDepth)),
 	)
+	return nil
 }
 
 // SetScissorRect sets the scissor rectangle used during the rasterization stage.
 // Pixels outside the scissor rectangle will be discarded.
 // x, y: top-left corner of the scissor rectangle in pixels
 // width, height: dimensions of the scissor rectangle in pixels
-func (rpe *RenderPassEncoder) SetScissorRect(x, y, width, height uint32) {
+func (rpe *RenderPassEncoder) SetScissorRect(x, y, width, height uint32) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetScissorRect"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
 	}
+	defer rpe.mu.Unlock()
 	procRenderPassEncoderSetScissorRect.Call( //nolint:errcheck
 		rpe.handle,
 		uintptr(x),
@@ -375,43 +452,55 @@ func (rpe *RenderPassEncoder) SetScissorRect(x, y, width, height uint32) {
 		uintptr(width),
 		uintptr(height),
 	)
+	return nil
 }
 
 // SetBlendConstant sets the blend constant color used by blend operations.
 // Errors are reported via Device error scopes.
-func (rpe *RenderPassEncoder) SetBlendConstant(color *Color) {
+func (rpe *RenderPassEncoder) SetBlendConstant(color *Color) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 || color == nil {
-		return
+	const op = "RenderPassEncoder.SetBlendConstant"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
+	}
+	defer rpe.mu.Unlock()
+	if color == nil {
+		return &WGPUError{Op: op, Message: "color is nil"}
 	}
 	procRenderPassEncoderSetBlendConstant.Call( //nolint:errcheck
 		rpe.handle,
 		uintptr(unsafe.Pointer(color)),
 	)
+	return nil
 }
 
 // SetStencilReference sets the stencil reference value used by stencil operations.
-func (rpe *RenderPassEncoder) SetStencilReference(reference uint32) {
+func (rpe *RenderPassEncoder) SetStencilReference(reference uint32) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.SetStencilReference"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
 	}
+	defer rpe.mu.Unlock()
 	procRenderPassEncoderSetStencilReference.Call( //nolint:errcheck
 		rpe.handle,
 		uintptr(reference),
 	)
+	return nil
 }
 
 // InsertDebugMarker inserts a single debug marker label into the render pass.
 // This is useful for GPU debugging tools to identify specific command points.
-func (rpe *RenderPassEncoder) InsertDebugMarker(markerLabel string) {
+func (rpe *RenderPassEncoder) InsertDebugMarker(markerLabel string) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.InsertDebugMarker"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
 	}
+	defer rpe.mu.Unlock()
 	labelBytes := []byte(markerLabel)
 	if len(labelBytes) == 0 {
-		return
+		return nil
 	}
 	label := StringView{
 		Data:   uintptr(unsafe.Pointer(&labelBytes[0])),
@@ -421,18 +510,21 @@ func (rpe *RenderPassEncoder) InsertDebugMarker(markerLabel string) {
 		rpe.handle,
 		uintptr(unsafe.Pointer(&label)),
 	)
+	return nil
 }
 
 // PushDebugGroup begins a labeled debug group in the render pass.
 // Use PopDebugGroup to end the group. Groups can be nested.
-func (rpe *RenderPassEncoder) PushDebugGroup(groupLabel string) {
+func (rpe *RenderPassEncoder) PushDebugGroup(groupLabel string) error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.PushDebugGroup"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
 	}
+	defer rpe.mu.Unlock()
 	labelBytes := []byte(groupLabel)
 	if len(labelBytes) == 0 {
-		return
+		return nil
 	}
 	label := StringView{
 		Data:   uintptr(unsafe.Pointer(&labelBytes[0])),
@@ -442,33 +534,85 @@ func (rpe *RenderPassEncoder) PushDebugGroup(groupLabel string) {
 		rpe.handle,
 		uintptr(unsafe.Pointer(&label)),
 	)
+	return nil
 }
 
 // PopDebugGroup ends the current debug group in the render pass.
 // Must match a preceding PushDebugGroup call.
-func (rpe *RenderPassEncoder) PopDebugGroup() {
+func (rpe *RenderPassEncoder) PopDebugGroup() error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.PopDebugGroup"
+	if err := rpe.lockRecording(op); err != nil {
+		return err
 	}
+	defer rpe.mu.Unlock()
 	procRenderPassEncoderPopDebugGroup.Call(rpe.handle) //nolint:errcheck
+	return nil
 }
 
 // End ends the render pass.
-func (rpe *RenderPassEncoder) End() {
+// The first call ends the pass in the native layer; subsequent calls return
+// ErrPassEnded without touching the native layer again. After End, all
+// recording methods on this pass are rejected.
+func (rpe *RenderPassEncoder) End() error {
 	mustInit()
-	if rpe == nil || rpe.handle == 0 {
-		return
+	const op = "RenderPassEncoder.End"
+	if rpe == nil {
+		return &WGPUError{Op: op, Message: "render pass encoder is nil"}
 	}
-	procRenderPassEncoderEnd.Call(rpe.handle) //nolint:errcheck
+	rpe.mu.Lock()
+	if rpe.released {
+		rpe.mu.Unlock()
+		return lifecycleError(op, ErrReleased)
+	}
+	if rpe.ended {
+		rpe.mu.Unlock()
+		return lifecycleError(op, ErrPassEnded)
+	}
+	rpe.ended = true
+	handle := rpe.handle
+	enc := rpe.encoder
+	rpe.mu.Unlock()
+
+	if handle != 0 {
+		procRenderPassEncoderEnd.Call(handle) //nolint:errcheck
+	}
+	if enc != nil {
+		enc.passEnded()
+	}
+	return nil
 }
 
 // Release releases the render pass encoder.
+// It is idempotent: the native release runs at most once. Releasing a pass
+// that was never ended invalidates its parent command encoder.
 func (rpe *RenderPassEncoder) Release() {
-	if rpe.handle != 0 {
-		untrackResource(rpe.handle)
-		procRenderPassEncoderRelease.Call(rpe.handle) //nolint:errcheck
-		rpe.handle = 0
+	if rpe == nil {
+		return
+	}
+	rpe.mu.Lock()
+	if rpe.released {
+		rpe.mu.Unlock()
+		return
+	}
+	rpe.released = true
+	wasEnded := rpe.ended
+	handle := rpe.handle
+	rpe.handle = 0
+	enc := rpe.encoder
+	rpe.encoder = nil
+	rpe.pipeline = nil
+	rpe.vertexBuffers = nil
+	rpe.indexBuffer = nil
+	rpe.bindGroups = nil
+	rpe.mu.Unlock()
+
+	if handle != 0 {
+		untrackResource(handle)
+		procRenderPassEncoderRelease.Call(handle) //nolint:errcheck
+	}
+	if enc != nil && !wasEnded {
+		enc.passAbandoned()
 	}
 }
 

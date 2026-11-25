@@ -1,6 +1,9 @@
 package wgpu
 
-import "unsafe"
+import (
+	"sync"
+	"unsafe"
+)
 
 // ptrFromUintptr converts a uintptr to unsafe.Pointer without triggering go vet
 // "possible misuse of unsafe.Pointer" warnings. This is the standard idiom for
@@ -84,7 +87,17 @@ type ComputePipeline struct{ handle uintptr }
 
 // CommandEncoder records GPU commands into a [CommandBuffer].
 // Create with [Device.CreateCommandEncoder], finalize with [CommandEncoder.Finish].
-type CommandEncoder struct{ handle uintptr }
+//
+// Lifecycle: while a pass begun on this encoder is still open, recording
+// commands and Finish are rejected. After Finish or Release, all further
+// recording calls fail with a lifecycle error (see lifecycle.go).
+type CommandEncoder struct {
+	handle uintptr
+
+	mu       sync.Mutex
+	state    encoderState
+	openPass bool // a pass begun on this encoder has not been ended
+}
 
 // CommandBuffer holds encoded GPU commands ready for submission via [Queue.Submit].
 // Obtained from [CommandEncoder.Finish], release with [CommandBuffer.Release].
@@ -92,11 +105,36 @@ type CommandBuffer struct{ handle uintptr }
 
 // RenderPassEncoder records draw commands within a render pass.
 // Begin with [CommandEncoder.BeginRenderPass], end with [RenderPassEncoder.End].
-type RenderPassEncoder struct{ handle uintptr }
+//
+// Lifecycle: after End or Release, all Set*/Draw*/ExecuteBundles calls are
+// rejected with a lifecycle error. The pass tracks the resources bound to it;
+// if such a resource is released while the pass is alive, subsequent draws
+// fail with ErrDependencyReleased instead of crashing in native code.
+type RenderPassEncoder struct {
+	handle  uintptr
+	encoder *CommandEncoder // back-pointer for open-pass tracking
+
+	mu       sync.Mutex
+	ended    bool
+	released bool
+
+	// Resources bound to this pass, validated on draw calls.
+	pipeline      *RenderPipeline
+	vertexBuffers map[uint32]*Buffer
+	indexBuffer   *Buffer
+	bindGroups    map[uint32]*BindGroup
+}
 
 // ComputePassEncoder records dispatch commands within a compute pass.
 // Begin with [CommandEncoder.BeginComputePass], end with [ComputePassEncoder.End].
-type ComputePassEncoder struct{ handle uintptr }
+type ComputePassEncoder struct {
+	handle  uintptr
+	encoder *CommandEncoder // back-pointer for open-pass tracking
+
+	mu       sync.Mutex
+	ended    bool
+	released bool
+}
 
 // Surface represents a platform window surface for presenting rendered frames.
 // Create with platform-specific CreateSurface, release with [Surface.Release].
@@ -108,11 +146,23 @@ type QuerySet struct{ handle uintptr }
 
 // RenderBundle is a pre-recorded set of render commands for efficient replay.
 // Obtained from [RenderBundleEncoder.Finish], release with [RenderBundle.Release].
-type RenderBundle struct{ handle uintptr }
+// A bundle may be executed any number of times until released; executing a
+// released bundle is rejected.
+type RenderBundle struct {
+	handle uintptr
+	mu     sync.Mutex
+}
 
 // RenderBundleEncoder records render commands into a [RenderBundle].
 // Create with [Device.CreateRenderBundleEncoder], finalize with [RenderBundleEncoder.Finish].
-type RenderBundleEncoder struct{ handle uintptr }
+// After Finish or Release, further recording calls are rejected.
+type RenderBundleEncoder struct {
+	handle uintptr
+
+	mu       sync.Mutex
+	finished bool
+	released bool
+}
 
 // DrawIndirectArgs contains arguments for indirect (GPU-driven) draw calls.
 // This struct must be written to a Buffer for use with DrawIndirect.

@@ -384,15 +384,21 @@ func (app *App) createRenderBundle() error {
 	}
 
 	// Record draw commands (these will be replayed every frame)
-	bundleEncoder.SetPipeline(app.pipeline)
-	bundleEncoder.Draw(9, 1, 0, 0) // 9 vertices = 3 triangles
+	if err := bundleEncoder.SetPipeline(app.pipeline); err != nil {
+		bundleEncoder.Release()
+		return fmt.Errorf("failed to set pipeline: %w", err)
+	}
+	if err := bundleEncoder.Draw(9, 1, 0, 0); err != nil { // 9 vertices = 3 triangles
+		bundleEncoder.Release()
+		return fmt.Errorf("failed to record draw: %w", err)
+	}
 
 	// Finish recording
-	bundle := bundleEncoder.Finish()
+	bundle, err := bundleEncoder.Finish()
 	bundleEncoder.Release()
 
-	if bundle == nil {
-		return fmt.Errorf("failed to finish render bundle")
+	if err != nil || bundle == nil {
+		return fmt.Errorf("failed to finish render bundle: %w", err)
 	}
 
 	app.renderBundle = bundle

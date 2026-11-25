@@ -393,8 +393,9 @@ func TestNullGuard_RenderBundleEncoder(t *testing.T) {
 	})
 
 	t.Run("Finish", func(t *testing.T) {
-		if rbe.Finish(nil) != nil {
-			t.Error("expected nil for nil encoder")
+		result, err := rbe.Finish(nil)
+		if result != nil || err == nil {
+			t.Error("expected nil result and non-nil error for nil encoder")
 		}
 	})
 }
