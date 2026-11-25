@@ -1,6 +1,7 @@
 package h264
 
 import (
+	"errors"
 	"image"
 	"os"
 	"testing"
@@ -17,8 +18,11 @@ func TestH264Decode(t *testing.T) {
 	}
 
 	h264dec, err := NewH264Decoder()
+	if errors.Is(err, ErrDecoderUnavailable) {
+		t.Skip("h264 cgo/ffmpeg decoder is not available in this build")
+	}
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	defer h264dec.Close()
 	img, err := h264dec.Decode(file)

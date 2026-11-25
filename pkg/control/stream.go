@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/Glimesh/waveguide/pkg/keyframer"
 	"github.com/Glimesh/waveguide/pkg/types"
@@ -22,7 +23,28 @@ type Stream struct {
 	log logrus.FieldLogger
 
 	cancelFunc context.CancelFunc
-	stopped    bool
+
+	// stopOnce makes local cancellation (Stop) idempotent and closes stopCh
+	// exactly once.
+	stopOnce sync.Once
+	// stopCh is the generation-owned exit signal for all stream goroutines
+	// (currently the heartbeat). It is closed by Stop and, unlike the
+	// control-level metadataCollectors map entry, is never deleted while
+	// goroutines might be selecting on it.
+	stopCh chan struct{}
+
+	// shutdownOnce runs the control-plane shutdown (external stop calls and
+	// stream-table removal) exactly once for this stream generation.
+	shutdownOnce sync.Once
+	shutdownErr  error
+
+	// heartbeatWG tracks this generation's heartbeat goroutine. StopStream
+	// waits on it so the heartbeat has fully exited before StopStream
+	// returns and before a reconnect can register a new generation.
+	heartbeatWG sync.WaitGroup
+
+	stateMu sync.RWMutex
+	stopped bool
 
 	// authenticated is set after the stream has successfully authed with a remote service
 	authenticated bool
@@ -41,8 +63,13 @@ type Stream struct {
 	rtpIngest     chan *rtp.Packet
 	lastThumbnail chan []byte
 	// channel used to signal thumbnailer to stop
-	stopThumbnailer   chan struct{}
-	stopHeartbeat     chan struct{}
+	stopThumbnailer chan struct{}
+	stopHeartbeat   chan struct{}
+	// metadataCollector is this generation's metadata/heartbeat exit signal.
+	// The same channel is registered in Control.metadataCollectors; keeping a
+	// reference on the Stream means deleting the map entry can never strand a
+	// heartbeat select on a nil channel.
+	metadataCollector chan bool
 	requestThumbnail  chan struct{}
 	thumbnailReceiver chan *rtp.Packet
 
@@ -100,18 +127,62 @@ func (s *Stream) ReportMetadata(metadatas ...Metadata) error {
 	return nil
 }
 
+// Stop cancels the stream context and signals every stream-owned goroutine
+// to exit. It is safe to call repeatedly and concurrently: only the first
+// call performs the signals, later calls are no-ops.
 func (s *Stream) Stop() {
-	s.log.Infof("stopping stream")
+	if s == nil {
+		return
+	}
 
-	s.stopHeartbeat <- struct{}{} // not being used anywhere, is it really needed?
+	s.stopOnce.Do(func() {
+		if s.log != nil {
+			s.log.Infof("stopping stream")
+		}
 
-	s.cancelFunc()
-	s.stopped = true
-	s.log.Debug("sent stop thumbnailer signal")
+		// Preserve the legacy buffered heartbeat signal for compatibility.
+		// The send must never block shutdown if nobody is reading it.
+		if s.stopHeartbeat != nil {
+			select {
+			case s.stopHeartbeat <- struct{}{}:
+			default:
+			}
+		}
 
-	s.log.Debug("canceled stream ctx")
+		// Broadcast the stop to every goroutine selecting on stopCh.
+		if s.stopCh != nil {
+			close(s.stopCh)
+		}
+
+		if s.cancelFunc != nil {
+			s.cancelFunc()
+		}
+
+		s.stateMu.Lock()
+		s.stopped = true
+		s.stateMu.Unlock()
+
+		if s.log != nil {
+			s.log.Debug("canceled stream ctx and closed stop signal")
+		}
+	})
 }
 
 func (s *Stream) Stopped() bool {
+	if s == nil {
+		return true
+	}
+
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	return s.stopped
+}
+
+// logger returns the stream logger or a safe fallback for minimally
+// initialized test fixtures.
+func (s *Stream) logger() logrus.FieldLogger {
+	if s != nil && s.log != nil {
+		return s.log
+	}
+	return logrus.StandardLogger()
 }
