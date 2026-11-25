@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -255,8 +256,8 @@ func TestSetASCAndDecodeMinimalFrame(t *testing.T) {
 
 func TestDecodeWithADTSHeader(t *testing.T) {
 	dec := New()
-	adtsHeader := buildADTSHeader(2, 4, 2, true, 100)
-	// Append END_ELEMENT after ADTS header
+	adtsHeader := buildADTSHeader(2, 4, 2, true, 8)
+	// Append END_ELEMENT after ADTS header (7-byte header + 1 payload byte)
 	frame := append(adtsHeader, 0xE0)
 
 	output, err := dec.DecodeFrame(frame)
@@ -271,7 +272,7 @@ func TestDecodeWithADTSHeader(t *testing.T) {
 func TestDecodeWithADTSHeaderAutoConfig(t *testing.T) {
 	// Test that ADTS header sets config when none was set
 	dec := New()
-	adtsHeader := buildADTSHeader(2, 4, 2, true, 100)
+	adtsHeader := buildADTSHeader(2, 4, 2, true, 8)
 	frame := append(adtsHeader, 0xE0)
 
 	output, err := dec.DecodeFrame(frame)
@@ -291,7 +292,8 @@ func TestDecodeWithADTSHeaderAutoConfig(t *testing.T) {
 
 func TestDecodeWithADTSHeaderWithCRC(t *testing.T) {
 	dec := New()
-	adtsHeader := buildADTSHeader(2, 4, 2, false, 100) // protection NOT absent = CRC present
+	adtsHeader := buildADTSHeader(2, 4, 2, false, 10) // protection NOT absent = CRC present
+	// 9-byte header (7 + CRC) + 1 payload byte
 	frame := append(adtsHeader, 0xE0)
 
 	output, err := dec.DecodeFrame(frame)
@@ -1087,7 +1089,6 @@ func TestSetConfigFromADTSPCE(t *testing.T) {
 		t.Error("expected error for PCE in ADTS")
 	}
 }
-
 func TestSetASCCustomSampleRate(t *testing.T) {
 	dec := New()
 	w := newBitWriter()
@@ -1154,6 +1155,402 @@ func TestTruncatedFrameReturnsError(t *testing.T) {
 	for _, data := range [][]byte{nil, {0}, {0, 0, 0}, {0, 0, 0, 0}} {
 		if _, err := d.DecodeFrame(data); err == nil {
 			t.Fatalf("accepted truncated frame %x", data)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Corrupt frame resilience tests
+// ---------------------------------------------------------------------------
+
+// buildADTSFrame builds a complete ADTS frame whose payload is END_ELEMENT
+// followed by zero padding, with the frame length field set automatically.
+func buildADTSFrame(profile, sampleIndex, chanConfig int) []byte {
+	// 7-byte header + 1-byte payload
+	frame := buildADTSHeader(profile, sampleIndex, chanConfig, true, 8)
+	return append(frame, 0xE0)
+}
+
+func TestDecodeFrameCorruptPayloadReturnsInvalidFrame(t *testing.T) {
+	dec := New()
+	asc := buildASC(2, 4, 2)
+	if err := dec.SetASC(asc); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+
+	for _, data := range [][]byte{nil, {0}, {0, 0, 0}, {0, 0, 0, 0}} {
+		_, err := dec.DecodeFrame(data)
+		if err == nil {
+			t.Fatalf("accepted truncated frame %x", data)
+		}
+		if !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("truncated frame %x: error %v does not match ErrInvalidFrame", data, err)
+		}
+	}
+}
+
+func TestDecodeFrameRecoversAfterBadFrame(t *testing.T) {
+	dec := New()
+	if err := dec.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+
+	good := []byte{0xE0}
+	// A frame whose element header runs out of data is a frame error.
+	if _, err := dec.DecodeFrame([]byte{0x00, 0x00}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("expected ErrInvalidFrame, got %v", err)
+	}
+
+	out, err := dec.DecodeFrame(good)
+	if err != nil {
+		t.Fatalf("DecodeFrame after bad frame failed: %v", err)
+	}
+	if len(out) != 1024*2 {
+		t.Fatalf("output length=%d want %d", len(out), 1024*2)
+	}
+}
+
+func TestDecodeFrameRecoversAfterBadADTSFrame(t *testing.T) {
+	dec := New()
+	frame := buildADTSFrame(2, 4, 2)
+
+	// First frame is truncated: header claims 8 bytes, only 7 supplied.
+	if _, err := dec.DecodeFrame(frame[:7]); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("truncated ADTS frame: expected ErrInvalidFrame, got %v", err)
+	}
+
+	out, err := dec.DecodeFrame(frame)
+	if err != nil {
+		t.Fatalf("DecodeFrame after bad ADTS frame failed: %v", err)
+	}
+	if len(out) != 1024*2 {
+		t.Fatalf("output length=%d want %d", len(out), 1024*2)
+	}
+}
+
+func TestDecodeFrameADTSFrameLengthTooSmall(t *testing.T) {
+	dec := New()
+	if err := dec.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+
+	// Frame length below the header size must be rejected, not read out of
+	// bounds.
+	frame := buildADTSHeader(2, 4, 2, true, 3)
+	frame = append(frame, 0xE0)
+	if _, err := dec.DecodeFrame(frame); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("expected ErrInvalidFrame for undersized frame, got %v", err)
+	}
+}
+
+func TestDecodeFrameDoesNotReadPastDeclaredLength(t *testing.T) {
+	dec := New()
+	if err := dec.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+
+	// The buffer contains a valid frame followed by bytes that would decode
+	// differently. The decoder must honour frameLength and stop after it.
+	frame := buildADTSHeader(2, 4, 2, true, 8)
+	frame = append(frame, 0xE0)
+	trailing := append(frame, 0xFF, 0xFF, 0xFF, 0xFF)
+	out, err := dec.DecodeFrame(trailing)
+	if err != nil {
+		t.Fatalf("DecodeFrame failed: %v", err)
+	}
+	// A decode that consumed the trailing bytes would report a bitstream
+	// error; a clean END_ELEMENT decode produces silence.
+	for i, v := range out {
+		if v != 0 {
+			t.Fatalf("output[%d]=%f want 0", i, v)
+		}
+	}
+}
+
+func TestDecodeFrameConfigErrorIsSticky(t *testing.T) {
+	dec := New()
+
+	// ADTS header with an unsupported profile (profile 3 => AOT 4? buildADTSHeader
+	// stores profile-1 in 2 bits, so use 3 -> AOT 4 is LTP which is accepted;
+	// use channel config 0 instead, which is rejected as PCE).
+	frame := buildADTSHeader(2, 4, 0, true, 8)
+	frame = append(frame, 0xE0)
+	if _, err := dec.DecodeFrame(frame); err == nil {
+		t.Fatal("expected error for PCE channel config")
+	} else if errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("config error must not match ErrInvalidFrame: %v", err)
+	}
+
+	// A subsequent perfectly-formed stereo frame must keep failing.
+	good := buildADTSFrame(2, 4, 2)
+	if _, err := dec.DecodeFrame(good); err == nil {
+		t.Fatal("decoder recovered from a configuration error; it must stay failed")
+	}
+}
+
+func TestDecodeFrameUnsupportedProfileIsSticky(t *testing.T) {
+	dec := New()
+	// ADTS stores profile-1 in 2 bits; 3 => AOT 4 (LTP), which is accepted.
+	// Use SetASC with an unsupported AOT instead: AOT 5 (SBR).
+	asc := buildASC(5, 4, 2)
+	if err := dec.SetASC(asc); err == nil {
+		t.Fatal("expected SetASC to reject unsupported profile")
+	}
+
+	good := buildADTSFrame(2, 4, 2)
+	if _, err := dec.DecodeFrame(good); err == nil {
+		t.Fatal("decoder decoded after a rejected SetASC; configuration error must be sticky")
+	}
+}
+
+func TestDecodeFrameBadFrameDoesNotPolluteFilterState(t *testing.T) {
+	// Decode a valid frame on two decoders. Corrupt the first decoder with a
+	// bad frame in between; the final valid frame must match the reference.
+	reference := New()
+	if err := reference.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+
+	frame := buildADTSFrame(2, 4, 2)
+	refOut, err := reference.DecodeFrame(frame)
+	if err != nil {
+		t.Fatalf("reference DecodeFrame failed: %v", err)
+	}
+
+	subject := New()
+	if err := subject.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+	// A corrupt frame whose spectral decoding fails part-way must not disturb
+	// the filter bank.
+	bad := buildADTSHeader(2, 4, 2, true, 8)
+	bad = append(bad, 0x00, 0x00, 0x00) // invalid element stream
+	if _, err := subject.DecodeFrame(bad); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("expected ErrInvalidFrame, got %v", err)
+	}
+
+	subjOut, err := subject.DecodeFrame(frame)
+	if err != nil {
+		t.Fatalf("subject DecodeFrame failed: %v", err)
+	}
+	if len(subjOut) != len(refOut) {
+		t.Fatalf("length mismatch: got %d want %d", len(subjOut), len(refOut))
+	}
+	for i := range refOut {
+		if subjOut[i] != refOut[i] {
+			t.Fatalf("sample %d differs: got %f want %f", i, subjOut[i], refOut[i])
+		}
+	}
+}
+
+func TestDecodeFrameBadFrameRestoresFilterBankOverlap(t *testing.T) {
+	// Seed a decoder with a non-zero overlap state through a real decode, then
+	// force a processing-stage failure. The overlap must be restored exactly so
+	// the next valid frame comes out identical to an untouched decoder.
+	dec := New()
+	if err := dec.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+	if _, err := dec.DecodeFrame([]byte{0xE0}); err != nil {
+		t.Fatalf("priming DecodeFrame failed: %v", err)
+	}
+
+	// Inject a non-zero overlap so any accidental carry-over is visible.
+	seed := [][]float32{
+		make([]float32, 1024),
+		make([]float32, 1024),
+	}
+	for i := range seed[0] {
+		seed[0][i] = float32(i%13) - 6
+		seed[1][i] = float32(i%7) - 3
+	}
+	dec.FilterBank.Restore(seed)
+	before := dec.FilterBank.Snapshot()
+
+	// A frame that parses but fails in the synthesis stage. A CPE whose
+	// second channel's Info is invalid cannot be produced from bits alone, so
+	// drive process() directly with a broken element.
+	brokenData := [][]float32{make([]float32, 1024), make([]float32, 1024)}
+	dec.Data = brokenData
+	badElement := frameElement{
+		kind: elemCPE,
+		cpe: &cpe.Element{
+			Left: &ics.ICStream{
+				Info: &ics.ICSInfo{WindowSequence: 0, WindowShape: [2]int{0, 0}},
+				Data: make([]float32, 1024),
+			},
+			Right: &ics.ICStream{
+				// WindowShape[1] out of range => filterbank.Process errors.
+				Info: &ics.ICSInfo{WindowSequence: 0, WindowShape: [2]int{0, 99}},
+				Data: make([]float32, 1024),
+			},
+		},
+	}
+	// Emulate DecodeFrame's guard: snapshot, attempt process, restore on error.
+	snapshot := dec.FilterBank.Snapshot()
+	if err := dec.process([]frameElement{badElement}); err == nil {
+		t.Fatal("expected process to fail for invalid window shape")
+	}
+	dec.FilterBank.Restore(snapshot)
+
+	after := dec.FilterBank.Snapshot()
+	for ch := range before {
+		for i := range before[ch] {
+			if before[ch][i] != after[ch][i] {
+				t.Fatalf("overlap[%d][%d] changed: got %f want %f", ch, i, after[ch][i], before[ch][i])
+			}
+		}
+	}
+}
+
+func TestDecodeFrameSampleIndexZeroAutoConfigures(t *testing.T) {
+	// Sample index 0 (96 kHz) is valid; auto-configuration must trigger for it
+	// too, rather than being mistaken for "unset".
+	dec := New()
+	frame := buildADTSFrame(2, 0, 1)
+	out, err := dec.DecodeFrame(frame)
+	if err != nil {
+		t.Fatalf("DecodeFrame failed: %v", err)
+	}
+	if dec.Config.SampleRate != 96000 {
+		t.Errorf("SampleRate=%d want 96000", dec.Config.SampleRate)
+	}
+	if len(out) != 1024 {
+		t.Errorf("output length=%d want 1024", len(out))
+	}
+	if dec.Config.ChanConfig != 1 {
+		t.Errorf("ChanConfig=%d want 1", dec.Config.ChanConfig)
+	}
+}
+
+func TestDecodeFrameSetASCAfterConfigError(t *testing.T) {
+	dec := New()
+	// Trigger a configuration error through ADTS.
+	frame := buildADTSHeader(2, 4, 0, true, 8)
+	frame = append(frame, 0xE0)
+	if _, err := dec.DecodeFrame(frame); err == nil {
+		t.Fatal("expected configuration error")
+	}
+
+	// A successful SetASC clears the latched error.
+	if err := dec.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+	if _, err := dec.DecodeFrame([]byte{0xE0}); err != nil {
+		t.Fatalf("DecodeFrame after recovered SetASC failed: %v", err)
+	}
+}
+
+func TestDecodeFrameCorruptFirstFrameDoesNotLockConfig(t *testing.T) {
+	dec := New()
+
+	// Corrupt first frame whose ADTS header declares mono 96 kHz. Its payload
+	// cannot be decoded, so its configuration must not stick.
+	badHeader := buildADTSHeader(2, 0, 1, true, 7+4)
+	bad := append(badHeader, 0x20, 0x00, 0x00, 0x00)
+	if _, err := dec.DecodeFrame(bad); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("expected ErrInvalidFrame, got %v", err)
+	}
+	if dec.Config.SampleRate != 0 || dec.Config.ChanConfig != 0 {
+		t.Fatalf("corrupt first frame left configuration behind: %+v", dec.Config)
+	}
+
+	// The next valid stereo 44.1 kHz frame must configure the decoder itself.
+	good := buildADTSFrame(2, 4, 2)
+	out, err := dec.DecodeFrame(good)
+	if err != nil {
+		t.Fatalf("DecodeFrame failed: %v", err)
+	}
+	if dec.Config.SampleRate != 44100 {
+		t.Errorf("SampleRate=%d want 44100", dec.Config.SampleRate)
+	}
+	if dec.Config.ChanConfig != 2 {
+		t.Errorf("ChanConfig=%d want 2", dec.Config.ChanConfig)
+	}
+	if len(out) != 1024*2 {
+		t.Errorf("output length=%d want %d", len(out), 1024*2)
+	}
+}
+
+func TestDecodeFrameBadFrameAfterConfiguredKeepsConfig(t *testing.T) {
+	dec := New()
+	if err := dec.SetASC(buildASC(2, 4, 2)); err != nil {
+		t.Fatalf("SetASC failed: %v", err)
+	}
+	if _, err := dec.DecodeFrame(buildADTSFrame(2, 4, 2)); err != nil {
+		t.Fatalf("DecodeFrame failed: %v", err)
+	}
+	cfg := dec.Config
+
+	// A corrupt frame with a wildly different header must not reconfigure.
+	bad := buildADTSHeader(2, 0, 1, true, 11)
+	bad = append(bad, 0x20, 0x00, 0x00, 0x00)
+	if _, err := dec.DecodeFrame(bad); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("expected ErrInvalidFrame, got %v", err)
+	}
+	if dec.Config != cfg {
+		t.Fatalf("configuration changed after bad frame: got %+v want %+v", dec.Config, cfg)
+	}
+}
+
+func TestDecodeFrameBadFrameIsTransparentToFilterState(t *testing.T) {
+	// With a non-zero seeded overlap, decoding good1 then good2 must produce
+	// exactly the same output whether or not a corrupt frame was attempted in
+	// between. This is the "bad frames do not pollute filter state" guarantee.
+	seed := [][]float32{make([]float32, 1024), make([]float32, 1024)}
+	for i := range seed[0] {
+		seed[0][i] = float32(i%11) - 5
+		seed[1][i] = float32(i%5) - 2
+	}
+
+	newSeeded := func() *Decoder {
+		d := New()
+		if err := d.SetASC(buildASC(2, 4, 2)); err != nil {
+			t.Fatalf("SetASC failed: %v", err)
+		}
+		d.FilterBank.Restore(seed)
+		return d
+	}
+
+	good := buildADTSFrame(2, 4, 2)
+	bad := buildADTSHeader(2, 4, 2, true, 11)
+	bad = append(bad, 0x20, 0x00, 0x00, 0x00)
+
+	ref := newSeeded()
+	if _, err := ref.DecodeFrame(good); err != nil {
+		t.Fatalf("ref good1: %v", err)
+	}
+	refOut, err := ref.DecodeFrame(good)
+	if err != nil {
+		t.Fatalf("ref good2: %v", err)
+	}
+
+	sub := newSeeded()
+	if _, err := sub.DecodeFrame(good); err != nil {
+		t.Fatalf("sub good1: %v", err)
+	}
+	if _, err := sub.DecodeFrame(bad); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("expected ErrInvalidFrame, got %v", err)
+	}
+	subOut, err := sub.DecodeFrame(good)
+	if err != nil {
+		t.Fatalf("sub good2: %v", err)
+	}
+
+	for i := range refOut {
+		if refOut[i] != subOut[i] {
+			t.Fatalf("sample %d differs: ref=%f sub=%f", i, refOut[i], subOut[i])
+		}
+	}
+
+	// The overlap-add state must be identical too.
+	refSnap := ref.FilterBank.Snapshot()
+	subSnap := sub.FilterBank.Snapshot()
+	for ch := range refSnap {
+		for i := range refSnap[ch] {
+			if refSnap[ch][i] != subSnap[ch][i] {
+				t.Fatalf("overlap[%d][%d] differs: ref=%f sub=%f", ch, i, refSnap[ch][i], subSnap[ch][i])
+			}
 		}
 	}
 }

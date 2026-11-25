@@ -5,6 +5,7 @@
 package decoder
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/skrashevich/go-aac/pkg/adts"
@@ -14,6 +15,49 @@ import (
 	"github.com/skrashevich/go-aac/pkg/ics"
 	"github.com/skrashevich/go-aac/pkg/tables"
 )
+
+// ErrInvalidFrame identifies an error caused by a corrupt or undecodable
+// frame. Unlike a configuration error, it describes a single frame only:
+// the decoder keeps its configuration and filter state intact, so the caller
+// can skip the offending frame and keep decoding the following ones.
+//
+// Use errors.Is to test for it:
+//
+//	samples, err := dec.DecodeFrame(frame)
+//	if errors.Is(err, decoder.ErrInvalidFrame) {
+//		// skip this frame, continue with the next one
+//	}
+var ErrInvalidFrame = errors.New("decoder: invalid frame")
+
+// configError marks a fatal decoder configuration problem (unsupported
+// profile, invalid channel configuration, etc.). Such problems are latched by
+// the decoder: once one occurs, every subsequent DecodeFrame call fails with
+// the same error, so skipping a frame can never make the decoder silently
+// recover into an inconsistent state.
+type configError struct {
+	err error
+}
+
+func (e *configError) Error() string { return e.err.Error() }
+func (e *configError) Unwrap() error { return e.err }
+
+func newConfigError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &configError{err: err}
+}
+
+// invalidFrame wraps err so that errors.Is(err, ErrInvalidFrame) reports true.
+func invalidFrame(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrInvalidFrame) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrInvalidFrame, err)
+}
 
 const (
 	aotAACMain = 1
@@ -63,6 +107,14 @@ type Decoder struct {
 	CCEs       []*cce.Element
 	Data       [][]float32
 	SBRPresent bool
+
+	// configured reports whether SetASC or an ADTS header initialized the
+	// decoder. It is kept separate from the Config fields because sample
+	// index 0 (96 kHz) is a legitimate value.
+	configured bool
+	// configErr holds a latched configuration error. Once set, every call to
+	// DecodeFrame fails with it.
+	configErr error
 }
 
 // New creates a new AAC decoder.
@@ -71,6 +123,9 @@ func New() *Decoder {
 }
 
 // SetASC parses an MPEG-4 AudioSpecificConfig (2 bytes) and initializes the decoder.
+//
+// Invalid or unsupported configuration is a fatal, latched error: the decoder
+// refuses all further DecodeFrame calls until a successful SetASC.
 func (d *Decoder) SetASC(data []byte) error {
 	stream := NewBitstream(data)
 	config := Config{}
@@ -91,7 +146,7 @@ func (d *Decoder) SetASC(data []byte) error {
 		}
 	} else {
 		if config.SampleIndex < 0 || config.SampleIndex >= len(tables.SampleRates) {
-			return fmt.Errorf("decoder: invalid sample index %d", config.SampleIndex)
+			return d.latchConfigError(fmt.Errorf("decoder: invalid sample index %d", config.SampleIndex))
 		}
 		config.SampleRate = int(tables.SampleRates[config.SampleIndex])
 	}
@@ -101,7 +156,7 @@ func (d *Decoder) SetASC(data []byte) error {
 	switch config.Profile {
 	case aotAACMain, aotAACLC, aotAACLTP:
 		if stream.ReadBits(1) != 0 {
-			return fmt.Errorf("decoder: frameLengthFlag not supported")
+			return d.latchConfigError(fmt.Errorf("decoder: frameLengthFlag not supported"))
 		}
 		config.FrameLength = 1024
 
@@ -120,40 +175,84 @@ func (d *Decoder) SetASC(data []byte) error {
 
 		if config.ChanConfig == channelConfigNone {
 			_ = stream.ReadBits(4)
-			return fmt.Errorf("decoder: PCE unimplemented")
+			return d.latchConfigError(fmt.Errorf("decoder: PCE unimplemented"))
 		}
 	default:
-		return fmt.Errorf("decoder: AAC profile %d not supported", config.Profile)
+		return d.latchConfigError(fmt.Errorf("decoder: AAC profile %d not supported", config.Profile))
 	}
 
 	if err := stream.Error(); err != nil {
-		return err
+		return d.latchConfigError(err)
 	}
 
 	filterBank, err := filterbank.New(false, config.ChanConfig)
 	if err != nil {
-		return err
+		return d.latchConfigError(err)
 	}
 
 	d.Config = config
 	d.FilterBank = filterBank
+	d.configured = true
+	d.configErr = nil
 	return nil
 }
 
 // DecodeFrame decodes a single AAC frame and returns interleaved PCM samples.
+//
+// A frame that cannot be decoded because of its own contents returns an error
+// matching ErrInvalidFrame. The decoder's configuration and filter state are
+// left untouched, so the caller may skip that frame and keep decoding the
+// frames that follow.
+//
+// A configuration problem (unsupported profile, invalid channel
+// configuration, ...) is fatal and latched: the returned error does not match
+// ErrInvalidFrame, and every subsequent call fails with the same error.
 func (d *Decoder) DecodeFrame(data []byte) ([]float32, error) {
+	if d.configErr != nil {
+		return nil, d.configErr
+	}
+
+	// Auto-configuration from an ADTS header is tentative: it only takes effect
+	// if the frame decodes. Otherwise a corrupt first frame would lock in its
+	// (possibly bogus) sample rate and channel count for the whole stream, and
+	// the WAV header would describe the bad frame rather than the real audio.
+	prevConfig := d.Config
+	prevFilterBank := d.FilterBank
+	prevConfigured := d.configured
+
+	out, err := d.decodeFrame(data)
+	if err != nil && !prevConfigured {
+		d.Config = prevConfig
+		d.FilterBank = prevFilterBank
+		d.configured = prevConfigured
+		d.CCEs = nil
+		d.Data = nil
+	}
+	return out, err
+}
+
+// decodeFrame performs the actual per-frame decode. Configuration changes it
+// makes are rolled back by DecodeFrame when the frame fails.
+func (d *Decoder) decodeFrame(data []byte) ([]float32, error) {
 	stream := NewBitstream(data)
 	if stream.PeekBits(12) == 0xfff {
 		header, err := adts.ReadHeaderFromBytes(data)
 		if err != nil {
+			return nil, invalidFrame(err)
+		}
+		// Never read past the frame declared in the ADTS header. A frame
+		// length that does not describe a plausible frame within the supplied
+		// bytes is treated as a corrupt frame rather than a stream error.
+		if err := validateADTSFrameLength(header, len(data)); err != nil {
 			return nil, err
 		}
-		if d.Config.SampleIndex == 0 && d.Config.SampleRate == 0 {
+		stream = NewBitstream(data[:header.FrameLength])
+
+		if !d.configured {
 			if err := d.setConfigFromADTS(header); err != nil {
-				return nil, err
+				return nil, d.latchConfigError(err)
 			}
 		}
-
 		headerBits := 56
 		if !header.ProtectionAbsent {
 			headerBits = 72
@@ -162,45 +261,48 @@ func (d *Decoder) DecodeFrame(data []byte) ([]float32, error) {
 	}
 
 	if d.FilterBank == nil || d.Config.FrameLength == 0 {
+		// Not a latched configuration error: the frame simply cannot be
+		// interpreted yet. A later ADTS frame may still configure the decoder.
 		return nil, fmt.Errorf("decoder: config not initialized")
 	}
 
-	d.CCEs = nil
-	elements := make([]frameElement, 0, 8)
 	config := d.Config
 	frameLength := config.FrameLength
 
+	d.CCEs = nil
+	elements := make([]frameElement, 0, 8)
+
 	for elementType := int(stream.ReadBits(3)); elementType != endElement; elementType = int(stream.ReadBits(3)) {
 		if err := stream.Error(); err != nil {
-			return nil, err
+			return nil, invalidFrame(err)
 		}
 		id := int(stream.ReadBits(4))
 		switch elementType {
 		case sceElement, lfeElement:
 			icsStream, err := ics.New(d.icsConfig())
 			if err != nil {
-				return nil, err
+				return nil, d.latchConfigError(err)
 			}
 			if err := icsStream.Decode(stream, d.icsConfig(), false); err != nil {
-				return nil, err
+				return nil, invalidFrame(err)
 			}
 			elements = append(elements, frameElement{kind: elemSCE, id: id, sce: icsStream})
 		case cpeElement:
 			cpeElem, err := cpe.New(d.icsConfig())
 			if err != nil {
-				return nil, err
+				return nil, d.latchConfigError(err)
 			}
 			if err := cpeElem.Decode(stream, d.icsConfig()); err != nil {
-				return nil, err
+				return nil, invalidFrame(err)
 			}
 			elements = append(elements, frameElement{kind: elemCPE, id: id, cpe: cpeElem})
 		case cceElement:
 			cceElem, err := cce.New(d.icsConfig())
 			if err != nil {
-				return nil, err
+				return nil, d.latchConfigError(err)
 			}
 			if err := cceElem.Decode(stream, d.icsConfig()); err != nil {
-				return nil, err
+				return nil, invalidFrame(err)
 			}
 			d.CCEs = append(d.CCEs, cceElem)
 		case dseElement:
@@ -214,23 +316,31 @@ func (d *Decoder) DecodeFrame(data []byte) ([]float32, error) {
 			}
 			stream.Advance(count * 8)
 		case pceElement:
-			return nil, fmt.Errorf("decoder: PCE_ELEMENT not implemented")
+			return nil, invalidFrame(fmt.Errorf("decoder: PCE_ELEMENT not implemented"))
 		case filElement:
 			if id == 15 {
 				id += int(stream.ReadBits(8)) - 1
 			}
 			stream.Advance(id * 8)
 		default:
-			return nil, fmt.Errorf("decoder: unknown element type %d", elementType)
+			return nil, invalidFrame(fmt.Errorf("decoder: unknown element type %d", elementType))
 		}
 	}
 
 	stream.Align()
-	if err := d.process(elements); err != nil {
-		return nil, err
-	}
 	if err := stream.Error(); err != nil {
-		return nil, err
+		return nil, invalidFrame(err)
+	}
+
+	// Guard the overlap-add state: a frame that fails during processing must
+	// not leave its partially written overlap data behind for the next frame.
+	var snapshot [][]float32
+	if d.FilterBank != nil {
+		snapshot = d.FilterBank.Snapshot()
+	}
+	if err := d.process(elements); err != nil {
+		d.FilterBank.Restore(snapshot)
+		return nil, d.classifyProcessError(err)
 	}
 
 	channels := len(d.Data)
@@ -243,6 +353,50 @@ func (d *Decoder) DecodeFrame(data []byte) ([]float32, error) {
 		}
 	}
 	return output, nil
+}
+
+// validateADTSFrameLength checks that the frame length declared in the ADTS
+// header describes a complete frame inside the supplied bytes.
+func validateADTSFrameLength(header adts.Header, available int) error {
+	minLength := 7
+	if !header.ProtectionAbsent {
+		minLength = 9
+	}
+	if header.FrameLength < minLength {
+		return invalidFrame(fmt.Errorf("decoder: invalid ADTS frame length %d (minimum %d)", header.FrameLength, minLength))
+	}
+	if header.FrameLength > available {
+		return invalidFrame(fmt.Errorf("decoder: ADTS frame length %d exceeds available %d bytes", header.FrameLength, available))
+	}
+	return nil
+}
+
+// classifyProcessError decides whether an error from the synthesis stage is a
+// frame problem or a configuration problem, and latches the latter.
+func (d *Decoder) classifyProcessError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ce *configError
+	if errors.As(err, &ce) {
+		d.configErr = err
+		return err
+	}
+	return invalidFrame(err)
+}
+
+// latchConfigError records err as the decoder's permanent configuration error
+// and returns it.
+func (d *Decoder) latchConfigError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ce *configError
+	if !errors.As(err, &ce) {
+		err = newConfigError(err)
+	}
+	d.configErr = err
+	return err
 }
 
 type elementKind int
@@ -279,6 +433,12 @@ func (d *Decoder) process(elements []frameElement) error {
 			}
 			channel += count
 		case elemCPE:
+			// A channel pair needs two free output channels. A corrupt frame in
+			// a mono (or odd-channel) stream can contain a CPE and must be
+			// rejected instead of writing past d.Data.
+			if channel+1 >= channels {
+				return fmt.Errorf("decoder: channel pair exceeds configured channels: %w", ErrInvalidFrame)
+			}
 			if err := d.processPair(e.id, e.cpe, channel); err != nil {
 				return err
 			}
@@ -297,10 +457,10 @@ func (d *Decoder) processSingle(id int, element *ics.ICStream, channel int) (int
 	data := element.Data
 
 	if profile == aotAACMain {
-		return 0, fmt.Errorf("decoder: main prediction unimplemented")
+		return 0, newConfigError(fmt.Errorf("decoder: main prediction unimplemented"))
 	}
 	if profile == aotAACLTP {
-		return 0, fmt.Errorf("decoder: LTP prediction unimplemented")
+		return 0, newConfigError(fmt.Errorf("decoder: LTP prediction unimplemented"))
 	}
 
 	if err := d.applyChannelCoupling(id, false, cce.BeforeTNS, data, nil); err != nil {
@@ -351,13 +511,13 @@ func (d *Decoder) processPair(id int, element *cpe.Element, channel int) error {
 	}
 
 	if profile == aotAACMain {
-		return fmt.Errorf("decoder: main prediction unimplemented")
+		return newConfigError(fmt.Errorf("decoder: main prediction unimplemented"))
 	}
 
 	d.processIS(element, lData, rData)
 
 	if profile == aotAACLTP {
-		return fmt.Errorf("decoder: LTP prediction unimplemented")
+		return newConfigError(fmt.Errorf("decoder: LTP prediction unimplemented"))
 	}
 
 	if err := d.applyChannelCoupling(id, true, cce.BeforeTNS, lData, rData); err != nil {
@@ -519,6 +679,8 @@ func (d *Decoder) applyChannelCoupling(elementID int, isChannelPair bool, coupli
 	return nil
 }
 
+// setConfigFromADTS initializes the decoder from an ADTS header. Errors are
+// configuration errors and are latched by the caller.
 func (d *Decoder) setConfigFromADTS(header adts.Header) error {
 	config := d.Config
 	config.Profile = header.Profile
@@ -530,10 +692,6 @@ func (d *Decoder) setConfigFromADTS(header adts.Header) error {
 	config.ChanConfig = header.ChannelConfig
 	config.FrameLength = 1024
 
-	filterBank, err := filterbank.New(false, config.ChanConfig)
-	if err != nil {
-		return err
-	}
 	if config.Profile != aotAACMain && config.Profile != aotAACLC && config.Profile != aotAACLTP {
 		return fmt.Errorf("decoder: AAC profile %d not supported", config.Profile)
 	}
@@ -541,8 +699,14 @@ func (d *Decoder) setConfigFromADTS(header adts.Header) error {
 		return fmt.Errorf("decoder: PCE unimplemented")
 	}
 
+	filterBank, err := filterbank.New(false, config.ChanConfig)
+	if err != nil {
+		return err
+	}
+
 	d.Config = config
 	d.FilterBank = filterBank
+	d.configured = true
 	return nil
 }
 

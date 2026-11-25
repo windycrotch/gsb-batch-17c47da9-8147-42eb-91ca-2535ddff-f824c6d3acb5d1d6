@@ -92,6 +92,38 @@ func New(smallFrames bool, channels int) (*FilterBank, error) {
 	return f, nil
 }
 
+// Snapshot returns a deep copy of the per-channel overlap-add state.
+//
+// The returned value can be passed to Restore to roll the filter bank back to
+// this point in time. Callers that decode untrusted frames use this to make
+// sure a frame that fails part-way through processing cannot leave stale
+// overlap data behind and corrupt the next frame.
+func (f *FilterBank) Snapshot() [][]float32 {
+	snapshot := make([][]float32, len(f.overlaps))
+	for i, overlap := range f.overlaps {
+		snapshot[i] = make([]float32, len(overlap))
+		copy(snapshot[i], overlap)
+	}
+	return snapshot
+}
+
+// Restore replaces the per-channel overlap-add state with a snapshot
+// previously obtained from Snapshot.
+//
+// Snapshots with a different channel count (or a nil snapshot) reset the
+// overlap state to silence.
+func (f *FilterBank) Restore(snapshot [][]float32) {
+	for i, overlap := range f.overlaps {
+		if i < len(snapshot) && len(snapshot[i]) == len(overlap) {
+			copy(overlap, snapshot[i])
+			continue
+		}
+		for j := range overlap {
+			overlap[j] = 0
+		}
+	}
+}
+
 // Process runs the filter bank for a single channel.
 //
 // input must contain at least 1024 spectral values, output must contain at

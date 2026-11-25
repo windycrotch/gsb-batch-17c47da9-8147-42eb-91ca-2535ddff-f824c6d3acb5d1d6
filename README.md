@@ -63,6 +63,16 @@ aac2pcm --raw input.aac > output.pcm
 aac2pcm -v input.aac output.wav
 ```
 
+Corrupt frames are skipped automatically: the tool keeps decoding after a bad
+frame and writes the WAV from the remaining valid audio. In `-v` mode it reports
+how many frames were skipped and the file offset of the first one. If the input
+contains no decodable frames at all the tool exits non-zero and writes no output
+file.
+
+The WAV sample rate, channel count and data length always describe the samples
+that were actually written, never the values declared by a corrupt or first
+frame.
+
 See [cmd/aac2pcm/main.go](cmd/aac2pcm/main.go) for a complete example of how to use the library.
 
 ## Library Usage
@@ -75,6 +85,28 @@ The library provides a simple API for decoding AAC audio. See the [aac2pcm imple
 4. Decoding frames with `decoder.DecodeFrame()`
 5. Converting float32 samples to int16 PCM
 6. Writing WAV files
+
+### Handling corrupt frames
+
+`DecodeFrame` distinguishes two kinds of failure:
+
+- **Corrupt frame** — the returned error matches `decoder.ErrInvalidFrame`. The
+  decoder's configuration and filter state are left untouched, so the caller may
+  skip the frame and keep decoding:
+
+  ```go
+  samples, err := dec.DecodeFrame(frame)
+  if errors.Is(err, decoder.ErrInvalidFrame) {
+      // skip this frame, continue with the next one
+      return
+  }
+  ```
+
+- **Configuration error** — anything else (unsupported profile, invalid channel
+  configuration, decoder not configured, ...). These are fatal and latched: every
+  later call returns the same error until a successful `SetASC`, so skipping a
+  frame can never make a mis-configured decoder silently recover.
+
 
 ## Architecture
 
