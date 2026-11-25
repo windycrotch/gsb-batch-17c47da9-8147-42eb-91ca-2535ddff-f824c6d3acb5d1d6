@@ -36,6 +36,13 @@ type Member struct {
 // primary. An index no member delivers within Skew grains of the
 // leading member is published from the INVALID placeholder, source
 // Placeholder.
+//
+// A member whose ring was replaced serves nothing until its new ring
+// does: Drop moves the slots it served off it. Indices its new ring never
+// wrote, below the new ring's head, are not ones it skipped, so it is
+// waited for as a late primary, once, rather than passed over at once.
+// Retire never moves a slot onto a ring just replaced, which holds none
+// of the grains the old one did. The same on Audio, page by page.
 type Discrete struct {
 	Grains      uint   // ring depth
 	Data        bool   // a data flow: committed means complete
@@ -48,11 +55,31 @@ type Discrete struct {
 	Primary int    // -1 until chosen; an ordered set starts on member 0
 	Current []int  // source selected per slot
 
+	// waitingIndex and waitingSince are the index a wait for a late
+	// primary began at and when. A wait lasts one Tolerance from there,
+	// however many passes see the primary late, so a member that stays a
+	// little behind is not waited for anew at every index.
 	waitingIndex uint64
 	waitingSince time.Time
 
 	seen []uint64 // per member, the head Retire last saw
 	late []uint64 // per member, how far its head was behind due when it last moved
+
+	// fresh is, per member, whether its ring was replaced since it last
+	// served an index, and freshSince when. Its new ring holds none of
+	// the indices the old one did, so a head past an index it does not
+	// hold is no skip: the new ring starts later and never had what came
+	// before it. Such an index is waited for once, from freshSince, as a
+	// late primary's is, and then the others serve until the new ring
+	// reaches an index of its own. The member stays the primary, which it
+	// has not skipped anything to remain.
+	fresh      []bool
+	freshSince []time.Time
+
+	// now is the clock of the last Step. Drop dates a replacement from
+	// it, so the new ring is waited for from the pass that took it over
+	// rather than from the first index the output reaches after.
+	now time.Time
 }
 
 // ToleranceFor is how long a set with skew budget skew waits for a late
@@ -97,6 +124,8 @@ func (d *Discrete) serves(m Member, index uint64) bool {
 // is published, and
 // how long until a pending decision times out (0 when none waits).
 func (d *Discrete) Step(members []Member, now time.Time) (selects []Select, head uint64, wait time.Duration) {
+	d.now = now
+	d.grow(len(members))
 	if d.Ordered && d.Primary < 0 {
 		d.Primary = 0
 	}
@@ -131,7 +160,24 @@ func (d *Discrete) Step(members []Member, now time.Time) (selects []Select, head
 				d.waitingIndex, d.waitingSince = index, now
 			}
 			switch {
-			case d.Primary < 0 || members[d.Primary].Head >= index:
+			case d.Primary < 0:
+				pick = alt
+			case d.isFresh(d.Primary) && members[d.Primary].Head >= index:
+				// The ring was replaced and starts past this index: the
+				// new ring never held it, so serving another member is
+				// not the primary having skipped it. It is late with it
+				// once, from the pass that took the ring over, as a late
+				// primary is. The member stays the primary: it skipped
+				// nothing, and serves again from the index its new ring
+				// starts at.
+				if d.freshSince[d.Primary].IsZero() {
+					d.freshSince[d.Primary] = now
+				}
+				if w := d.Tolerance - now.Sub(d.freshSince[d.Primary]); w > 0 {
+					return selects, d.Head, w
+				}
+				pick = alt
+			case members[d.Primary].Head >= index:
 				pick = alt // the primary skipped it
 			case now.Sub(d.waitingSince) >= d.Tolerance:
 				pick, d.Primary = alt, alt // the primary is late: replace it
@@ -148,6 +194,11 @@ func (d *Discrete) Step(members []Member, now time.Time) (selects []Select, head
 		if d.Primary < 0 && pick != d.Placeholder {
 			d.Primary = pick
 		}
+		if pick >= 0 && pick < len(d.fresh) {
+			// The ring the index came from is live: it is no longer one
+			// a replacement left behind.
+			d.fresh[pick] = false
+		}
 		if d.Current[slot] != pick {
 			d.Current[slot] = pick
 			selects = append(selects, Select{Slot: slot, Source: pick, Index: index})
@@ -156,6 +207,21 @@ func (d *Discrete) Step(members []Member, now time.Time) (selects []Select, head
 	}
 	return selects, d.Head, 0
 }
+
+// grow makes room for n members in the replacement bookkeeping.
+func (d *Discrete) grow(n int) {
+	if len(d.fresh) >= n {
+		return
+	}
+	fresh, since := make([]bool, n), make([]time.Time, n)
+	copy(fresh, d.fresh)
+	copy(since, d.freshSince)
+	d.fresh, d.freshSince = fresh, since
+}
+
+// isFresh reports whether member m's ring was replaced since it last
+// served an index.
+func (d *Discrete) isFresh(m int) bool { return m >= 0 && m < len(d.fresh) && d.fresh[m] }
 
 // Retire returns the selects that keep the output's oldest grains true
 // while it lags its members. Readers trust every index from
@@ -201,7 +267,9 @@ func (d *Discrete) Retire(members []Member, due uint64) (selects []Select) {
 		}
 		to := d.Placeholder
 		for m := range members {
-			if m != cur && d.serves(members[m], i) && next(m) < i+uint64(d.Grains) {
+			// A ring just replaced holds none of the indices the old one
+			// did, whatever the members described here still say of it.
+			if m != cur && !d.isFresh(m) && d.serves(members[m], i) && next(m) < i+uint64(d.Grains) {
 				to = m
 				break
 			}
@@ -215,7 +283,14 @@ func (d *Discrete) Retire(members []Member, due uint64) (selects []Select) {
 // Drop returns the selects that move every slot member m serves to
 // another member that holds its grain, or to the placeholder, before m's
 // ring is replaced by one that holds none of them.
+//
+// The new ring is marked fresh, so a head past an index it does not hold
+// is read as the ring having started later, not as a skip, and it is
+// waited for once as a late primary is. A wait the old ring was in
+// belongs to it and ends here, so the new ring is not passed over on the
+// old ring's expired clock.
 func (d *Discrete) Drop(members []Member, m int) (selects []Select) {
+	d.grow(len(members))
 	for slot, cur := range d.Current {
 		if cur != m {
 			continue
@@ -234,6 +309,11 @@ func (d *Discrete) Drop(members []Member, m int) (selects []Select) {
 		}
 		d.Current[slot] = to
 		selects = append(selects, Select{Slot: uint(slot), Source: to, Index: index})
+	}
+	d.fresh[m], d.freshSince[m] = true, d.now
+	if d.Primary == m {
+		// A wait the old ring was in is the old ring's.
+		d.waitingIndex, d.waitingSince = 0, time.Time{}
 	}
 	return selects
 }
@@ -314,6 +394,18 @@ type Audio struct {
 	upto      []uint64 // scratch for Step
 	seen      []seen   // per member, what under read
 	holds     []uint64 // scratch for zeros
+
+	// fresh is, per member, whether its ring was replaced since it last
+	// served a page, and freshSince when. Its new ring holds none of the
+	// pages the old one did, so a head past a page it does not hold is no
+	// gap: the new ring starts later and never had what came before it.
+	// Such a page is waited for once, from freshSince, as a late
+	// primary's is, and then the other members serve until the new ring
+	// reaches a page of its own. The member stays the primary, which it
+	// has not skipped anything to remain.
+	fresh      []bool
+	freshSince []time.Time
+	now        time.Time // the clock of the last Step; Drop dates a replacement from it
 }
 
 // zeroWait is a stretch of zeros' wait for another member to commit it.
@@ -329,7 +421,8 @@ const (
 func NewAudio(members int, pages uint64, silence int) *Audio {
 	a := &Audio{Pages: pages, Silence: silence, Primary: 0, Tolerance: 2 * time.Millisecond, Run: 48,
 		Current: make([]int, pages), cov: make([][]coverage, members), evHead: make([]uint64, members),
-		batch: make([]uint64, members), waitingPage: ^uint64(0)}
+		batch: make([]uint64, members), waitingPage: ^uint64(0),
+		fresh: make([]bool, members), freshSince: make([]time.Time, members)}
 	for i := range a.Current {
 		a.Current[i] = silence
 	}
@@ -388,6 +481,7 @@ type PageSelect struct {
 
 // Step advances the published head as far as the members allow at now.
 func (a *Audio) Step(now time.Time) (selects []PageSelect, head uint64, wait time.Duration) {
+	a.now = now
 	var lead uint64
 	for _, h := range a.evHead {
 		lead = max(lead, h)
@@ -424,11 +518,27 @@ func (a *Audio) Step(now time.Time) (selects []PageSelect, head uint64, wait tim
 			if a.waitingPage != n {
 				a.waitingPage, a.waitingSince = n, now
 			}
-			gap := (a.cov[a.Primary][p].valid && a.cov[a.Primary][p].n == n && a.cov[a.Primary][p].broken) ||
-				a.evHead[a.Primary] > a.Head
+			broken := a.cov[a.Primary][p].valid && a.cov[a.Primary][p].n == n && a.cov[a.Primary][p].broken
+			ahead := a.evHead[a.Primary] > a.Head
 			switch {
-			case gap:
+			case broken:
+				pick = alt // a gap in the primary's own ring
+			case a.fresh[a.Primary] && ahead:
+				// The ring was replaced and starts past this page: the
+				// new ring never held it, so it is no gap in what the
+				// primary wrote. It is late with it once, from the pass
+				// that took the ring over, as a late primary is. The
+				// member stays the primary: it skipped nothing, and
+				// serves again from the page its new ring starts at.
+				if a.freshSince[a.Primary].IsZero() {
+					a.freshSince[a.Primary] = now
+				}
+				if w := a.Tolerance - now.Sub(a.freshSince[a.Primary]); w > 0 {
+					return selects, a.Head, w
+				}
 				pick = alt
+			case ahead:
+				pick = alt // the primary's head passed a page it does not hold
 			case now.Sub(a.waitingSince) >= a.Tolerance:
 				pick, a.Primary = alt, alt
 			default:
@@ -442,6 +552,11 @@ func (a *Audio) Step(now time.Time) (selects []PageSelect, head uint64, wait tim
 			pick = a.Silence
 			clear(upto)
 			upto[pick] = min((n+1)*PageSamples, lead)
+		}
+		if pick >= 0 && pick < len(a.fresh) {
+			// The ring the page came from is live: it is no longer one a
+			// replacement left behind.
+			a.fresh[pick] = false
 		}
 		if a.Current[p] != pick {
 			a.Current[p] = pick
@@ -736,6 +851,18 @@ func (a *Audio) Drop(m int) (selects []PageSelect) {
 	// would read as the member having skipped what it never wrote.
 	a.cov[m] = make([]coverage, a.Pages)
 	a.evHead[m] = 0
+	// The new ring is marked fresh, so a head past a page it does not
+	// hold is read as the ring having started later, not as a gap, and it
+	// is waited for once as a late primary is. A wait the old ring was in
+	// belongs to it and ends here, so the new ring is not passed over on
+	// the old ring's expired clock.
+	a.fresh[m], a.freshSince[m] = true, a.now
+	if a.Primary == m {
+		a.waitingPage, a.waitingSince = ^uint64(0), time.Time{}
+		if a.zeroWait == zeroWaiting {
+			a.zeroWait = zeroNone
+		}
+	}
 	// What under read of m's ring, or against it, holds for it no more.
 	for i := range a.seen {
 		if i == m || a.seen[i].cur == m {
