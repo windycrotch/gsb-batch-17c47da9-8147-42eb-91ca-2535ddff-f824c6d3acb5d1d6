@@ -1,0 +1,34 @@
+module github.com/hexis-revival/hexagon
+
+go 1.25.8
+
+require (
+	github.com/aws/aws-sdk-go v1.55.8 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/gorilla/mux v1.8.1
+	github.com/hexis-revival/go-raknet v0.0.0-20241211210029-9be624b59d55
+	github.com/hexis-revival/hbxml v0.0.0-20241215135203-d953473452ef
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/pgx/v5 v5.9.1 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/jinzhu/inflection v1.0.0 // indirect
+	github.com/jinzhu/now v1.1.5 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/lib/pq v1.12.3
+	github.com/pkg/errors v0.9.1
+	github.com/redis/go-redis/v9 v9.18.0
+	github.com/u2takey/ffmpeg-go v0.5.0
+	github.com/u2takey/go-utils v0.3.1 // indirect
+	golang.org/x/crypto v0.50.0
+	golang.org/x/image v0.39.0
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
+	gorm.io/driver/postgres v1.6.0
+	gorm.io/gorm v1.31.1
+)
+
+require golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
+
+require go.uber.org/atomic v1.11.0 // indirect
