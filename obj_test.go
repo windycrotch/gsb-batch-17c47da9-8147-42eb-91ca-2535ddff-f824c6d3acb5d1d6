@@ -3,6 +3,8 @@ package gwob
 import (
 	"bytes"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -320,6 +322,381 @@ func TestSmoothGroup2(t *testing.T) {
 
 	if len(o.Groups) != 1 {
 		t.Errorf("smoothGroupObj2: groups: want=%d got=%d", 1, len(o.Groups))
+	}
+}
+
+// badFaceObj mixes valid faces with bad faces (out-of-range vertex,
+// texture and normal indices, malformed tokens) and material/smooth
+// switches with no faces in between.
+var badFaceObj = `
+o bad_face_test
+v 0 0 0
+v 1 0 0
+v 0 1 0
+v 0 0 1
+usemtl mtlA
+f 1 2 3
+f 1 2 99
+f 1 2 nope
+usemtl mtlB
+s 1
+usemtl mtlC
+f 1 3 4
+s 2
+f 2 3 4
+`
+
+var badFaceIndices = []int{0, 1, 2, 0, 2, 3, 1, 2, 3}
+var badFaceCoord = []float32{0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}
+
+func TestBadFaceIsolation(t *testing.T) {
+
+	var logs []string
+	options := ObjParserOptions{LogStats: LogStats, Logger: func(msg string) { logs = append(logs, msg) }}
+
+	o, err := NewObjFromBuf("badFaceObj", []byte(badFaceObj), &options)
+	if err != nil {
+		t.Fatalf("TestBadFaceIsolation: NewObjFromBuf: %v", err)
+	}
+	if o == nil {
+		t.Fatalf("TestBadFaceIsolation: nil Obj")
+	}
+
+	// bad faces must not leak partial data into geometry
+	if !sliceEqualInt(badFaceIndices, o.Indices) {
+		t.Errorf("TestBadFaceIsolation: indices: want=%v got=%v", badFaceIndices, o.Indices)
+	}
+	if !sliceEqualFloat(badFaceCoord, o.Coord) {
+		t.Errorf("TestBadFaceIsolation: coord: want=%v got=%v", badFaceCoord, o.Coord)
+	}
+
+	// skipped face count must be reported through the logger
+	foundSkip := false
+	for _, msg := range logs {
+		if strings.Contains(msg, "skipped 2 bad face") {
+			foundSkip = true
+		}
+	}
+	if !foundSkip {
+		t.Errorf("TestBadFaceIsolation: missing skipped-face log message: %v", logs)
+	}
+
+	// no residual zero-count groups; groups keep their own
+	// smooth/usemtl; index ranges are contiguous
+	if len(o.Groups) != 3 {
+		t.Fatalf("TestBadFaceIsolation: groups: want=%d got=%d", 3, len(o.Groups))
+	}
+	wantBegin := []int{0, 3, 6}
+	wantCount := []int{3, 3, 3}
+	wantMtl := []string{"mtlA", "mtlC", "mtlC"}
+	wantSmooth := []int{0, 1, 2}
+	for i, g := range o.Groups {
+		if g.IndexBegin != wantBegin[i] || g.IndexCount != wantCount[i] {
+			t.Errorf("group %d: range want=%d+%d got=%d+%d", i, wantBegin[i], wantCount[i], g.IndexBegin, g.IndexCount)
+		}
+		if g.Usemtl != wantMtl[i] {
+			t.Errorf("group %d: usemtl want=%s got=%s", i, wantMtl[i], g.Usemtl)
+		}
+		if g.Smooth != wantSmooth[i] {
+			t.Errorf("group %d: smooth want=%d got=%d", i, wantSmooth[i], g.Smooth)
+		}
+	}
+	for i := 1; i < len(o.Groups); i++ {
+		prev := o.Groups[i-1]
+		if prev.IndexBegin+prev.IndexCount != o.Groups[i].IndexBegin {
+			t.Errorf("groups %d and %d not contiguous", i-1, i)
+		}
+	}
+
+	// export must not fail and must round-trip
+	buf := bytes.Buffer{}
+	if errWrite := o.ToWriter(&buf); errWrite != nil {
+		t.Fatalf("TestBadFaceIsolation: ToWriter: %v", errWrite)
+	}
+	re, errParse := NewObjFromReader("badFaceObj-reload", &buf, &options)
+	if errParse != nil {
+		t.Fatalf("TestBadFaceIsolation: reload: %v", errParse)
+	}
+	if !sliceEqualInt(o.Indices, re.Indices) {
+		t.Errorf("TestBadFaceIsolation: reload indices: want=%v got=%v", o.Indices, re.Indices)
+	}
+	if !sliceEqualFloat(o.Coord, re.Coord) {
+		t.Errorf("TestBadFaceIsolation: reload coord: want=%v got=%v", o.Coord, re.Coord)
+	}
+}
+
+func TestBadFaceKinds(t *testing.T) {
+
+	cases := map[string]string{
+		"vertex out of range":  "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n",
+		"vertex negative oob":  "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -4 -2 -1\n",
+		"vertex zero":          "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",
+		"texture out of range": "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/1 2/1 3/2\n",
+		"normal out of range":  "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//2 3//1\n",
+		"malformed index":      "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 x\n",
+		"too few corners":      "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2\n",
+		"quad with bad corner": "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3 9\n",
+	}
+
+	for name, str := range cases {
+		options := ObjParserOptions{}
+		o, err := NewObjFromBuf(name, []byte(str), &options)
+		if err != nil {
+			t.Errorf("%s: NewObjFromBuf: %v", name, err)
+			continue
+		}
+		if o == nil {
+			t.Errorf("%s: nil Obj", name)
+			continue
+		}
+		if len(o.Indices) != 0 || len(o.Coord) != 0 {
+			t.Errorf("%s: bad face leaked data: indices=%v coord=%v", name, o.Indices, o.Coord)
+		}
+		for _, g := range o.Groups {
+			if g.IndexCount == 0 {
+				t.Errorf("%s: residual zero-count group=%s", name, g.Name)
+			}
+		}
+	}
+}
+
+func TestAllFacesBad(t *testing.T) {
+
+	str := `
+o all_bad
+v 0 0 0
+v 1 0 0
+usemtl m
+f 1 2 3
+f 4 5 6
+s 1
+f 7 8 9
+`
+	options := ObjParserOptions{}
+
+	o, err := NewObjFromBuf("allBad", []byte(str), &options)
+	if err != nil {
+		t.Fatalf("TestAllFacesBad: NewObjFromBuf: %v", err)
+	}
+	if o == nil {
+		t.Fatalf("TestAllFacesBad: nil Obj")
+	}
+
+	// must export safely as empty geometry
+	buf := bytes.Buffer{}
+	if errWrite := o.ToWriter(&buf); errWrite != nil {
+		t.Fatalf("TestAllFacesBad: ToWriter: %v", errWrite)
+	}
+	if strings.Contains(buf.String(), "\nf ") {
+		t.Errorf("TestAllFacesBad: unexpected face line in output: %q", buf.String())
+	}
+
+	// exported empty geometry must parse back
+	re, errParse := NewObjFromReader("allBad-reload", &buf, &options)
+	if errParse != nil {
+		t.Fatalf("TestAllFacesBad: reload: %v", errParse)
+	}
+	if len(re.Indices) != 0 || len(re.Coord) != 0 {
+		t.Errorf("TestAllFacesBad: reload not empty: indices=%v coord=%v", re.Indices, re.Coord)
+	}
+}
+
+func TestNoResidualEmptyGroups(t *testing.T) {
+
+	str := `
+mtllib lib
+usemtl a
+usemtl b
+s off
+s 1
+g g1
+g g2
+v 0 0 0
+v 1 0 0
+v 0 1 0
+f 1 2 3
+usemtl c
+s 2
+usemtl d
+`
+	options := ObjParserOptions{}
+
+	o, err := NewObjFromBuf("residual", []byte(str), &options)
+	if err != nil {
+		t.Fatalf("TestNoResidualEmptyGroups: NewObjFromBuf: %v", err)
+	}
+
+	for _, g := range o.Groups {
+		if g.IndexCount == 0 {
+			t.Errorf("TestNoResidualEmptyGroups: residual zero-count group=%s", g.Name)
+		}
+	}
+	if len(o.Groups) != 1 {
+		t.Fatalf("TestNoResidualEmptyGroups: groups: want=1 got=%d", len(o.Groups))
+	}
+	g := o.Groups[0]
+	if g.Name != "g2" || g.Usemtl != "b" || g.Smooth != 1 {
+		t.Errorf("TestNoResidualEmptyGroups: group want=g2/b/1 got=%s/%s/%d", g.Name, g.Usemtl, g.Smooth)
+	}
+	if g.IndexBegin != 0 || g.IndexCount != 3 {
+		t.Errorf("TestNoResidualEmptyGroups: range want=0+3 got=%d+%d", g.IndexBegin, g.IndexCount)
+	}
+}
+
+func roundTrip(t *testing.T, label, str string) *Obj {
+	options := ObjParserOptions{}
+
+	orig, err := NewObjFromBuf(label, []byte(str), &options)
+	if err != nil {
+		t.Fatalf("%s: NewObjFromBuf: %v", label, err)
+	}
+
+	buf := bytes.Buffer{}
+	if errWrite := orig.ToWriter(&buf); errWrite != nil {
+		t.Fatalf("%s: ToWriter: %v", label, errWrite)
+	}
+
+	re, errParse := NewObjFromReader(label+"-reload", &buf, &options)
+	if errParse != nil {
+		t.Fatalf("%s: reload: %v", label, errParse)
+	}
+
+	if !sliceEqualInt(orig.Indices, re.Indices) {
+		t.Errorf("%s: reload indices: want=%v got=%v", label, orig.Indices, re.Indices)
+	}
+	if !sliceEqualFloat(orig.Coord, re.Coord) {
+		t.Errorf("%s: reload coord: want=%v got=%v", label, orig.Coord, re.Coord)
+	}
+	if orig.StrideSize != re.StrideSize ||
+		orig.StrideOffsetPosition != re.StrideOffsetPosition ||
+		orig.StrideOffsetTexture != re.StrideOffsetTexture ||
+		orig.StrideOffsetNormal != re.StrideOffsetNormal {
+		t.Errorf("%s: stride mismatch: want=%d/%d/%d/%d got=%d/%d/%d/%d", label,
+			orig.StrideSize, orig.StrideOffsetPosition, orig.StrideOffsetTexture, orig.StrideOffsetNormal,
+			re.StrideSize, re.StrideOffsetPosition, re.StrideOffsetTexture, re.StrideOffsetNormal)
+	}
+
+	return re
+}
+
+func TestWriteTextureOnly(t *testing.T) {
+	str := `
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+f 1/1 2/2 3/3
+`
+	roundTrip(t, "TestWriteTextureOnly", str)
+}
+
+func TestWriteNormalOnly(t *testing.T) {
+	str := `
+v 0 0 0
+v 1 0 0
+v 0 1 0
+vn 1 0 0
+vn 0 1 0
+vn 0 0 1
+f 1//1 2//2 3//3
+`
+	roundTrip(t, "TestWriteNormalOnly", str)
+}
+
+func TestWriteTextureAndNormal(t *testing.T) {
+	roundTrip(t, "TestWriteTextureAndNormal", cubeObj)
+}
+
+func TestWriteBadCountNoFaceLines(t *testing.T) {
+
+	orig, err := NewObjFromVertex([]float32{}, []int{0, 1})
+	if err != nil {
+		t.Fatalf("TestWriteBadCountNoFaceLines: NewObjFromVertex: %v", err)
+	}
+
+	buf := bytes.Buffer{}
+	errWrite := orig.ToWriter(&buf)
+	if errWrite == nil {
+		t.Fatalf("TestWriteBadCountNoFaceLines: unexpected writer success")
+	}
+	if strings.Contains(buf.String(), "\nf ") {
+		t.Errorf("TestWriteBadCountNoFaceLines: face line written for bad group: %q", buf.String())
+	}
+}
+
+func TestConcurrentParse(t *testing.T) {
+
+	options := ObjParserOptions{}
+
+	want, err := NewObjFromBuf("cubeObj", []byte(cubeObj), &options)
+	if err != nil {
+		t.Fatalf("TestConcurrentParse: NewObjFromBuf: %v", err)
+	}
+
+	buf := []byte(cubeObj)
+	const goroutines = 8
+	results := make([]*Obj, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			o, e := NewObjFromBuf("cubeObj", buf, &ObjParserOptions{})
+			if e != nil {
+				t.Errorf("TestConcurrentParse: goroutine %d: %v", slot, e)
+				return
+			}
+			results[slot] = o
+		}(i)
+	}
+	wg.Wait()
+
+	for i, o := range results {
+		if o == nil {
+			t.Errorf("TestConcurrentParse: goroutine %d: nil Obj", i)
+			continue
+		}
+		if !sliceEqualInt(want.Indices, o.Indices) {
+			t.Errorf("TestConcurrentParse: goroutine %d: indices mismatch", i)
+		}
+		if !sliceEqualFloat(want.Coord, o.Coord) {
+			t.Errorf("TestConcurrentParse: goroutine %d: coord mismatch", i)
+		}
+		if len(o.Groups) != len(want.Groups) {
+			t.Errorf("TestConcurrentParse: goroutine %d: groups mismatch", i)
+		}
+	}
+}
+
+func TestParseRecovery(t *testing.T) {
+
+	options := ObjParserOptions{}
+
+	// first parse skips bad faces
+	if _, err := NewObjFromBuf("badFaceObj", []byte(badFaceObj), &options); err != nil {
+		t.Fatalf("TestParseRecovery: bad parse: %v", err)
+	}
+
+	// a following valid parse must match a fresh valid parse
+	want, errWant := NewObjFromBuf("cubeObj", []byte(cubeObj), &options)
+	if errWant != nil {
+		t.Fatalf("TestParseRecovery: fresh parse: %v", errWant)
+	}
+	got, errGot := NewObjFromBuf("cubeObj", []byte(cubeObj), &options)
+	if errGot != nil {
+		t.Fatalf("TestParseRecovery: second parse: %v", errGot)
+	}
+
+	if !sliceEqualInt(want.Indices, got.Indices) {
+		t.Errorf("TestParseRecovery: indices mismatch")
+	}
+	if !sliceEqualFloat(want.Coord, got.Coord) {
+		t.Errorf("TestParseRecovery: coord mismatch")
+	}
+	if len(want.Groups) != len(got.Groups) {
+		t.Errorf("TestParseRecovery: groups mismatch")
 	}
 }
 

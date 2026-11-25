@@ -386,6 +386,7 @@ type objParser struct {
 	normLines  int
 	faceLines  int // stat-only
 	triangles  int // stat-only
+	badFaces   int // faces skipped atomically due to bad indices
 }
 
 // ObjParserOptions sets options for the parser.
@@ -594,18 +595,23 @@ func readObj(objName string, reader StringReader, options *ObjParserOptions) (*O
 
 	// 3. output
 
-	// drop empty groups
+	// drop empty groups: consecutive usemtl/s/g switches with no
+	// faces in between must not leave residual zero-count groups
 	tmp := []*Group{}
 	for _, g := range o.Groups {
 		switch {
-		case g.IndexCount < 0:
-			continue // discard empty bogus group created internally by parser
+		case g.IndexCount <= 0:
+			continue // discard empty group
 		case g.IndexCount < 3:
 			options.log(fmt.Sprintf("readObj: obj=%s BAD GROUP SIZE group=%s size=%d < 3", objName, g.Name, g.IndexCount))
 		}
 		tmp = append(tmp, g)
 	}
 	o.Groups = tmp
+
+	if p.badFaces > 0 {
+		options.log(fmt.Sprintf("readObj: obj=%s skipped %d bad face(s)", objName, p.badFaces))
+	}
 
 	setupStride(o) // setup stride size
 
@@ -765,87 +771,114 @@ func pushIndex(currGroup *Group, o *Obj, i int) {
 	currGroup.IndexCount++
 }
 
-func addVertex(p *objParser, o *Obj, index string, options *ObjParserOptions) error {
+// vertexRef holds a fully validated face corner. Parsing a face
+// first converts every corner into a vertexRef without touching
+// parser output state, so a bad face can be dropped atomically:
+// nothing is written to Coord, Indices or group counters unless
+// every corner of the face is valid.
+type vertexRef struct {
+	vi         int    // resolved vertex index
+	ti         int    // resolved texture index
+	ni         int    // resolved normal index
+	hasTexture bool   // corner carries a texture index
+	hasNormal  bool   // corner carries a normal index
+	absIndex   string // unified index key
+}
+
+// parseVertexRef resolves and validates a single face corner index.
+// It performs no mutation of parser or Obj state.
+func parseVertexRef(p *objParser, index string, options *ObjParserOptions) (vertexRef, error) {
+	var ref vertexRef
+
 	ind := splitSlash(strings.Replace(index, "//", "/0/", 1))
 	size := len(ind)
 	if size < 1 || size > 3 {
-		return fmt.Errorf("addVertex: line=%d bad index=[%s] size=%d", p.lineCount, index, size)
+		return ref, fmt.Errorf("bad index=[%s] size=%d", index, size)
 	}
 
 	v, err := strconv.ParseInt(ind[0], 10, 32)
 	if err != nil {
-		return fmt.Errorf("addVertex: line=%d bad integer 1st index=[%s]: %v", p.lineCount, ind[0], err)
+		return ref, fmt.Errorf("bad integer 1st index=[%s]: %v", ind[0], err)
 	}
-	vi := solveRelativeIndex(int(v), p.vertLines)
+	ref.vi = solveRelativeIndex(int(v), p.vertLines)
+	if ref.vi < 0 || ref.vi*3+2 >= len(p.vertCoord) {
+		return ref, fmt.Errorf("invalid vertex index=[%s]", ind[0])
+	}
 
-	var ti int
 	var tIndex string
-	hasTextureCoord := strings.Index(index, "//") == -1 && size > 1
-	if hasTextureCoord {
+	ref.hasTexture = strings.Index(index, "//") == -1 && size > 1
+	if ref.hasTexture {
 		t, e := strconv.ParseInt(ind[1], 10, 32)
 		if e != nil {
-			return fmt.Errorf("addVertex: line=%d bad integer 2nd index=[%s]: %v", p.lineCount, ind[1], e)
+			return ref, fmt.Errorf("bad integer 2nd index=[%s]: %v", ind[1], e)
 		}
-		ti = solveRelativeIndex(int(t), p.textLines)
-		tIndex = strconv.Itoa(ti)
+		ref.ti = solveRelativeIndex(int(t), p.textLines)
+		if ref.ti < 0 || ref.ti*2+1 >= len(p.textCoord) {
+			return ref, fmt.Errorf("invalid texture index=[%s]", ind[1])
+		}
+		tIndex = strconv.Itoa(ref.ti)
 	}
 
-	var ni int
 	var nIndex string
-	if size > 2 {
+	ref.hasNormal = size > 2
+	if ref.hasNormal {
 		n, e := strconv.ParseInt(ind[2], 10, 32)
 		if e != nil {
-			return fmt.Errorf("addVertex: line=%d bad integer 3rd index=[%s]: %v", p.lineCount, ind[2], e)
+			return ref, fmt.Errorf("bad integer 3rd index=[%s]: %v", ind[2], e)
 		}
-		ni = solveRelativeIndex(int(n), p.normLines)
-		nIndex = strconv.Itoa(ni)
+		ref.ni = solveRelativeIndex(int(n), p.normLines)
+		if !options.IgnoreNormals {
+			if ref.ni < 0 || ref.ni*3+2 >= len(p.normCoord) {
+				return ref, fmt.Errorf("invalid normal index=[%s]", ind[2])
+			}
+		}
+		nIndex = strconv.Itoa(ref.ni)
 	}
 
-	absIndex := fmt.Sprintf("%d/%s/%s", vi, tIndex, nIndex)
+	ref.absIndex = fmt.Sprintf("%d/%s/%s", ref.vi, tIndex, nIndex)
 
+	return ref, nil
+}
+
+// addVertexRef appends an already validated corner to the output.
+func addVertexRef(p *objParser, o *Obj, ref vertexRef, options *ObjParserOptions) {
 	// known unified index?
-	if i, ok := p.indexTable[absIndex]; ok {
+	if i, ok := p.indexTable[ref.absIndex]; ok {
 		pushIndex(p.currGroup, o, i)
-		return nil
+		return
 	}
 
-	vOffset := vi * 3
-	if vOffset+2 >= len(p.vertCoord) {
-		return fmt.Errorf("err: line=%d invalid vertex index=[%s]", p.lineCount, ind[0])
-	}
-
+	vOffset := ref.vi * 3
 	o.Coord = append(o.Coord, p.vertCoord[vOffset+0]) // x
 	o.Coord = append(o.Coord, p.vertCoord[vOffset+1]) // y
 	o.Coord = append(o.Coord, p.vertCoord[vOffset+2]) // z
 
-	if tIndex != "" && hasTextureCoord {
-		tOffset := ti * 2
-
-		if tOffset+1 >= len(p.textCoord) {
-			return fmt.Errorf("err: line=%d invalid texture index=[%s]", p.lineCount, ind[1])
-		}
-
+	if ref.hasTexture {
+		tOffset := ref.ti * 2
 		o.Coord = append(o.Coord, p.textCoord[tOffset+0]) // u
 		o.Coord = append(o.Coord, p.textCoord[tOffset+1]) // v
 		o.TextCoordFound = true
 	}
 
-	if !options.IgnoreNormals && nIndex != "" {
-		nOffset := ni * 3
-
+	if !options.IgnoreNormals && ref.hasNormal {
+		nOffset := ref.ni * 3
 		o.Coord = append(o.Coord, p.normCoord[nOffset+0]) // x
 		o.Coord = append(o.Coord, p.normCoord[nOffset+1]) // y
 		o.Coord = append(o.Coord, p.normCoord[nOffset+2]) // z
-
 		o.NormCoordFound = true
 	}
 
 	// add unified index
 	pushIndex(p.currGroup, o, p.indexCount)
-	p.indexTable[absIndex] = p.indexCount
+	p.indexTable[ref.absIndex] = p.indexCount
 	p.indexCount++
+}
 
-	return nil
+// skipFace records an atomically dropped bad face and reports it
+// through the parser logger.
+func (p *objParser) skipFace(options *ObjParserOptions, face string, err error) {
+	p.badFaces++
+	options.log(fmt.Sprintf("parseLine: line=%d skipping bad face=[%s]: %v", p.lineCount, face, err))
 }
 
 func smoothGroup(s string) (int, error) {
@@ -867,12 +900,14 @@ func parseLine(p *objParser, o *Obj, line string, options *ObjParserOptions) (bo
 	case strings.HasPrefix(line, "s "):
 		smooth := line[2:]
 		if s, err := smoothGroup(smooth); err == nil {
-			if p.currGroup.Smooth != s {
-				if p.currGroup.IndexCount == 0 {
-					// mark previous empty group as bogus
-					p.currGroup.IndexCount = -1
-				}
-				// create new group
+			switch {
+			case p.currGroup.Smooth == s:
+				// no change
+			case p.currGroup.IndexCount == 0:
+				// empty group absorbs the switch: no residual empty group
+				p.currGroup.Smooth = s
+			default:
+				// split group at smooth switch
 				p.currGroup = o.newGroup(p.currGroup.Name, p.currGroup.Usemtl, len(o.Indices), s)
 			}
 		} else {
@@ -880,24 +915,29 @@ func parseLine(p *objParser, o *Obj, line string, options *ObjParserOptions) (bo
 		}
 	case strings.HasPrefix(line, "o ") || strings.HasPrefix(line, "g "):
 		name := line[2:]
-		if p.currGroup.Name == "" {
+		switch {
+		case p.currGroup.Name == "":
 			// only set missing name for group
 			p.currGroup.Name = name
-		} else if p.currGroup.Name != name {
-			// create new group
+		case p.currGroup.Name == name:
+			// no change
+		case p.currGroup.IndexCount == 0:
+			// empty group absorbs the rename: no residual empty group
+			p.currGroup.Name = name
+		default:
+			// split group at name switch
 			p.currGroup = o.newGroup(name, p.currGroup.Usemtl, len(o.Indices), p.currGroup.Smooth)
 		}
 	case strings.HasPrefix(line, "usemtl "):
 		usemtl := line[7:]
-		if p.currGroup.Usemtl == "" {
-			// only set the missing material name for group
+		switch {
+		case p.currGroup.Usemtl == usemtl:
+			// no change
+		case p.currGroup.IndexCount == 0:
+			// empty group absorbs the switch: no residual empty group
 			p.currGroup.Usemtl = usemtl
-		} else if p.currGroup.Usemtl != usemtl {
-			if p.currGroup.IndexCount == 0 {
-				// mark previous empty group as bogus
-				p.currGroup.IndexCount = -1
-			}
-			// create new group for material
+		default:
+			// split group at material switch
 			p.currGroup = o.newGroup(p.currGroup.Name, usemtl, len(o.Indices), p.currGroup.Smooth)
 		}
 	case strings.HasPrefix(line, "mtllib "):
@@ -913,35 +953,38 @@ func parseLine(p *objParser, o *Obj, line string, options *ObjParserOptions) (bo
 		f := strings.Fields(face)
 		size := len(f)
 		if size < 3 || size > 4 {
-			return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] size=%d", p.lineCount, face, size)
+			p.skipFace(options, face, fmt.Errorf("bad face size=%d (must be 3 or 4)", size))
+			return ErrNonFatal, nil
 		}
+
+		// Validate every corner BEFORE writing anything, so a bad
+		// face is dropped atomically: no partial data reaches
+		// Coord, Indices or the current group index range.
+		corners := make([]vertexRef, size)
+		for i, tok := range f {
+			ref, errRef := parseVertexRef(p, tok, options)
+			if errRef != nil {
+				p.skipFace(options, face, errRef)
+				return ErrNonFatal, nil
+			}
+			corners[i] = ref
+		}
+
 		// triangle face: v0 v1 v2
 		// quad face:
 		// v0 v1 v2 v3 =>
 		// v0 v1 v2
 		// v2 v3 v0
 		p.triangles++
-		if err := addVertex(p, o, f[0], options); err != nil {
-			return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] index_v0=[%s]: %v", p.lineCount, face, f[0], err)
-		}
-		if err := addVertex(p, o, f[1], options); err != nil {
-			return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] index_v1=[%s]: %v", p.lineCount, face, f[1], err)
-		}
-		if err := addVertex(p, o, f[2], options); err != nil {
-			return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] index_v2=[%s]: %v", p.lineCount, face, f[2], err)
-		}
+		addVertexRef(p, o, corners[0], options)
+		addVertexRef(p, o, corners[1], options)
+		addVertexRef(p, o, corners[2], options)
 		if size > 3 {
 			// quad face
 			p.triangles++
-			if err := addVertex(p, o, f[2], options); err != nil {
-				return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] index_v2=[%s]: %v", p.lineCount, face, f[2], err)
-			}
-			if err := addVertex(p, o, f[3], options); err != nil {
-				return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] index_v3=[%s]: %v", p.lineCount, face, f[3], err)
-			}
-			if err := addVertex(p, o, f[0], options); err != nil {
-				return ErrNonFatal, fmt.Errorf("parseLine: line=%d bad face=[%s] index_v0=[%s]: %v", p.lineCount, face, f[0], err)
-			}
+			addVertexRef(p, o, corners[2], options)
+			addVertexRef(p, o, corners[3], options)
+			addVertexRef(p, o, corners[0], options)
 		}
 	case strings.HasPrefix(line, "v "):
 		p.vertLines++
