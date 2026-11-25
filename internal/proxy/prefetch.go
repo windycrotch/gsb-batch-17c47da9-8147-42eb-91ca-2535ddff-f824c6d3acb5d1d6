@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -20,18 +19,27 @@ const (
 
 // servePrefetch accelerates large non-HLS range streams (such as cloud-drive 4K MP4/MKV
 // files throttled per connection) using bounded concurrent range reads.
-// Returns true if the response was completely handled; false falls back to direct proxy.
-func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *proxySession, target string, headers map[string]string) bool {
+//
+// It returns handled=true when the request belongs to the prefetch path. A
+// non-nil error is only returned while response headers have not been committed
+// yet, so the caller can still render a proper failure status; once streaming
+// has started, errors abort the stream silently. handled=false means the
+// request shape is unsupported and the caller must proxy it directly (after
+// re-snapshotting the session, since a refresh may have changed the URL).
+func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *proxySession, target string, headers map[string]string, reqCtx context.Context) (handled bool, preCommitErr error) {
+	if !sess.alive() {
+		return true, removedError()
+	}
 	reqStart, reqEnd, hasRange, ok := parseSingleByteRange(r.Header.Get("Range"))
 	if !ok {
-		return false
+		return false, nil
 	}
 	if !hasRange {
 		reqStart, reqEnd = 0, -1
 	}
 	// Small explicit probes (e.g. player reading initial 64 KiB header or trailer) do not need chunking.
 	if reqEnd >= 0 && (reqEnd-reqStart+1) <= prefetchChunkSize {
-		return false
+		return false, nil
 	}
 
 	firstEnd := reqStart + prefetchChunkSize - 1
@@ -39,39 +47,55 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		firstEnd = reqEnd
 	}
 	firstRange := fmt.Sprintf("bytes=%d-%d", reqStart, firstEnd)
-	resp, err := p.doSessionRequest(r.Context(), http.MethodGet, target, headers, firstRange, false)
+	resp, err := p.doSessionRequest(reqCtx, http.MethodGet, target, headers, firstRange, false)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return true
+		if serr := sess.removalOrContextErr(err); serr != nil {
+			return true, serr
 		}
-		return false
+		// A transport error before any refresh: let the direct path retry once.
+		return false, nil
 	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		if newURL, newHdr, refreshed := sess.tryRefresh(r.Context()); refreshed {
-			httpx.DrainAndClose(resp.Body)
-			target, headers = newURL, newHdr
-			resp, err = p.doSessionRequest(r.Context(), http.MethodGet, target, headers, firstRange, false)
-			if err != nil {
-				return errors.Is(err, context.Canceled)
+	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && sess.hasRefresh() {
+		newURL, newHdr, refreshErr := sess.refreshOnce(reqCtx)
+		httpx.DrainAndClose(resp.Body)
+		if refreshErr != nil {
+			// No stale-link fallback: a failed refresh is a hard failure.
+			return true, refreshErr
+		}
+		target, headers = newURL, newHdr
+		resp, err = p.doSessionRequest(reqCtx, http.MethodGet, target, headers, firstRange, false)
+		if err != nil {
+			if serr := sess.removalOrContextErr(err); serr != nil {
+				return true, serr
 			}
+			return true, err
 		}
 	}
 	if resp.StatusCode != http.StatusPartialContent {
 		httpx.DrainAndClose(resp.Body)
-		return false
+		// Either range requests are unsupported, or a refreshed upstream
+		// answered differently. The caller re-snapshots the session before
+		// falling back, so it never reuses a pre-refresh URL.
+		return false, nil
 	}
 	_, actualEnd, total, validCR := parseContentRange(resp.Header.Get("Content-Range"))
 	if !validCR || total <= 0 {
 		httpx.DrainAndClose(resp.Body)
-		return false
+		return false, nil
 	}
 
-	// Read first chunk completely before committing headers so errors can still fall back cleanly.
+	// Read first chunk completely before committing headers so errors can still surface as a status.
 	firstData, _, err := httpx.ReadLimit(resp.Body, firstEnd-reqStart+1, prefetchChunkSize)
 	ct := resp.Header.Get("Content-Type")
 	httpx.DrainAndClose(resp.Body)
 	if err != nil {
-		return errors.Is(err, context.Canceled)
+		if serr := sess.removalOrContextErr(err); serr != nil {
+			return true, serr
+		}
+		return true, err
+	}
+	if int64(len(firstData)) != firstEnd-reqStart+1 {
+		return true, fmt.Errorf("upstream first chunk returned %d bytes, want %d", len(firstData), firstEnd-reqStart+1)
 	}
 
 	finalEnd := total - 1
@@ -79,7 +103,7 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		finalEnd = reqEnd
 	}
 	if finalEnd < reqStart {
-		return false
+		return false, nil
 	}
 
 	if ct != "" {
@@ -95,15 +119,16 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 	}
 
 	if _, err := w.Write(firstData); err != nil {
-		return true
+		return true, nil
 	}
 	nextOffset := actualEnd + 1
 	if nextOffset > finalEnd {
-		return true
+		return true, nil
 	}
 
-	// Stream remaining chunks with a bounded sliding window of concurrent workers.
-	streamCtx, cancel := context.WithCancel(r.Context())
+	// reqCtx is already bound to the session lifetime, so RemoveSession
+	// cancels every in-flight chunk through streamCtx.
+	streamCtx, cancel := context.WithCancel(reqCtx)
 	defer cancel()
 
 	type chunkRange struct {
@@ -127,6 +152,14 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
+				if !sess.alive() {
+					job.slot.err = removedError()
+					close(job.slot.done)
+					cancel()
+					continue
+				}
+				// Snapshot per chunk: after a single-flight refresh every
+				// remaining chunk uses the new URL and headers.
 				curTarget, curHeaders := sess.snapshot()
 				data, fetchErr := p.fetchChunk(streamCtx, sess, curTarget, curHeaders, job.r.start, job.r.end)
 				job.slot.data, job.slot.err = data, fetchErr
@@ -168,29 +201,34 @@ func (p *Proxy) servePrefetch(w http.ResponseWriter, r *http.Request, sess *prox
 		case <-streamCtx.Done():
 			cancel()
 			wg.Wait()
-			return true
+			return true, nil
 		case <-slot.done:
 		}
 		if slot.err != nil || streamCtx.Err() != nil {
 			cancel()
 			wg.Wait()
-			return true
+			// Headers are already committed; abort the stream rather than
+			// splice bytes from a failed or mixed-URL chunk.
+			return true, nil
 		}
 		if len(slot.data) > 0 {
 			if _, err := w.Write(slot.data); err != nil {
 				cancel()
 				wg.Wait()
-				return true
+				return true, nil
 			}
 		}
 	}
 	wg.Wait()
-	return true
+	return true, nil
 }
 
 func (p *Proxy) fetchChunk(ctx context.Context, sess *proxySession, target string, headers map[string]string, start, end int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !sess.alive() {
+		return nil, removedError()
 	}
 	rng := fmt.Sprintf("bytes=%d-%d", start, end)
 	resp, err := p.doSessionRequest(ctx, http.MethodGet, target, headers, rng, false)
@@ -198,22 +236,34 @@ func (p *Proxy) fetchChunk(ctx context.Context, sess *proxySession, target strin
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		if newURL, newHdr, refreshed := sess.tryRefresh(ctx); refreshed {
+		if sess.hasRefresh() {
+			newURL, newHdr, refreshErr := sess.refreshOnce(ctx)
 			httpx.DrainAndClose(resp.Body)
-			resp, err = p.doSessionRequest(ctx, http.MethodGet, newURL, newHdr, rng, false)
+			if refreshErr != nil {
+				return nil, refreshErr
+			}
+			// Retry this one chunk against the refreshed address only, so a
+			// chunk can never concatenate bytes from two different links.
+			target, headers = newURL, newHdr
+			resp, err = p.doSessionRequest(ctx, http.MethodGet, target, headers, rng, false)
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
 	defer httpx.DrainAndClose(resp.Body)
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusPartialContent {
 		return nil, fmt.Errorf("upstream chunk HTTP %d", resp.StatusCode)
 	}
 	expected := end - start + 1
-	data, _, err := httpx.ReadLimit(resp.Body, expected, expected)
+	data, exceeded, err := httpx.ReadLimit(resp.Body, expected, expected)
 	if err != nil {
 		return nil, err
+	}
+	// Reject short bodies and Range-ignoring 200 replies: either would splice
+	// bytes belonging to a different offset into the stream.
+	if exceeded || int64(len(data)) != expected {
+		return nil, fmt.Errorf("upstream chunk bytes %d-%d returned %d bytes, want %d", start, end, len(data), expected)
 	}
 	return data, nil
 }

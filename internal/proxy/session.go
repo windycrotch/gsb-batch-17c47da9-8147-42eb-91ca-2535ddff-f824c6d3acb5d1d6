@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -29,6 +30,43 @@ type SessionConfig struct {
 
 type sessionHeadersKey struct{}
 
+// ErrSessionRemoved is returned (wrapped in a sessionError) for work that
+// races with RemoveSession, so in-flight requests stop instead of fetching
+// more upstream chunks for a session that no longer exists.
+var ErrSessionRemoved = errors.New("proxy: session removed")
+
+// sessionError carries the HTTP status the player should see. It always
+// wraps a cause so errors.Is still works.
+type sessionError struct {
+	status int
+	msg    string
+	cause  error
+}
+
+func (e *sessionError) Error() string { return e.msg }
+func (e *sessionError) Unwrap() error { return e.cause }
+
+func removedError() error {
+	return &sessionError{status: http.StatusNotFound, msg: ErrSessionRemoved.Error(), cause: ErrSessionRemoved}
+}
+
+func refreshError(cause error) error {
+	msg := "proxy: media address refresh failed"
+	if cause != nil {
+		msg = msg + ": " + cause.Error()
+	}
+	return &sessionError{status: http.StatusBadGateway, msg: msg, cause: cause}
+}
+
+func writeSessionError(w http.ResponseWriter, err error) {
+	var se *sessionError
+	if errors.As(err, &se) {
+		http.Error(w, se.msg, se.status)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadGateway)
+}
+
 type proxySession struct {
 	mu            sync.RWMutex
 	targetURL     string
@@ -37,6 +75,80 @@ type proxySession struct {
 	prefetch      bool
 	refresh       func(ctx context.Context) (string, map[string]string, error)
 	lastRefreshed time.Time
+
+	// removed flips once under Proxy.mu in RemoveSession. Every in-flight
+	// request selects on removedCh so removal cancels the whole session even
+	// while the player keeps its half of the connection open.
+	removed    bool
+	removedCh  chan struct{}
+	removeOnce sync.Once
+
+	// refreshMu guards refreshFlight, the single in-flight refresh generation.
+	// A generation is cleared as soon as it completes, so each independent
+	// burst of 401/403 requests coalesces into exactly one callback while a
+	// later burst (e.g. the new link also expires) can refresh again.
+	refreshMu     sync.Mutex
+	refreshFlight *refreshFlight
+}
+
+type refreshResult struct {
+	url     string
+	headers map[string]string
+	err     error
+}
+
+type refreshFlight struct {
+	done chan struct{}
+	res  refreshResult
+}
+
+// markRemoved closes removedCh exactly once. Called while Proxy.mu is held.
+func (s *proxySession) markRemoved() {
+	s.removeOnce.Do(func() {
+		s.mu.Lock()
+		s.removed = true
+		s.mu.Unlock()
+		close(s.removedCh)
+	})
+}
+
+// alive reports whether the session is still mounted.
+func (s *proxySession) alive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !s.removed
+}
+
+// removalOrContextErr classifies a pre-commit upstream error. A dead session
+// yields a 404-wrapping removed error; a plain request cancellation (the
+// player disconnected but the session still exists) returns the context error
+// so callers stay silent instead of writing a misleading 404.
+func (s *proxySession) removalOrContextErr(err error) error {
+	if !s.alive() {
+		return removedError()
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
+}
+
+// withLifetime derives a context that is cancelled when the request ends or
+// the session is removed.
+func (s *proxySession) withLifetime(ctx context.Context) (context.Context, context.CancelFunc) {
+	lifetimeCtx, cancelLifetime := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-s.removedCh:
+			cancelLifetime()
+		case <-stop:
+		}
+	}()
+	return lifetimeCtx, func() {
+		close(stop)
+		cancelLifetime()
+	}
 }
 
 // RegisterSession mounts a dedicated local route that keeps its own headers and
@@ -53,23 +165,35 @@ func (p *Proxy) RegisterSession(cfg SessionConfig) (id, localURL string) {
 		filename:  name,
 		prefetch:  cfg.Prefetch,
 		refresh:   cfg.Refresh,
+		removedCh: make(chan struct{}),
 	}
 	p.mu.Lock()
 	if p.sessions == nil {
 		p.sessions = map[string]*proxySession{}
+	}
+	// A random ID collision must never resurrect a removed session.
+	if old, exists := p.sessions[id]; exists {
+		old.markRemoved()
 	}
 	p.sessions[id] = s
 	p.mu.Unlock()
 	return id, p.base + "/s/" + id + "/" + url.PathEscape(name)
 }
 
-// RemoveSession unmounts a registered session.
+// RemoveSession unmounts a registered session and cancels every in-flight
+// request that belongs to it. A session removed here can never be re-mounted:
+// refresh and chunk workers observe removedCh and stop without touching the
+// Proxy session table again.
 func (p *Proxy) RemoveSession(id string) {
 	if id == "" {
 		return
 	}
 	p.mu.Lock()
-	delete(p.sessions, id)
+	s, ok := p.sessions[id]
+	if ok {
+		delete(p.sessions, id)
+		s.markRemoved()
+	}
 	p.mu.Unlock()
 }
 
@@ -86,32 +210,93 @@ func (s *proxySession) snapshot() (target string, headers map[string]string) {
 	return s.targetURL, clone(s.headers)
 }
 
-func (s *proxySession) tryRefresh(ctx context.Context) (string, map[string]string, bool) {
-	if s.refresh == nil {
-		return "", nil, false
-	}
-	s.mu.Lock()
-	// Coalesce/rate-limit refreshes so concurrent range probes do not hammer upstream.
-	if time.Since(s.lastRefreshed) < 5*time.Second {
-		t, h := s.targetURL, clone(s.headers)
-		s.mu.Unlock()
-		return t, h, true
-	}
-	s.mu.Unlock()
+func (s *proxySession) hasRefresh() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.refresh != nil
+}
 
-	newURL, newHeaders, err := s.refresh(ctx)
-	if err != nil || strings.TrimSpace(newURL) == "" {
-		return "", nil, false
+// refreshOnce runs the session refresh callback at most once per concurrent
+// burst: the first caller executes the callback while every other caller waits
+// for and reuses that same result.
+//
+// A failed refresh (callback error or empty address) is not cached as session
+// state and its flight is released immediately, so a later independent 401 can
+// try again; a successful result is stored atomically and becomes the single
+// URL/header set the whole session uses afterwards.
+//
+// The callback runs on a context detached from any individual request so a
+// leader whose player disconnects mid-refresh cannot strand the followers.
+// Removal always wins: a session removed concurrently is never re-mounted,
+// even if the callback resolves successfully afterwards.
+func (s *proxySession) refreshOnce(ctx context.Context) (string, map[string]string, error) {
+	s.refreshMu.Lock()
+	flight := s.refreshFlight
+	if flight == nil {
+		flight = &refreshFlight{done: make(chan struct{})}
+		s.refreshFlight = flight
+		go s.runRefresh(ctx, flight)
 	}
+	s.refreshMu.Unlock()
+
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+		return "", nil, ctx.Err()
+	case <-s.removedCh:
+		return "", nil, removedError()
+	}
+
+	res := flight.res
+	if res.err != nil {
+		return "", nil, refreshError(res.err)
+	}
+	return res.url, clone(res.headers), nil
+}
+
+// runRefresh executes one refresh generation and publishes its result. All
+// session state mutation happens under s.mu and is skipped when the session
+// has been removed, so a late callback cannot re-mount a dead session.
+func (s *proxySession) runRefresh(ctx context.Context, flight *refreshFlight) {
+	res := refreshResult{}
+	defer func() {
+		if r := recover(); r != nil {
+			res = refreshResult{err: fmt.Errorf("refresh callback panic: %v", r)}
+		}
+		// Publish the result first, then release the flight slot while still
+		// holding refreshMu so the next generation cannot start before the
+		// waiters of this one are released.
+		s.refreshMu.Lock()
+		flight.res = res
+		if s.refreshFlight == flight {
+			s.refreshFlight = nil
+		}
+		close(flight.done)
+		s.refreshMu.Unlock()
+	}()
+
+	refresh := s.refresh
+	newURL, newHeaders, err := refresh(context.WithoutCancel(ctx))
+	if err != nil || strings.TrimSpace(newURL) == "" {
+		if err == nil {
+			err = errors.New("refresh callback returned an empty address")
+		}
+		res = refreshResult{err: err}
+		return
+	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.removed {
+		res = refreshResult{err: ErrSessionRemoved}
+		return
+	}
 	s.targetURL = strings.TrimSpace(newURL)
 	if newHeaders != nil {
 		s.headers = clone(newHeaders)
 	}
 	s.lastRefreshed = time.Now()
-	t, h := s.targetURL, clone(s.headers)
-	s.mu.Unlock()
-	return t, h, true
+	res = refreshResult{url: s.targetURL, headers: clone(s.headers)}
 }
 
 func (p *Proxy) serveSession(w http.ResponseWriter, r *http.Request) {
@@ -143,33 +328,60 @@ func (p *Proxy) serveSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tie every upstream call made for this request to the session lifetime:
+	// RemoveSession cancels them even if the player stops reading.
+	reqCtx, cancelLifetime := sess.withLifetime(r.Context())
+	defer cancelLifetime()
+
 	isHLSPath := playlist("", u.Path) || playlist("", sess.filename)
 	if r.Method == http.MethodGet && sess.prefetch && !isSub && !isHLSPath {
-		if p.servePrefetch(w, r, sess, target, headers) {
+		if handled, perr := p.servePrefetch(w, r, sess, target, headers, reqCtx); handled {
+			if perr != nil && !errors.Is(perr, context.Canceled) {
+				// Headers may already be committed; the error only surfaces
+				// when the status line has not been written.
+				writeSessionError(w, perr)
+			}
 			return
+		}
+		// The prefetch path may have performed a single-flight refresh before
+		// deciding to fall back (e.g. upstream lacks Range support). Re-snapshot
+		// so the direct request never uses the pre-refresh URL or headers.
+		if !isSub {
+			target, headers = sess.snapshot()
 		}
 	}
 
-	resp, err := p.doSessionRequest(r.Context(), r.Method, target, headers, r.Header.Get("Range"), isHLSPath)
+	resp, err := p.doSessionRequest(reqCtx, r.Method, target, headers, r.Header.Get("Range"), isHLSPath)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeSessionError(w, err)
 		return
 	}
-	if !isSub && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-		if newURL, newHdr, refreshed := sess.tryRefresh(r.Context()); refreshed {
-			httpx.DrainAndClose(resp.Body)
-			resp, err = p.doSessionRequest(r.Context(), r.Method, newURL, newHdr, r.Header.Get("Range"), isHLSPath)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				http.Error(w, err.Error(), http.StatusBadGateway)
+	// Only the main media endpoint owns the refresh callback. HLS sub-resources
+	// (/sub) always use the session's current snapshot, which already carries
+	// any refreshed URL and headers.
+	if !isSub && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && sess.hasRefresh() {
+		newURL, newHdr, refreshErr := sess.refreshOnce(reqCtx)
+		httpx.DrainAndClose(resp.Body)
+		if refreshErr != nil {
+			// Never retry with the stale address: surface a hard failure so
+			// the player does not mistake a half response for success.
+			if errors.Is(refreshErr, context.Canceled) {
 				return
 			}
-			headers = newHdr
+			writeSessionError(w, refreshErr)
+			return
+		}
+		target, headers = newURL, newHdr
+		resp, err = p.doSessionRequest(reqCtx, r.Method, target, headers, r.Header.Get("Range"), isHLSPath)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			writeSessionError(w, err)
+			return
 		}
 	}
 	defer httpx.DrainAndClose(resp.Body)
@@ -193,7 +405,7 @@ func (p *Proxy) serveSession(w http.ResponseWriter, r *http.Request) {
 		return p.base + "/s/" + id + "/sub?url=" + url.QueryEscape(raw)
 	}
 	if playlist(resp.Header.Get("Content-Type"), base.Path) {
-		p.writeSessionPlaylist(w, resp, base.String(), headers, wrapSub, r.Context())
+		p.writeSessionPlaylist(w, resp, base.String(), headers, wrapSub, reqCtx)
 		return
 	}
 	buf := make([]byte, 64)
@@ -204,7 +416,7 @@ func (p *Proxy) serveSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if n > 0 && bytes.HasPrefix(bytes.TrimSpace(buf[:n]), []byte("#EXTM3U")) {
 		if resp.StatusCode == http.StatusPartialContent {
-			p.writeSessionPlaylist(w, resp, base.String(), headers, wrapSub, r.Context())
+			p.writeSessionPlaylist(w, resp, base.String(), headers, wrapSub, reqCtx)
 			return
 		}
 		restBody, _, err := httpx.ReadLimit(resp.Body, resp.ContentLength, playlistLimit)

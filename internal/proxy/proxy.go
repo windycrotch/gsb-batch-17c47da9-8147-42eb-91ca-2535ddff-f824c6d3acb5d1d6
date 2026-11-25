@@ -177,7 +177,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var sessHeaders map[string]string
 	if sid != "" {
 		sess, found := p.session(sid)
-		if !found {
+		if !found || !sess.alive() {
 			http.NotFound(w, r)
 			return
 		}
