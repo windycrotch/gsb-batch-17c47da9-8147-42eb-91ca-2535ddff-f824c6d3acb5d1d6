@@ -243,6 +243,32 @@ func (p *Playlist) FindLastAdBreak() (*internal.Node, bool) {
 	return adBreaks[len(adBreaks)-1], true
 }
 
+// FindBreakForEndMarker resolves which ad break owns an end marker (a CUE-IN
+// tag or a DATERANGE SCTE35-IN tag). Unlike FindNodeInsideAdBreak, it does not
+// stop at a DATERANGE SCTE35-IN: that tag is itself an end marker of the same
+// break, so the search must pass through it in order to reach the owning
+// DATERANGE SCTE35-OUT. It returns nil/false when the marker is not preceded by
+// any ad break start.
+func (p *Playlist) FindBreakForEndMarker(node *internal.Node) (*internal.Node, bool) {
+	current := node.Prev
+	for current != nil {
+		if current.HLSElement.Name == dateRangeNode && current.HLSElement.Attrs[scte35OutAttr] != "" {
+			return current, true
+		}
+
+		// A CUE-IN that belongs to an earlier (already terminated) break marks
+		// the boundary of that break; an end marker past it cannot belong to a
+		// break that started even earlier.
+		if current.HLSElement.Name == cueInNode {
+			return nil, false
+		}
+
+		current = current.Prev
+	}
+
+	return nil, false
+}
+
 // FindSecondLastAdBreak returns the DateRange node immediately preceding the last one, if it exists.
 func (p *Playlist) FindSecondLastAdBreak() (*internal.Node, bool) {
 	adBreaks := p.Breaks()
@@ -281,102 +307,236 @@ func IsSegment(node *internal.Node) bool {
 	return node.HLSElement.Name == extInfNode
 }
 
-// Trims invalid and duplicated ad breaks from the playlist
+// Trims invalid and duplicated ad breaks from the playlist.
+//
+// The operation is idempotent: running it more than once on the same playlist
+// produces exactly the same result as running it once. All nodes that are
+// removed are collected first (based on break ownership) and removed in a
+// single, guarded pass, so a node removed by an earlier step is never accessed
+// again by a later step.
 func (p *Playlist) TrimInvalidBreaks() {
 	adBreaks := p.Breaks()
-	for i, adBreak := range adBreaks {
-		if _, err := ValidateStartDate(adBreak); err != nil {
-			p.removeInvalidBreakTags(adBreak)
+	if len(adBreaks) == 0 {
+		// No ad breaks: nothing to do and nothing to break.
+		return
+	}
+
+	// removed tracks every node scheduled for removal, making the operation
+	// safe against stale references and repeated executions.
+	removed := make(map[*internal.Node]bool)
+
+	// surviving keeps the ad break nodes that remain in the playlist, in
+	// playlist order. Duplicate detection always compares against the last
+	// surviving break rather than against a possibly-removed snapshot entry.
+	surviving := make([]*internal.Node, 0, len(adBreaks))
+
+	for _, adBreak := range adBreaks {
+		if removed[adBreak] {
+			continue
 		}
 
-		if _, err := ValidateMediaSequence(adBreak); err != nil {
-			p.removeInvalidBreakTags(adBreak)
+		if isInvalidBreak(adBreak) {
+			for node := range p.breakNodesToRemove(adBreak) {
+				removed[node] = true
+			}
+			continue
 		}
 
-		if err := ValidatePlannedDuration(adBreak); err != nil {
-			p.removeInvalidBreakTags(adBreak)
+		if len(surviving) > 0 {
+			previous := surviving[len(surviving)-1]
+			if IsDuplicatedProgramStartBreak(adBreak, previous) {
+				// The Program Start break shares its CueIn with the remaining
+				// break, so only its own start markers are removed.
+				for node := range p.programStartBreakNodesToRemove(adBreak) {
+					removed[node] = true
+				}
+				continue
+			}
+			if IsDuplicatedBreak(adBreak, previous) {
+				// A duplicated break is a valid break, so its PROGRAM-DATE-TIME
+				// tags stay (they also describe the surviving duplicate): only
+				// the break's own start/end markers and comments are removed.
+				for node := range p.duplicateBreakNodesToRemove(adBreak) {
+					removed[node] = true
+				}
+				continue
+			}
 		}
 
-		if i > 0 && len(adBreaks) > 1 {
-			if IsDuplicatedProgramStartBreak(adBreak, adBreaks[i-1]) {
-				p.removeProgramStartDaterange(adBreak)
-			} else if IsDuplicatedBreak(adBreak, adBreaks[i-1]) {
-				p.removeDuplicateBreakTags(adBreak)
+		surviving = append(surviving, adBreak)
+	}
+
+	// Single guarded removal pass. Removing arbitrary nodes from a linked list
+	// never invalidates the Head/Tail pointers of the remaining nodes.
+	for node := range removed {
+		p.Remove(node)
+	}
+}
+
+// isInvalidBreak reports whether the ad break must be removed because its
+// START-DATE cannot be parsed, its StartMediaSequence is not a valid integer,
+// or its PLANNED-DURATION is missing, zero, non-numeric or longer than the
+// 10 minutes limit.
+func isInvalidBreak(adBreak *internal.Node) bool {
+	if _, err := ValidateStartDate(adBreak); err != nil {
+		return true
+	}
+
+	if _, err := ValidateMediaSequence(adBreak); err != nil {
+		return true
+	}
+
+	return ValidatePlannedDuration(adBreak) != nil
+}
+
+// breakNodesToRemove collects every node that exists solely to serve the given
+// invalid ad break: the start markers (DATERANGE SCTE35-OUT + CUE-OUT), the end
+// markers (CUE-IN and DATERANGE SCTE35-IN) and the auxiliary nodes that belong
+// only to this break (PROGRAM-DATE-TIME tags and related comments).
+//
+// Ownership is derived structurally (walking the linked list) instead of from
+// fixed node positions, so the result is correct regardless of the exact node
+// layout and never leaves orphaned CUE-OUT/CUE-IN markers behind.
+func (p *Playlist) breakNodesToRemove(adBreak *internal.Node) map[*internal.Node]bool {
+	nodes := p.breakMarkerNodesToRemove(adBreak)
+
+	// Auxiliary start node: the PROGRAM-DATE-TIME that marks the break start.
+	if pdt := p.breakStartProgramDateTime(adBreak); pdt != nil {
+		nodes[pdt] = true
+	}
+
+	// Auxiliary end nodes: the PROGRAM-DATE-TIME immediately following each end
+	// marker that belongs to this break.
+	for _, cueIn := range p.CueInEvents() {
+		owner, found := p.FindBreakForEndMarker(cueIn)
+		if found && owner == adBreak {
+			if pdt := nextNodeOfType(cueIn, programDateTimeNode); pdt != nil {
+				nodes[pdt] = true
 			}
 		}
 	}
-}
-
-func (p *Playlist) removeInvalidBreakTags(adBreak *internal.Node) {
-	if adBreak.Next.Next != nil && adBreak.Next.Next.HLSElement.Name == programDateTimeNode {
-		p.Remove(adBreak.Next.Next)
-	}
-
-	if adBreak.Next != nil && adBreak.Next.HLSElement.Name == cueOutNode {
-		p.Remove(adBreak.Next)
-	}
-
-	cueIns := p.CueInEvents()
-	for i := range cueIns {
-		adBreakCueIn, found := p.FindNodeInsideAdBreak(cueIns[i])
-		if found && adBreakCueIn == adBreak {
-			if cueIns[i].Prev != nil && cueIns[i].Prev.HLSElement.Name == commentNode && cueIns[i].Prev.HLSElement.Attrs[commentAttr] == autoReturnModeComment {
-				p.Remove(cueIns[i].Prev)
+	for _, scteIn := range p.SCTE35InTags() {
+		owner, found := p.FindBreakForEndMarker(scteIn)
+		if found && owner == adBreak {
+			if pdt := nextNodeOfType(scteIn, programDateTimeNode); pdt != nil {
+				nodes[pdt] = true
 			}
-
-			if cueIns[i].Next != nil && cueIns[i].Next.HLSElement.Name == programDateTimeNode {
-				p.Remove(cueIns[i].Next)
-			}
-
-			p.Remove(cueIns[i])
 		}
 	}
 
-	if adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode && strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], spliceInsertComment) {
-		p.Remove(adBreak.Prev)
-	}
-
-	p.Remove(adBreak)
+	return nodes
 }
 
-func (p *Playlist) removeDuplicateBreakTags(adBreak *internal.Node) {
-	if adBreak.Next != nil && adBreak.Next.HLSElement.Name == cueOutNode {
-		p.Remove(adBreak.Next)
-	}
+// duplicateBreakNodesToRemove collects the markers of an ad break that is a
+// duplicate of a surviving break. The break itself is valid, so the
+// PROGRAM-DATE-TIME tags inside it are preserved (they equally describe the
+// surviving duplicate); only the break's own start/end markers and comments are
+// removed.
+func (p *Playlist) duplicateBreakNodesToRemove(adBreak *internal.Node) map[*internal.Node]bool {
+	return p.breakMarkerNodesToRemove(adBreak)
+}
 
-	cueIns := p.CueInEvents()
-	for i := range cueIns {
-		adBreakCueIn, found := p.FindNodeInsideAdBreak(cueIns[i])
-		if cueIns[i].Prev != nil && cueIns[i].Prev.HLSElement.Name == commentNode && cueIns[i].Prev.HLSElement.Attrs[commentAttr] == autoReturnModeComment {
-			p.Remove(cueIns[i].Prev)
+// breakMarkerNodesToRemove collects the start/end markers and the related
+// comments of the given ad break, without touching PROGRAM-DATE-TIME tags.
+func (p *Playlist) breakMarkerNodesToRemove(adBreak *internal.Node) map[*internal.Node]bool {
+	nodes := map[*internal.Node]bool{adBreak: true}
+
+	// Start markers: CUE-OUT immediately following the break, plus the
+	// splice_insert comment that immediately precedes it.
+	if cueOut := nextNodeOfType(adBreak, cueOutNode); cueOut != nil {
+		nodes[cueOut] = true
+		if comment := previousNodeOfType(cueOut, commentNode); comment != nil &&
+			strings.Contains(comment.HLSElement.Attrs[commentAttr], spliceInsertComment) {
+			nodes[comment] = true
 		}
+	}
 
-		if found && adBreakCueIn == adBreak {
-			p.Remove(cueIns[i])
-			break
+	// End markers: every CUE-IN / DATERANGE SCTE35-IN that belongs to this
+	// break, together with their auxiliary Auto Return Mode comments.
+	for _, cueIn := range p.CueInEvents() {
+		owner, found := p.FindBreakForEndMarker(cueIn)
+		if !found || owner != adBreak {
+			continue
+		}
+		nodes[cueIn] = true
+		if comment := previousNodeOfType(cueIn, commentNode); comment != nil &&
+			comment.HLSElement.Attrs[commentAttr] == autoReturnModeComment {
+			nodes[comment] = true
 		}
 	}
 
-	if adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode && strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], spliceInsertComment) {
-		p.Remove(adBreak.Prev)
+	for _, scteIn := range p.SCTE35InTags() {
+		owner, found := p.FindBreakForEndMarker(scteIn)
+		if !found || owner != adBreak {
+			continue
+		}
+		nodes[scteIn] = true
 	}
 
-	p.Remove(adBreak)
+	return nodes
 }
 
-// Returns true if the given ad break is preceded by the "## splice_insert(Program Start)" comment
-func isProgramStartSpliceInsert(adBreak *internal.Node) bool {
-	return adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode && strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], programStartComment)
-}
+// programStartBreakNodesToRemove collects the nodes of a duplicated Program
+// Start break. Such a break shares its CUE-IN with the break that is kept, so
+// only the Program Start comment, the DATERANGE and its own CUE-OUT are
+// removed; the shared end markers must stay untouched.
+func (p *Playlist) programStartBreakNodesToRemove(adBreak *internal.Node) map[*internal.Node]bool {
+	nodes := map[*internal.Node]bool{adBreak: true}
 
-// Removes a duplicated Program Start ad break, which shares the CueIn tag with the other break.
-// Only the Program Start comment, the DateRange tag and its CueOut tag are removed.
-func (p *Playlist) removeProgramStartDaterange(adBreak *internal.Node) {
-	if adBreak.Next != nil && adBreak.Next.HLSElement.Name == cueOutNode {
-		p.Remove(adBreak.Next)
+	if cueOut := nextNodeOfType(adBreak, cueOutNode); cueOut != nil {
+		nodes[cueOut] = true
 	}
 
-	p.Remove(adBreak.Prev)
+	if comment := previousNodeOfType(adBreak, commentNode); comment != nil &&
+		strings.Contains(comment.HLSElement.Attrs[commentAttr], programStartComment) {
+		nodes[comment] = true
+	}
 
-	p.Remove(adBreak)
+	return nodes
+}
+
+// breakStartProgramDateTime returns the PROGRAM-DATE-TIME node that marks the
+// start of the given ad break, or nil when there is none. The tag normally
+// follows the break's CUE-OUT; when the CUE-OUT has left the DVR window it
+// directly follows the DATERANGE node.
+func (p *Playlist) breakStartProgramDateTime(adBreak *internal.Node) *internal.Node {
+	cursor := adBreak
+	if cueOut := nextNodeOfType(adBreak, cueOutNode); cueOut != nil {
+		cursor = cueOut
+	}
+	return nextNodeOfType(cursor, programDateTimeNode)
+}
+
+// nextNodeOfType returns the first node following node whose HLS element has
+// the given name, stopping at the next media segment (#EXTINF), which marks a
+// different logical block. It returns nil if no such node exists before then.
+func nextNodeOfType(node *internal.Node, name string) *internal.Node {
+	current := node.Next
+	for current != nil {
+		if current.HLSElement.Name == name {
+			return current
+		}
+		if current.HLSElement.Name == extInfNode {
+			return nil
+		}
+		current = current.Next
+	}
+	return nil
+}
+
+// previousNodeOfType returns the nearest node preceding node whose HLS element
+// has the given name, stopping at the previous media segment (#EXTINF). It
+// returns nil if no such node exists before then.
+func previousNodeOfType(node *internal.Node, name string) *internal.Node {
+	current := node.Prev
+	for current != nil {
+		if current.HLSElement.Name == name {
+			return current
+		}
+		if current.HLSElement.Name == extInfNode {
+			return nil
+		}
+		current = current.Prev
+	}
+	return nil
 }

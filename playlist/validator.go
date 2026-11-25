@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/globocom/go-m3u8/internal"
@@ -37,7 +38,7 @@ func ValidatePlannedDuration(adBreak *internal.Node) error {
 		return err
 	}
 
-	if plannedDuration == 0 {
+	if plannedDuration == 0 || plannedDuration < 0 {
 		return ErrMissingPlannedDuration
 	}
 
@@ -59,7 +60,9 @@ func IsDuplicatedBreak(adBreak, previousAdBreak *internal.Node) bool {
 		return false
 	}
 
-	sameStartDate := startDate.Sub(startDatePrevious) < offset
+	// Use the absolute difference so that breaks are treated as duplicates
+	// regardless of which one starts first.
+	sameStartDate := startDate.Sub(startDatePrevious).Abs() < offset
 
 	return sameStartDate && sameDuration
 }
@@ -81,9 +84,16 @@ func IsDuplicatedProgramStartBreak(adBreak, previousAdBreak *internal.Node) bool
 		return false
 	}
 
-	sameStartDate := startDate.Sub(startDatePrevious) < offset
+	sameStartDate := startDate.Sub(startDatePrevious).Abs() < offset
 
 	return sameStartDate && sameSCTE35Out
+}
+
+// isProgramStartSpliceInsert returns true if the given ad break is preceded by
+// the "## splice_insert(Program Start)" comment.
+func isProgramStartSpliceInsert(adBreak *internal.Node) bool {
+	return adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode &&
+		strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], programStartComment)
 }
 
 // Checks if the given cue out node belongs to the ad break with the given media sequence

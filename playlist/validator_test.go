@@ -104,6 +104,19 @@ func TestValidatePlannedDurationMissingPlannedDuration(t *testing.T) {
 	assert.Equal(t, playlist.ErrMissingPlannedDuration, err)
 }
 
+func TestValidatePlannedDurationNegativePlannedDuration(t *testing.T) {
+	adBreak := &internal.Node{
+		HLSElement: &internal.HLSElement{
+			Attrs: map[string]string{
+				"PLANNED-DURATION": "-20",
+			},
+		},
+	}
+
+	err := playlist.ValidatePlannedDuration(adBreak)
+	assert.Equal(t, playlist.ErrMissingPlannedDuration, err)
+}
+
 func TestIsDuplicatedBreak(t *testing.T) {
 	file, _ := os.Open("./../mocks/media/withDuplicatedBreaks.m3u8")
 	pl, err := m3u8.ParsePlaylist(file)
