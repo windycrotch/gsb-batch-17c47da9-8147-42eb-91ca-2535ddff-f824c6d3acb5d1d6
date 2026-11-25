@@ -23,6 +23,11 @@ type TrackEventType int
 const (
 	UnknownTrackEvent TrackEventType = iota
 	TrackStartEvent
+	// TrackEndEvent signals that a track was ingested completely and the upload finished normally. The track is
+	// finalized but may still be advertised until the stream ends.
+	TrackEndEvent
+	// TrackStopEvent signals that a track was stopped prematurely: either its upload failed, or the stream was
+	// garbage collected after inactivity. The track must no longer be advertised as active.
 	TrackStopEvent
 )
 

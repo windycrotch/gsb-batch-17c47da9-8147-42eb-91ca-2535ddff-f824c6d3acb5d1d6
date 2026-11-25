@@ -69,6 +69,10 @@ info: ## Print options
 
 ##@ Development
 
+.PHONY: test
+test: ## Run tests (TESTS_ARGS is passed to go test, e.g. TESTS_ARGS="-race")
+	@TESTS_ARGS="$(TESTS_ARGS)" scripts/exec-local test
+
 .PHONY: generate
 generate: generate-modules ## Generate all
 

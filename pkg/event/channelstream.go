@@ -38,7 +38,13 @@ type channelStream struct {
 	mtx sync.RWMutex
 
 	recvCh chan Event
-	subs   []chan Event
+	done   chan struct{}
+	subs   []*subscription
+}
+
+type subscription struct {
+	ch   chan Event
+	done chan struct{}
 }
 
 func NewStream() Stream {
@@ -48,12 +54,18 @@ func NewStream() Stream {
 func NewStreamBuf(n int) Stream {
 	return &channelStream{
 		recvCh: make(chan Event, n),
-		subs:   make([]chan Event, 0),
+		done:   make(chan struct{}),
+		subs:   make([]*subscription, 0),
 	}
 }
 
 func (cs *channelStream) Pub(e Event) {
-	cs.recvCh <- e
+	// Do not block forever when the stream has been stopped. Otherwise, publishers (e.g. ingest HTTP handlers) could
+	// get stuck once the context that drives the stream has been cancelled.
+	select {
+	case cs.recvCh <- e:
+	case <-cs.done:
+	}
 }
 
 func (cs *channelStream) Sub() <-chan Event {
@@ -63,29 +75,32 @@ func (cs *channelStream) Sub() <-chan Event {
 func (cs *channelStream) SubBuf(n int) <-chan Event {
 	cs.mtx.Lock()
 	defer cs.mtx.Unlock()
-	ch := make(chan Event, n)
-	cs.subs = append(cs.subs, ch)
-	return ch
+	sub := &subscription{
+		ch:   make(chan Event, n),
+		done: make(chan struct{}),
+	}
+	cs.subs = append(cs.subs, sub)
+	return sub.ch
 }
 
 func (cs *channelStream) Desub(ch <-chan Event) {
 	cs.mtx.Lock()
 	defer cs.mtx.Unlock()
 
-	for i, subCh := range cs.subs {
-		if ch == subCh { // TODO: does this work?
-			if i == len(cs.subs)-1 {
-				cs.subs[i] = nil
-				cs.subs = cs.subs[:i]
-			} else {
-				cs.subs[i] = cs.subs[len(cs.subs)-1]
-				cs.subs[len(cs.subs)-1] = nil
-				cs.subs = cs.subs[:len(cs.subs)-1]
-			}
-			close(subCh)
+	for i, sub := range cs.subs {
+		if sub.ch == ch { // TODO: does this work?
+			cs.removeSub(i)
+			close(sub.done)
 			return
 		}
 	}
+}
+
+func (cs *channelStream) removeSub(i int) {
+	last := len(cs.subs) - 1
+	cs.subs[i] = cs.subs[last]
+	cs.subs[last] = nil
+	cs.subs = cs.subs[:last]
 }
 
 func (cs *channelStream) Start(ctx context.Context) {
@@ -99,24 +114,46 @@ func (cs *channelStream) start(ctx context.Context) {
 			cs.clean()
 			return
 		case e := <-cs.recvCh:
-			go cs.emit(e)
+			cs.emit(e)
 		}
 	}
 }
 
+// emit forwards an event to all subscribers.
+//
+// Events are emitted synchronously and in the order they were published. Emitting each event from its own goroutine
+// would allow events to be observed out of order, which manifest generation relies on: a fragment must never be listed
+// before the event that initialized its track, and a state produced from an older event must never overwrite a newer
+// one.
 func (cs *channelStream) emit(e Event) {
 	cs.mtx.RLock()
-	defer cs.mtx.RUnlock()
-	for _, ch := range cs.subs {
-		ch <- e
+	subs := make([]*subscription, len(cs.subs))
+	copy(subs, cs.subs)
+	cs.mtx.RUnlock()
+
+	for _, sub := range subs {
+		select {
+		case sub.ch <- e:
+		case <-sub.done:
+			// subscriber went away while we were emitting
+		case <-cs.done:
+			return
+		}
 	}
 }
 
 func (cs *channelStream) clean() {
 	cs.mtx.Lock()
 	defer cs.mtx.Unlock()
-	for _, ch := range cs.subs {
-		close(ch)
+
+	// Signal publishers and emitters that this stream no longer accepts events. Subscriber channels are intentionally
+	// not closed: an emit that already copied the subscriber list may still select on them.
+	select {
+	case <-cs.done:
+		// already cleaned
+	default:
+		close(cs.done)
 	}
-	close(cs.recvCh)
+
+	cs.subs = cs.subs[:0]
 }

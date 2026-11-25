@@ -200,21 +200,49 @@ func (a *cmafIngest) handleSwitchingSetTrackUpload(c *fiber.Ctx) error {
 	// TODO: ingestHeader can be skipped if track is already initialized
 	err := convertIngestErr(a.ingestHeader(reqReader, track, pathPrefix))
 	if err != nil {
+		// A failed upload must not leave the track advertised as active.
+		a.publishTrackLifecycle(track, event.TrackStopEvent, "failed to ingest CMAF header")
 		return err
 	}
 
 	err = convertIngestErr(a.ingestFragments(reqReader, track, pathPrefix))
 	if err != nil {
+		a.publishTrackLifecycle(track, event.TrackStopEvent, "failed to ingest CMAF fragments")
 		return err
 	}
 
 	log.Info("stop track")
+
+	// The encoder closed this track normally. Tell subscribers (e.g. the manifest function) that no more fragments will
+	// follow so that the end of the track is observable in the playlists.
+	a.publishTrackLifecycle(track, event.TrackEndEvent, "track ended")
 
 	// DASH-IF does not specify a response code; use 201 Created
 	c.Status(fiber.StatusCreated)
 	// TODO: send body with transfert time, size, etc.
 	// TODO: set headers like ETag, Last-Modified, Location?, caching, ...
 	return nil
+}
+
+// publishTrackLifecycle publishes a track lifecycle event for an upload that is still attached to a live stream.
+//
+// Events for streams that have already been garbage collected are dropped: the stream stop event has already told
+// subscribers to forget the stream.
+func (a *cmafIngest) publishTrackLifecycle(track *media.Track, typ event.TrackEventType, msg string) {
+	a.streamsMtx.RLock()
+	pres := track.SwitchingSet.Presentation
+	active := a.streams[pres.Name] == pres
+	a.streamsMtx.RUnlock()
+
+	if typ == event.TrackStopEvent {
+		a.getLoggerWithTrack(track).Warn(msg + "; stopping track")
+	}
+
+	if !active {
+		return
+	}
+
+	a.eventStream.Pub(event.NewTrackEvent(typ, track))
 }
 
 func (a *cmafIngest) handleTrackUpload(c *fiber.Ctx) error {
@@ -253,69 +281,80 @@ func (a *cmafIngest) getOrCreateStream(name string) *media.Presentation {
 		defer a.streamsMtx.RUnlock()
 		return s
 	}
-
-	// upgrade to write lock
 	a.streamsMtx.RUnlock()
-	a.streamsMtx.Lock()
-	defer a.streamsMtx.Unlock()
 
-	// check if there was a race
-	if s, ok := a.streams[name]; ok {
-		return s
+	s, created := func() (*media.Presentation, bool) {
+		a.streamsMtx.Lock()
+		defer a.streamsMtx.Unlock()
+
+		// check if there was a race
+		if s, ok := a.streams[name]; ok {
+			return s, false
+		}
+
+		s := &media.Presentation{
+			Name:           name,
+			LastModifiedAt: time.Now(),
+		}
+		a.streams[name] = s
+		go a.gcStreamAfterTimeout(name)
+		return s, true
+	}()
+
+	if created {
+		a.execCtx.Logger().With("stream", name).Info("start stream")
+		// Publish after releasing the lock: subscribers may block.
+		a.eventStream.Pub(event.NewStreamEvent(event.StreamStartEvent, s))
 	}
 
-	log := a.execCtx.Logger().With("stream", name)
-	log.Info("start stream")
-
-	s := &media.Presentation{
-		Name:           name,
-		LastModifiedAt: time.Now(),
-	}
-	a.streams[name] = s
-
-	e := event.NewStreamEvent(event.StreamStartEvent, s)
-	a.eventStream.Pub(e)
-
-	go a.gcStreamAfterTimeout(name)
 	return s
 }
 
 func (a *cmafIngest) gcStreamAfterTimeout(name string) {
 	log := a.execCtx.Logger().With("stream", name)
 
-	a.streamsMtx.Lock()
+	a.streamsMtx.RLock()
 	s, ok := a.streams[name]
+	a.streamsMtx.RUnlock()
 	if !ok {
 		return
 	}
-	a.streamsMtx.Unlock()
 
 	gc := func() bool {
+		// Hold the presentation lock across the expiry check and the removal from the stream map. LastModifiedAt is
+		// only updated under this lock, so once it is seen as expired no in-flight upload can revive the stream between
+		// the check and the deletion.
 		s.Lock()
-		defer s.Unlock()
-
-		lastModifiedDuration := time.Since(s.LastModifiedAt)
-		if lastModifiedDuration > a.cfg.CMAFIngest.StreamTimeout {
-			a.streamsMtx.Lock()
-			defer a.streamsMtx.Unlock()
-			delete(a.streams, name)
-
-			var e event.Event
-			for _, set := range s.SwitchingSets {
-				for _, t := range set.Tracks {
-					e = event.NewTrackEvent(event.TrackStopEvent, t)
-					a.eventStream.Pub(e)
-				}
-				e = event.NewSwitchingSetEvent(event.SwitchingSetStopEvent, set)
-				a.eventStream.Pub(e)
-			}
-			e = event.NewStreamEvent(event.StreamStopEvent, s)
-			a.eventStream.Pub(e)
-
-			return true
+		if time.Since(s.LastModifiedAt) <= a.cfg.CMAFIngest.StreamTimeout {
+			s.Unlock()
+			return false
 		}
 
-		return false
+		a.streamsMtx.Lock()
+		if a.streams[name] != s {
+			// A new generation of this stream has already been created; do not delete it.
+			a.streamsMtx.Unlock()
+			s.Unlock()
+			return false
+		}
+		delete(a.streams, name)
+		a.streamsMtx.Unlock()
+
+		tracks := make([]*media.Track, 0)
+		for _, set := range s.SwitchingSets {
+			for _, t := range set.Tracks {
+				tracks = append(tracks, t)
+			}
+		}
+		s.Unlock()
+
+		// Publish only after all locks have been released: publishing may block on subscribers, and holding a lock
+		// while doing so would stall in-flight uploads of other tracks of the same stream.
+		for _, t := range tracks {
+			a.eventStream.Pub(event.NewTrackEvent(event.TrackStopEvent, t))
+		}
+		a.eventStream.Pub(event.NewStreamEvent(event.StreamStopEvent, s))
+		return true
 	}
 
 	t := time.NewTicker(a.cfg.CMAFIngest.StreamTimeout)
@@ -339,30 +378,31 @@ func (a *cmafIngest) getOrCreateSwitchingSet(stream *media.Presentation, name st
 		defer stream.RUnlock()
 		return set
 	}
-
-	// upgrade to write lock
 	stream.RUnlock()
-	stream.Lock()
-	defer stream.Unlock()
 
-	// check if there was a race
-	if set, ok := stream.SwitchingSets[name]; ok {
-		return set
+	set, created := func() (*media.SwitchingSet, bool) {
+		stream.Lock()
+		defer stream.Unlock()
+
+		// check if there was a race
+		if set, ok := stream.SwitchingSets[name]; ok {
+			return set, false
+		}
+
+		set := &media.SwitchingSet{
+			Name: name,
+		}
+		stream.AddSwitchingSet(set)
+		return set, true
+	}()
+
+	if created {
+		a.execCtx.Logger().With(
+			"stream", stream.Name,
+			"switchingSet", name,
+		).Info("start switching set")
+		a.eventStream.Pub(event.NewSwitchingSetEvent(event.SwitchingSetStartEvent, set))
 	}
-
-	log := a.execCtx.Logger().With(
-		"stream", stream.Name,
-		"switchingSet", name,
-	)
-	log.Info("start switching set")
-
-	set := &media.SwitchingSet{
-		Name: name,
-	}
-	stream.AddSwitchingSet(set)
-
-	e := event.NewSwitchingSetEvent(event.SwitchingSetStartEvent, set)
-	a.eventStream.Pub(e)
 
 	return set
 }
@@ -373,32 +413,33 @@ func (a *cmafIngest) getOrCreateTrack(set *media.SwitchingSet, name string) *med
 		defer set.RUnlock()
 		return t
 	}
-
-	// upgrade to write lock
 	set.RUnlock()
-	set.Lock()
-	defer set.Unlock()
 
-	// check if there was a race
-	if t, ok := set.Tracks[name]; ok {
-		return t
+	t, created := func() (*media.Track, bool) {
+		set.Lock()
+		defer set.Unlock()
+
+		// check if there was a race
+		if t, ok := set.Tracks[name]; ok {
+			return t, false
+		}
+
+		t := &media.Track{
+			Name:   name,
+			Format: media.CMAF,
+		}
+		set.AddTrack(t)
+		return t, true
+	}()
+
+	if created {
+		a.execCtx.Logger().With(
+			"stream", set.Presentation.Name,
+			"switchingSet", set.Name,
+			"track", name,
+		).Info("start track")
+		a.eventStream.Pub(event.NewTrackEvent(event.TrackStartEvent, t))
 	}
-
-	log := a.execCtx.Logger().With(
-		"stream", set.Presentation.Name,
-		"switchingSet", set.Name,
-		"track", name,
-	)
-	log.Info("start track")
-
-	t := &media.Track{
-		Name:   name,
-		Format: media.CMAF,
-	}
-	set.AddTrack(t)
-
-	e := event.NewTrackEvent(event.TrackStartEvent, t)
-	a.eventStream.Pub(e)
 
 	return t
 }
@@ -707,6 +748,8 @@ func (a *cmafIngest) ingestFragments(reader io.Reader, track *media.Track, pathP
 				if err != nil {
 					return err
 				}
+				// the new writer holds an uncommitted fragment again
+				triedCommit = false
 				e = event.NewFragmentEvent(event.FragmentStartEvent, file, track, frag)
 				a.eventStream.Pub(e)
 				log.Debugf("ingest CMAF fragment: %s", fileName)
@@ -775,7 +818,6 @@ func (a *cmafIngest) ingestFragments(reader io.Reader, track *media.Track, pathP
 
 			// mdat is last box in chunk => prepare for next chunk
 			moof = nil
-			triedCommit = false
 			chunkHdrSize = 0
 			lr.N = int64(a.cfg.CMAFIngest.MaxChunkHeaderSize)
 

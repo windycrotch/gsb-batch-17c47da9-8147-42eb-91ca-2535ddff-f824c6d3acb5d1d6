@@ -105,3 +105,17 @@ func (f *Fragment) Duration() uint64 {
 	}
 	return total
 }
+
+// BaseMediaDecodeTime returns the decode time of the first chunk in the fragment relative to the movie timeline.
+//
+// It is used to order fragments. The second return value is false if no decode time is available.
+func (f *Fragment) BaseMediaDecodeTime() (uint64, bool) {
+	if len(f.Chunks) == 0 {
+		return 0, false
+	}
+	chunk := f.Chunks[0]
+	if chunk.Moof == nil || chunk.Moof.Traf == nil || chunk.Moof.Traf.Tfdt == nil {
+		return 0, false
+	}
+	return chunk.Moof.Traf.Tfdt.BaseMediaDecodeTime(), true
+}

@@ -53,6 +53,20 @@ Instead of a binary, a container image can be built using `make image`. Note tha
 
 Running `make` or `make help` will output all available targets together with a description.
 
+## Testing
+
+Tests run fully offline and do not require any external encoder. Synthetic CMAF tracks are generated in-memory (see `internal/cmaftest`) and driven through the real HTTP ingest endpoints:
+
+```sh
+# run all tests
+$ make test
+
+# run with the race detector
+$ make test TESTS_ARGS="-race"
+```
+
+The HLS manifest tests under `pkg/app/cmafingest` exercise normal ingestion, aborted uploads, stream reclamation after the ingest timeout, restarts, encoder reconnects, and concurrent uploads. They assert that playlists only list segments that are already readable on the volume, never regress or duplicate segments, and that a stopped or failed stream is no longer advertised.
+
 ## Configuration
 
 `nagare media ingest` is mainly configured through a YAML configuration file. By default, a file named `config.yaml` is searched for in the current directory and in `/etc/nagare-media/ingest/`. The path can be overwritten with the `-c, --config` CLI flag. The `--dev` flag will activate a special developer mode (currently it only influences the logging output). The following additional flags are available:
