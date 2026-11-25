@@ -1,0 +1,7 @@
+linters:
+  disable:
+    - errcheck  # Too many false positives for deferred close, process kill, etc.
+
+issues:
+  exclude-dirs:
+    - vendor
