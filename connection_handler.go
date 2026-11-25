@@ -54,6 +54,22 @@ func (h *Connection_Handler) init() {
 	h.sinks = make(map[string]*WRTC_Sink)
 }
 
+// Returns true if the connection is closed (thread safe)
+func (h *Connection_Handler) isClosed() bool {
+	h.statusMutex.Lock()
+	defer h.statusMutex.Unlock()
+
+	return h.closed
+}
+
+// Marks the connection as closed (thread safe)
+func (h *Connection_Handler) setClosed() {
+	h.statusMutex.Lock()
+	defer h.statusMutex.Unlock()
+
+	h.closed = true
+}
+
 // Runs the handler
 // Reads messages, parses them and applies them
 func (h *Connection_Handler) run() {
@@ -71,7 +87,7 @@ func (h *Connection_Handler) run() {
 		h.log("Connection closed.")
 		// Ensure connection is closed
 		h.connection.Close()
-		h.closed = true
+		h.setClosed()
 		// Release resources
 		h.onClose()
 		// Remove connection
@@ -145,7 +161,7 @@ func (h *Connection_Handler) sendHeartbeatMessages() {
 	for {
 		time.Sleep(HEARTBEAT_MSG_PERIOD_SECONDS * time.Second)
 
-		if h.closed {
+		if h.isClosed() {
 			return // Closed
 		}
 
@@ -207,31 +223,37 @@ func (h *Connection_Handler) receivePublishMessage(msg SignalingMessage) {
 
 	source.init()
 
-	// Register the source
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	// Register the request
+	h.statusMutex.Lock()
 
-		if h.requests[requestId] != 0 {
-			h.sendErrorMessage("PROTOCOL_ERROR", "You reused the same request ID for 2 different requests.", requestId)
-			return
-		}
+	if h.requests[requestId] != 0 {
+		h.statusMutex.Unlock()
+		h.sendErrorMessage("PROTOCOL_ERROR", "You reused the same request ID for 2 different requests.", requestId)
+		return
+	}
 
-		if h.requestCount > h.node.requestLimit {
-			h.sendErrorMessage("LIMIT_REQUESTS", "Too many requests on the same socket.", requestId)
-			return
-		}
+	if h.requestCount > h.node.requestLimit {
+		h.statusMutex.Unlock()
+		h.sendErrorMessage("LIMIT_REQUESTS", "Too many requests on the same socket.", requestId)
+		return
+	}
 
-		h.requestCount++
-		h.requests[requestId] = REQUEST_TYPE_PUBLISH
-		h.sources[requestId] = &source
+	h.requestCount++
+	h.requests[requestId] = REQUEST_TYPE_PUBLISH
+	h.sources[requestId] = &source
 
-		h.sendOkMessage(requestId)
+	h.statusMutex.Unlock()
 
-		h.node.registerSource(&source) // Register source
+	h.sendOkMessage(requestId)
 
-		go source.run() // Run source
-	}()
+	// Register the source and run it OUTSIDE the connection lock.
+	// Registration may close a previously registered source for the same
+	// stream, and closing it notifies its connection (sendSourceClose takes
+	// that connection's lock). Doing this while holding this connection's
+	// lock would deadlock when the same connection re-publishes the stream.
+	h.node.registerSource(&source) // Register source
+
+	go source.run() // Run source
 }
 
 // Called when a PLAY message is received from the client
@@ -270,31 +292,33 @@ func (h *Connection_Handler) receivePlayMessage(msg SignalingMessage) {
 
 	sink.init()
 
-	// Register the sink
-	func() {
-		h.statusMutex.Lock()
-		defer h.statusMutex.Unlock()
+	// Register the request
+	h.statusMutex.Lock()
 
-		if h.requests[requestId] != 0 {
-			h.sendErrorMessage("PROTOCOL_ERROR", "You reused the same request ID for 2 different requests.", requestId)
-			return
-		}
+	if h.requests[requestId] != 0 {
+		h.statusMutex.Unlock()
+		h.sendErrorMessage("PROTOCOL_ERROR", "You reused the same request ID for 2 different requests.", requestId)
+		return
+	}
 
-		if h.requestCount > h.node.requestLimit {
-			h.sendErrorMessage("LIMIT_REQUESTS", "Too many requests on the same socket.", requestId)
-			return
-		}
+	if h.requestCount > h.node.requestLimit {
+		h.statusMutex.Unlock()
+		h.sendErrorMessage("LIMIT_REQUESTS", "Too many requests on the same socket.", requestId)
+		return
+	}
 
-		h.requestCount++
-		h.requests[requestId] = REQUEST_TYPE_PLAY
-		h.sinks[requestId] = &sink
+	h.requestCount++
+	h.requests[requestId] = REQUEST_TYPE_PLAY
+	h.sinks[requestId] = &sink
 
-		h.sendOkMessage(requestId)
+	h.statusMutex.Unlock()
 
-		h.sendStandbyMessage(requestId)
+	h.sendOkMessage(requestId)
 
-		h.node.registerSink(&sink) // Register sink
-	}()
+	h.sendStandbyMessage(requestId)
+
+	// Register the sink OUTSIDE the connection lock (see receivePublishMessage)
+	h.node.registerSink(&sink) // Register sink
 }
 
 // Called when an ANSWER message is received from the client
@@ -325,9 +349,9 @@ func (h *Connection_Handler) receiveCandidateMessage(msg SignalingMessage) {
 
 		if h.requests[requestId] == 0 {
 			return // IGNORE
-		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH {
+		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH && h.sources[requestId] != nil {
 			h.sources[requestId].onICECandidate(msg.body)
-		} else if h.requests[requestId] == REQUEST_TYPE_PLAY {
+		} else if h.requests[requestId] == REQUEST_TYPE_PLAY && h.sinks[requestId] != nil {
 			h.sinks[requestId].onICECandidate(msg.body)
 		}
 	}()
@@ -344,13 +368,17 @@ func (h *Connection_Handler) receiveCloseMessage(msg SignalingMessage) {
 		if h.requests[requestId] == 0 {
 			return // IGNORE
 		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH {
-			h.sources[requestId].close(false, true)
+			if h.sources[requestId] != nil {
+				h.sources[requestId].close(false, true)
+			}
 
 			delete(h.sources, requestId)
 			delete(h.requests, requestId)
 			h.requestCount--
 		} else if h.requests[requestId] == REQUEST_TYPE_PLAY {
-			h.sinks[requestId].close()
+			if h.sinks[requestId] != nil {
+				h.sinks[requestId].close()
+			}
 
 			delete(h.sinks, requestId)
 			delete(h.requests, requestId)
@@ -439,11 +467,25 @@ func (h *Connection_Handler) sendICECandidate(reqId string, sid string, candidat
 // Removes a source and send a message to the client
 func (h *Connection_Handler) sendSourceClose(reqId string, sid string) {
 	h.statusMutex.Lock()
-	defer h.statusMutex.Unlock()
 
-	delete(h.sources, reqId)
-	delete(h.requests, reqId)
-	h.requestCount--
+	// Only update the status if the request is still registered.
+	// A duplicate cleanup (for example, the client already sent CLOSE)
+	// must not corrupt the request count.
+	_, existed := h.requests[reqId]
+
+	if existed {
+		delete(h.sources, reqId)
+		delete(h.requests, reqId)
+		if h.requestCount > 0 {
+			h.requestCount--
+		}
+	}
+
+	h.statusMutex.Unlock()
+
+	if !existed {
+		return
+	}
 
 	msg := SignalingMessage{
 		method: "CLOSE",
@@ -474,7 +516,7 @@ func (h *Connection_Handler) onClose() {
 
 	for requestId := range h.requests {
 		if h.requests[requestId] == 0 {
-			return // IGNORE
+			continue // IGNORE
 		} else if h.requests[requestId] == REQUEST_TYPE_PUBLISH {
 			h.sources[requestId].close(false, true)
 

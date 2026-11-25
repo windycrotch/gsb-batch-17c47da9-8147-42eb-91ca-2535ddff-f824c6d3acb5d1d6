@@ -43,6 +43,10 @@ func (sender *WRTC_Source_Sender) onTracksReady(localTrackVideo *webrtc.TrackLoc
 	sender.statusMutex.Lock()
 	defer sender.statusMutex.Unlock()
 
+	if sender.closed {
+		return
+	}
+
 	// Set video track
 	sender.localTrackVideo = localTrackVideo
 	sender.hasVideo = localTrackVideo != nil
@@ -68,6 +72,10 @@ func (sender *WRTC_Source_Sender) onTracksReady(localTrackVideo *webrtc.TrackLoc
 func (sender *WRTC_Source_Sender) runAfterTracksReady() {
 	sender.statusMutex.Lock()
 	defer sender.statusMutex.Unlock()
+
+	if sender.closed {
+		return // Closed
+	}
 
 	if !sender.hasVideo && !sender.hasAudio {
 		return // Nothing to do
@@ -161,11 +169,19 @@ func (sender *WRTC_Source_Sender) runAfterTracksReady() {
 // Called if the peer connection is disconnected
 func (sender *WRTC_Source_Sender) onClose() {
 	sender.statusMutex.Lock()
-	defer sender.statusMutex.Unlock()
 
+	if sender.closed {
+		sender.statusMutex.Unlock()
+		return
+	}
+
+	sender.closed = true
 	sender.peerConnection = nil
 
-	// Remove the sender from the node
+	sender.statusMutex.Unlock()
+
+	// Remove the sender from the node (outside the sender lock
+	// to prevent lock-order inversions)
 	sender.node.onSenderClosed(sender)
 }
 
@@ -259,9 +275,14 @@ func (sender *WRTC_Source_Sender) onAnswer(answerJSON string) {
 }
 
 // Close the sender
+// It is safe to call this method multiple times
 func (sender *WRTC_Source_Sender) close() {
 	sender.statusMutex.Lock()
 	defer sender.statusMutex.Unlock()
+
+	if sender.closed {
+		return // Already closed
+	}
 
 	sender.closed = true
 

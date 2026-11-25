@@ -15,8 +15,11 @@ func loadWebRTCConfig() webrtc.Configuration {
 	}
 
 	// STUN server
+	// Set STUN_SERVER=NONE to explicitly disable STUN (useful for local testing)
 	stunServer := os.Getenv("STUN_SERVER")
-	if stunServer != "" {
+	if stunServer == "NONE" {
+		// STUN explicitly disabled
+	} else if stunServer != "" {
 		peerConnectionConfig.ICEServers = append(peerConnectionConfig.ICEServers, webrtc.ICEServer{
 			URLs: []string{stunServer},
 		})

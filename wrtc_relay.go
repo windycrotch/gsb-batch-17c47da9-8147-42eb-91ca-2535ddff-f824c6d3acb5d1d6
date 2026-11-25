@@ -5,9 +5,15 @@ package main
 import (
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 )
+
+// Max time a relay may stay not-ready before it is closed and re-resolved.
+// This prevents viewers from waiting forever when the remote node does
+// not answer the CONNECT request (for example, a stale discovery message).
+var relayReadyTimeout = 15 * time.Second
 
 // WRTC_Relay - This data structure contains the status data
 // of an inter-node INPUT connection
@@ -19,6 +25,10 @@ type WRTC_Relay struct {
 	node *WebRTC_CDN_Node // Reference to the node
 
 	ready bool
+
+	closed bool // True when the relay is no longer active
+
+	readyTimer *time.Timer // Watchdog to close the relay if it never becomes ready
 
 	peerConnection *webrtc.PeerConnection
 	statusMutex    *sync.Mutex
@@ -33,13 +43,66 @@ type WRTC_Relay struct {
 // Initialize
 func (relay *WRTC_Relay) init() {
 	relay.ready = false
+	relay.closed = false
 	relay.statusMutex = &sync.Mutex{}
+
+	// Watchdog: if the relay does not become ready in time, close it so
+	// the stream is re-resolved and viewers do not wait forever
+	relay.readyTimer = time.AfterFunc(relayReadyTimeout, func() {
+		relay.statusMutex.Lock()
+		mustClose := !relay.closed && !relay.ready
+		relay.statusMutex.Unlock()
+
+		if mustClose {
+			LogDebug("Source relay timed out waiting for tracks | RemoteNode: " + relay.remoteId + " | SreamID: " + relay.sid)
+			relay.onClose()
+		}
+	})
+}
+
+// Returns true if the relay is ready (tracks available)
+func (relay *WRTC_Relay) isReady() bool {
+	relay.statusMutex.Lock()
+	defer relay.statusMutex.Unlock()
+
+	return relay.ready
+}
+
+// Marks the relay as ready and returns its tracks.
+// Returns ok = false if the relay was already closed.
+func (relay *WRTC_Relay) markReady() (localTrackVideo *webrtc.TrackLocalStaticRTP, localTrackAudio *webrtc.TrackLocalStaticRTP, ok bool) {
+	relay.statusMutex.Lock()
+	defer relay.statusMutex.Unlock()
+
+	if relay.closed {
+		return nil, nil, false
+	}
+
+	relay.ready = true
+
+	if relay.readyTimer != nil {
+		relay.readyTimer.Stop()
+	}
+
+	return relay.localTrackVideo, relay.localTrackAudio, true
+}
+
+// Returns the current local tracks (thread safe)
+func (relay *WRTC_Relay) currentTracks() (localTrackVideo *webrtc.TrackLocalStaticRTP, localTrackAudio *webrtc.TrackLocalStaticRTP) {
+	relay.statusMutex.Lock()
+	defer relay.statusMutex.Unlock()
+
+	return relay.localTrackVideo, relay.localTrackAudio
 }
 
 // Called when an offer SDP message is received
 func (relay *WRTC_Relay) onOffer(offerJSON string, hasVideo bool, hasAudio bool) {
 	relay.statusMutex.Lock()
 	defer relay.statusMutex.Unlock()
+
+	if relay.closed {
+		return // Ignore offers for a closed relay
+	}
 
 	relay.hasVideo = hasVideo
 	relay.hasAudio = hasAudio
@@ -66,16 +129,18 @@ func (relay *WRTC_Relay) onOffer(offerJSON string, hasVideo bool, hasAudio bool)
 
 	peerConnection.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		relay.statusMutex.Lock()
-		defer relay.statusMutex.Unlock()
 
 		if remoteTrack.Kind() == webrtc.RTPCodecTypeVideo {
 			if relay.localTrackVideo != nil {
+				relay.statusMutex.Unlock()
 				return
 			}
 
 			localTrack, newTrackErr := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, "video", "pion")
 			if newTrackErr != nil {
+				relay.statusMutex.Unlock()
 				LogError(newTrackErr)
+				return
 			}
 
 			relay.localTrackVideo = localTrack
@@ -83,23 +148,33 @@ func (relay *WRTC_Relay) onOffer(offerJSON string, hasVideo bool, hasAudio bool)
 			go pipeTrack(remoteTrack, localTrack)
 		} else if remoteTrack.Kind() == webrtc.RTPCodecTypeAudio {
 			if relay.localTrackAudio != nil {
+				relay.statusMutex.Unlock()
 				return
 			}
 
 			localTrack, newTrackErr := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, "audio", "pion")
 			if newTrackErr != nil {
+				relay.statusMutex.Unlock()
 				LogError(newTrackErr)
+				return
 			}
 
 			relay.localTrackAudio = localTrack
 
 			go pipeTrack(remoteTrack, localTrack)
 		} else {
+			relay.statusMutex.Unlock()
 			return
 		}
 
-		if (!relay.hasAudio || relay.localTrackAudio != nil) && (!relay.hasVideo || relay.localTrackVideo != nil) {
+		ready := (!relay.hasAudio || relay.localTrackAudio != nil) && (!relay.hasVideo || relay.localTrackVideo != nil)
+
+		relay.statusMutex.Unlock()
+
+		if ready {
 			// Received all the tracks, the relay is now ready
+			// Note: the node is notified AFTER releasing the relay lock,
+			// since the node may call back into the relay.
 			relay.node.onRelayReady(relay)
 		}
 	})
@@ -225,31 +300,59 @@ func (relay *WRTC_Relay) sendAnswer(answerJSON string) {
 // Called if the peer connection is closed
 func (relay *WRTC_Relay) onClose() {
 	relay.statusMutex.Lock()
-	defer relay.statusMutex.Unlock()
 
-	if relay.peerConnection != nil {
-		relay.peerConnection.OnICECandidate(nil)
-		relay.peerConnection.OnConnectionStateChange(nil)
-		relay.peerConnection.OnTrack(nil)
-		relay.peerConnection.Close()
+	if relay.closed {
+		relay.statusMutex.Unlock()
+		return // Already closed
 	}
 
+	relay.closed = true
+
+	if relay.readyTimer != nil {
+		relay.readyTimer.Stop()
+	}
+
+	peerConnection := relay.peerConnection
 	relay.peerConnection = nil
 
+	relay.statusMutex.Unlock()
+
+	if peerConnection != nil {
+		peerConnection.OnICECandidate(nil)
+		peerConnection.OnConnectionStateChange(nil)
+		peerConnection.OnTrack(nil)
+		peerConnection.Close()
+	}
+
+	// Notify the node outside the relay lock to prevent lock-order inversions
 	relay.node.onRelayClosed(relay)
 }
 
 // Close the relay
+// It is safe to call this method multiple times
 func (relay *WRTC_Relay) close() {
 	relay.statusMutex.Lock()
-	defer relay.statusMutex.Unlock()
 
-	if relay.peerConnection != nil {
-		relay.peerConnection.OnICECandidate(nil)
-		relay.peerConnection.OnConnectionStateChange(nil)
-		relay.peerConnection.OnTrack(nil)
-		relay.peerConnection.Close()
+	if relay.closed {
+		relay.statusMutex.Unlock()
+		return
 	}
 
+	relay.closed = true
+
+	if relay.readyTimer != nil {
+		relay.readyTimer.Stop()
+	}
+
+	peerConnection := relay.peerConnection
 	relay.peerConnection = nil
+
+	relay.statusMutex.Unlock()
+
+	if peerConnection != nil {
+		peerConnection.OnICECandidate(nil)
+		peerConnection.OnConnectionStateChange(nil)
+		peerConnection.OnTrack(nil)
+		peerConnection.Close()
+	}
 }

@@ -8,21 +8,23 @@ package main
 // it will create a sender for the node that requested the connection
 func (node *WebRTC_CDN_Node) receiveConnectMessage(from string, sid string) {
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
 
 	source := node.sources[sid]
 
-	if source == nil {
+	if source == nil || source.isClosed() {
+		node.mutexStatus.Unlock()
 		return // Ignore, no source available
 	}
 
-	if node.senders[sid] != nil && node.senders[sid][from] != nil {
-		// Close previous sender
-		node.senders[sid][from].close()
+	var oldSender *WRTC_Source_Sender
+
+	if node.senders[sid] != nil {
+		oldSender = node.senders[sid][from]
 	}
 
-	// Create a sender
-	sender := WRTC_Source_Sender{
+	// Create a sender (replaces any previous one for the same remote node,
+	// so duplicate CONNECT messages cannot pile up multiple senders)
+	sender := &WRTC_Source_Sender{
 		sid:      sid,
 		remoteId: from,
 		node:     node,
@@ -34,11 +36,21 @@ func (node *WebRTC_CDN_Node) receiveConnectMessage(from string, sid string) {
 		node.senders[sid] = make(map[string]*WRTC_Source_Sender)
 	}
 
-	node.senders[sid][from] = &sender
+	node.senders[sid][from] = sender
 
-	if node.sources[sid] != nil && node.sources[sid].ready {
+	ready := source.ready
+	localTrackVideo, localTrackAudio := source.currentTracks()
+
+	node.mutexStatus.Unlock()
+
+	// Close the previous sender outside the node lock
+	if oldSender != nil {
+		oldSender.close()
+	}
+
+	if ready {
 		// Tracks already available
-		sender.onTracksReady(node.sources[sid].localTrackVideo, node.sources[sid].localTrackAudio)
+		sender.onTracksReady(localTrackVideo, localTrackAudio)
 	}
 }
 
@@ -47,7 +59,8 @@ func (node *WebRTC_CDN_Node) onSenderClosed(sender *WRTC_Source_Sender) {
 	node.mutexStatus.Lock()
 	defer node.mutexStatus.Unlock()
 
-	if node.senders[sender.sid] != nil && node.senders[sender.sid][sender.remoteId] != nil {
+	// Identity check: a stale sender must not remove its replacement
+	if node.senders[sender.sid] != nil && node.senders[sender.sid][sender.remoteId] == sender {
 		delete(node.senders[sender.sid], sender.remoteId)
 
 		if len(node.senders[sender.sid]) == 0 {
@@ -87,29 +100,38 @@ func (node *WebRTC_CDN_Node) receiveCandidateMessage(from string, sid string, ca
 // Called when an INFO message is received
 func (node *WebRTC_CDN_Node) receiveInfoMessage(from string, sid string) {
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
 
 	// If we receive an INFO message from another node
-	// and we have an existing connection for that stream,
-	// we must close it to prevent duplicates
-	if node.sources[sid] != nil {
-		// Close the old source
-		s := node.sources[sid]
-		s.close(true, false)
+	// and we have a local source for that stream, the remote
+	// source takes precedence (at most one valid source per stream ID)
+	oldSource := node.sources[sid]
+	if oldSource != nil {
 		delete(node.sources, sid)
 	}
 
-	// If we have any pending sinks for that stream,
-	// we create a relay for that source
-	if node.sinks[sid] != nil && len(node.sinks[sid]) > 0 {
-		// Close old relay
-		if node.relays[sid] != nil {
-			node.relays[sid].close()
-			delete(node.relays, sid)
+	// Senders of the old local source must also be released
+	var oldSenders []*WRTC_Source_Sender
+	if oldSource != nil && node.senders[sid] != nil {
+		for _, sender := range node.senders[sid] {
+			oldSenders = append(oldSenders, sender)
 		}
+		delete(node.senders, sid)
+	}
+
+	var relay *WRTC_Relay
+	var oldRelay *WRTC_Relay
+	var sinksToNotify []*WRTC_Sink
+
+	// If we have any pending sinks for that stream,
+	// we (re)create a relay for that source
+	if node.sinks[sid] != nil && len(node.sinks[sid]) > 0 {
+		// Replace the old relay (if any), so duplicate or repeated
+		// discovery messages cannot pile up multiple relays
+		oldRelay = node.relays[sid]
+		delete(node.relays, sid)
 
 		// Create new relay
-		relay := WRTC_Relay{
+		relay = &WRTC_Relay{
 			sid:      sid,
 			remoteId: from,
 			node:     node,
@@ -117,9 +139,45 @@ func (node *WebRTC_CDN_Node) receiveInfoMessage(from string, sid string) {
 
 		relay.init()
 
-		node.relays[sid] = &relay
+		node.relays[sid] = relay
 
-		// Send a connect message
+		// Collect sinks to notify them that the old tracks are gone
+		if oldSource != nil || oldRelay != nil {
+			for _, sink := range node.sinks[sid] {
+				sinksToNotify = append(sinksToNotify, sink)
+			}
+		}
+	}
+
+	node.mutexStatus.Unlock()
+
+	// Close replaced resources AFTER releasing the node lock
+	if oldSource != nil {
+		oldTracksVideo, oldTracksAudio := oldSource.currentTracks()
+		oldSource.close(true, false)
+
+		// Tell the sinks the old tracks are gone, they will
+		// receive the tracks of the new relay when it is ready
+		for _, sink := range sinksToNotify {
+			sink.onTracksClosed(oldTracksVideo, oldTracksAudio)
+		}
+	} else if oldRelay != nil {
+		oldTracksVideo, oldTracksAudio := oldRelay.currentTracks()
+		for _, sink := range sinksToNotify {
+			sink.onTracksClosed(oldTracksVideo, oldTracksAudio)
+		}
+	}
+
+	if oldRelay != nil {
+		oldRelay.close()
+	}
+
+	for _, sender := range oldSenders {
+		sender.close()
+	}
+
+	if relay != nil {
+		// Send a connect message to the node that announced the source
 		node.sendConnectMessage(from, sid)
 	}
 }
@@ -138,36 +196,63 @@ func (node *WebRTC_CDN_Node) receiveOfferMessage(sid string, data string, hasVid
 // Called when a relay is ready
 // This means the tracks are available
 func (node *WebRTC_CDN_Node) onRelayReady(relay *WRTC_Relay) {
+	localTrackVideo, localTrackAudio, ok := relay.markReady()
+
+	if !ok {
+		return // Relay was closed before becoming ready
+	}
+
 	node.mutexStatus.Lock()
 	defer node.mutexStatus.Unlock()
 
-	relay.ready = true
+	// Ignore the event if the relay was replaced in the meantime
+	if node.relays[relay.sid] != relay {
+		return
+	}
 
 	// Notify sinks
 	if node.sinks[relay.sid] != nil {
 		for _, sink := range node.sinks[relay.sid] {
-			sink.onTracksReady(relay.localTrackVideo, relay.localTrackAudio)
+			sink.onTracksReady(localTrackVideo, localTrackAudio)
 		}
 	}
 }
 
 // Called when a relay is closed
 func (node *WebRTC_CDN_Node) onRelayClosed(relay *WRTC_Relay) {
+	localTrackVideo, localTrackAudio := relay.currentTracks()
+
 	node.mutexStatus.Lock()
-	defer node.mutexStatus.Unlock()
+
+	// Identity check: a stale relay (already replaced) must not remove
+	// the new relay nor disturb the sinks
+	if node.relays[relay.sid] != relay {
+		node.mutexStatus.Unlock()
+		return
+	}
 
 	delete(node.relays, relay.sid)
 
-	// Any sinks waiting, tell them the tracks are closed
+	var sinksToNotify []*WRTC_Sink
+
 	if node.sinks[relay.sid] != nil {
 		for _, sink := range node.sinks[relay.sid] {
-			sink.onTracksClosed(relay.localTrackVideo, relay.localTrackAudio)
+			sinksToNotify = append(sinksToNotify, sink)
 		}
+	}
+
+	hasSinks := len(sinksToNotify) > 0
+
+	node.mutexStatus.Unlock()
+
+	// Any sinks waiting, tell them the tracks are closed
+	for _, sink := range sinksToNotify {
+		sink.onTracksClosed(localTrackVideo, localTrackAudio)
 	}
 
 	// If there are sinks for that stream ID
 	// and there are no source, try resolving it
-	if node.sinks[relay.sid] != nil && len(node.sinks[relay.sid]) > 0 {
+	if hasSinks {
 		node.sendResolveMessage(relay.sid)
 	}
 }

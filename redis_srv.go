@@ -137,6 +137,16 @@ func (node *WebRTC_CDN_Node) receiveRedisMessage(msg string) {
 
 // Sends a redis message
 func (node *WebRTC_CDN_Node) sendRedisMessage(channel string, msg *map[string]string) {
+	if node.redisSendHook != nil {
+		// Test hook: deliver the message without a redis server
+		cp := make(map[string]string, len(*msg))
+		for k, v := range *msg {
+			cp[k] = v
+		}
+		node.redisSendHook(channel, cp)
+		return
+	}
+
 	if node.standAlone {
 		return
 	}

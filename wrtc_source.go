@@ -51,10 +51,30 @@ func (source *WRTC_Source) init() {
 	source.statusMutex = &sync.Mutex{}
 }
 
+// Returns true if the source is closed
+func (source *WRTC_Source) isClosed() bool {
+	source.statusMutex.Lock()
+	defer source.statusMutex.Unlock()
+
+	return source.closed
+}
+
+// Returns the current local tracks (thread safe)
+func (source *WRTC_Source) currentTracks() (localTrackVideo *webrtc.TrackLocalStaticRTP, localTrackAudio *webrtc.TrackLocalStaticRTP) {
+	source.statusMutex.Lock()
+	defer source.statusMutex.Unlock()
+
+	return source.localTrackVideo, source.localTrackAudio
+}
+
 // Creates the connection and generates the offer
 func (source *WRTC_Source) run() {
 	source.statusMutex.Lock()
 	defer source.statusMutex.Unlock()
+
+	if source.closed {
+		return // Closed before it could start
+	}
 
 	peerConnectionConfig := loadWebRTCConfig() // Load config
 
@@ -70,16 +90,17 @@ func (source *WRTC_Source) run() {
 	// Track event handler
 	peerConnection.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		source.statusMutex.Lock()
-		defer source.statusMutex.Unlock()
 
 		if remoteTrack.Kind() == webrtc.RTPCodecTypeVideo {
 			// Received video track
 			if source.localTrackVideo != nil {
+				source.statusMutex.Unlock()
 				return
 			}
 
 			localTrack, newTrackErr := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, "video", "pion")
 			if newTrackErr != nil {
+				source.statusMutex.Unlock()
 				LogError(newTrackErr)
 				return
 			}
@@ -103,11 +124,13 @@ func (source *WRTC_Source) run() {
 		} else if remoteTrack.Kind() == webrtc.RTPCodecTypeAudio {
 			// Received audio track
 			if source.localTrackAudio != nil {
+				source.statusMutex.Unlock()
 				return
 			}
 
 			localTrack, newTrackErr := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, "audio", "pion")
 			if newTrackErr != nil {
+				source.statusMutex.Unlock()
 				LogError(newTrackErr)
 				return
 			}
@@ -116,11 +139,18 @@ func (source *WRTC_Source) run() {
 
 			go pipeTrack(remoteTrack, localTrack)
 		} else {
+			source.statusMutex.Unlock()
 			return
 		}
 
-		if (!source.hasAudio || source.localTrackAudio != nil) && (!source.hasVideo || source.localTrackVideo != nil) {
+		ready := (!source.hasAudio || source.localTrackAudio != nil) && (!source.hasVideo || source.localTrackVideo != nil)
+
+		source.statusMutex.Unlock()
+
+		if ready {
 			// Received all the tracks
+			// Note: the node is notified AFTER releasing the source lock,
+			// since the node may call back into the source.
 			source.connection.logDebug("Source Ready | SreamID: " + source.sid + " | RequestID: " + source.requestId)
 			source.node.onSourceReady(source)
 		}
@@ -256,12 +286,17 @@ func (source *WRTC_Source) onAnswer(answerJSON string) {
 // Peer connection closed
 func (source *WRTC_Source) onClose() {
 	source.statusMutex.Lock()
-	defer source.statusMutex.Unlock()
 
 	if source.closed {
+		source.statusMutex.Unlock()
 		return
 	}
 	source.closed = true
+
+	source.statusMutex.Unlock()
+
+	// Notify outside the source lock to prevent lock-order inversions
+	// (the node and the connection handler take their own locks)
 
 	// Send close message to the connection
 	source.connection.sendSourceClose(source.requestId, source.sid)
@@ -273,23 +308,26 @@ func (source *WRTC_Source) onClose() {
 // Source manually closed
 func (source *WRTC_Source) close(notifyConnection bool, deregister bool) {
 	source.statusMutex.Lock()
-	defer source.statusMutex.Unlock()
 
 	if source.closed {
+		source.statusMutex.Unlock()
 		return
 	}
 
 	source.closed = true
 
-	if source.peerConnection != nil {
-		// Close the peer connection
-		source.peerConnection.OnConnectionStateChange(nil)
-		source.peerConnection.OnICECandidate(nil)
-		source.peerConnection.OnTrack(nil)
-		source.peerConnection.Close()
-	}
-
+	peerConnection := source.peerConnection
 	source.peerConnection = nil
+
+	source.statusMutex.Unlock()
+
+	// Close the peer connection outside the source lock
+	if peerConnection != nil {
+		peerConnection.OnConnectionStateChange(nil)
+		peerConnection.OnICECandidate(nil)
+		peerConnection.OnTrack(nil)
+		peerConnection.Close()
+	}
 
 	// Send close message to the connection
 	if notifyConnection {

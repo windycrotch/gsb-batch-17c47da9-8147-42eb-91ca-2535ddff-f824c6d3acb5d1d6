@@ -19,9 +19,15 @@ import (
 // sources, inks, relays and senders
 type WebRTC_CDN_Node struct {
 	// Config
-	id           string
-	redisClient  *redis.Client
-	standAlone   bool
+	id          string
+	redisClient *redis.Client
+	standAlone  bool
+
+	// Test hook: when set, redis messages are delivered to this
+	// function instead of being published to a redis server.
+	// Used by tests to simulate a multi-node deployment in-process.
+	redisSendHook func(channel string, msg map[string]string)
+
 	upgrader     *websocket.Upgrader
 	reqCount     uint64
 	sinkCount    uint64
@@ -73,7 +79,7 @@ func (node *WebRTC_CDN_Node) init() {
 	custom_ip_limit := os.Getenv("MAX_IP_CONCURRENT_CONNECTIONS")
 	if custom_ip_limit != "" {
 		cil, e := strconv.Atoi(custom_ip_limit)
-		if e != nil {
+		if e == nil {
 			node.ipLimit = uint32(cil)
 		}
 	}
@@ -85,7 +91,7 @@ func (node *WebRTC_CDN_Node) init() {
 	custom_req_limit := os.Getenv("MAX_REQUESTS_PER_SOCKET")
 	if custom_req_limit != "" {
 		cil, e := strconv.Atoi(custom_req_limit)
-		if e != nil {
+		if e == nil {
 			node.requestLimit = uint32(cil)
 		}
 	}

@@ -44,12 +44,12 @@ You can configure the node using environment variables
 
 ### WebRTC options
 
-| Variable Name | Description                                                                             |
-| ------------- | --------------------------------------------------------------------------------------- |
-| STUN_SERVER   | STUN server URL. Example: `stun:stun.l.google.com:19302`                                |
-| TURN_SERVER   | TURN server URL. Set if the server is behind NAT. Example: `turn:turn.example.com:3478` |
-| TURN_USERNAME | Username for the TURN server.                                                           |
-| TURN_PASSWORD | Credential for the TURN server.                                                         |
+| Variable Name | Description                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------------- |
+| STUN_SERVER   | STUN server URL. Example: `stun:stun.l.google.com:19302`. Set to `NONE` to explicitly disable STUN.     |
+| TURN_SERVER   | TURN server URL. Set if the server is behind NAT. Example: `turn:turn.example.com:3478`                 |
+| TURN_USERNAME | Username for the TURN server.                                                                           |
+| TURN_PASSWORD | Credential for the TURN server.                                                                         |
 
 ### Redis
 
@@ -113,6 +113,16 @@ Check the documentation in order to connect to the nodes:
 If you want to know about the inter-node communication protocol check:
 
 - [Inter-Node communication protocol](./doc/redis.md)
+
+## Testing
+
+The repository includes end-to-end reliability tests (publisher re-publish, multi-node relay rebuild, resource cleanup, concurrent closes and late signaling). They run locally, without a redis server or internet access:
+
+```
+go test -race -v ./...
+```
+
+See [TESTING.md](./TESTING.md) for a description of each scenario.
 
 ## Client Libraries
 

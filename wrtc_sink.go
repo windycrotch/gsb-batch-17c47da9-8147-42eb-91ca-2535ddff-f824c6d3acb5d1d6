@@ -44,10 +44,22 @@ func (sink *WRTC_Sink) init() {
 	sink.closed = false
 }
 
+// Returns true if the sink is closed
+func (sink *WRTC_Sink) isClosed() bool {
+	sink.statusMutex.Lock()
+	defer sink.statusMutex.Unlock()
+
+	return sink.closed
+}
+
 // Receive the tracks from local source or relay
 func (sink *WRTC_Sink) onTracksReady(localTrackVideo *webrtc.TrackLocalStaticRTP, localTrackAudio *webrtc.TrackLocalStaticRTP) {
 	sink.statusMutex.Lock()
 	defer sink.statusMutex.Unlock()
+
+	if sink.closed {
+		return
+	}
 
 	// Set video track
 	sink.localTrackVideo = localTrackVideo
@@ -72,7 +84,13 @@ func (sink *WRTC_Sink) onTracksReady(localTrackVideo *webrtc.TrackLocalStaticRTP
 
 func (sink *WRTC_Sink) onTracksClosed(localTrackVideo *webrtc.TrackLocalStaticRTP, localTrackAudio *webrtc.TrackLocalStaticRTP) {
 	sink.statusMutex.Lock()
-	defer sink.statusMutex.Unlock()
+
+	if sink.closed {
+		sink.statusMutex.Unlock()
+		return
+	}
+
+	notify := false
 
 	if sink.localTrackAudio == localTrackAudio && sink.localTrackVideo == localTrackVideo {
 		sink.localTrackAudio = nil
@@ -88,6 +106,12 @@ func (sink *WRTC_Sink) onTracksClosed(localTrackVideo *webrtc.TrackLocalStaticRT
 
 		sink.peerConnection = nil
 
+		notify = true
+	}
+
+	sink.statusMutex.Unlock()
+
+	if notify {
 		sink.connection.sendStandbyMessage(sink.requestId)
 	}
 }
@@ -96,6 +120,10 @@ func (sink *WRTC_Sink) onTracksClosed(localTrackVideo *webrtc.TrackLocalStaticRT
 func (sink *WRTC_Sink) runAfterTracksReady() {
 	sink.statusMutex.Lock()
 	defer sink.statusMutex.Unlock()
+
+	if sink.closed {
+		return // Closed
+	}
 
 	if !sink.hasVideo && !sink.hasAudio {
 		return // Nothing to do
@@ -253,22 +281,34 @@ func (sink *WRTC_Sink) reconnect() {
 }
 
 // Close the sink
+// It is safe to call this method multiple times
 func (sink *WRTC_Sink) close() {
 	sink.statusMutex.Lock()
-	defer sink.statusMutex.Unlock()
+
+	if sink.closed {
+		sink.statusMutex.Unlock()
+		return // Already closed
+	}
 
 	sink.closed = true
 
-	if sink.peerConnection != nil {
-		sink.peerConnection.OnICECandidate(nil)
-		sink.peerConnection.OnConnectionStateChange(nil)
-		sink.peerConnection.Close()
-	}
-
+	peerConnection := sink.peerConnection
 	sink.peerConnection = nil
 	sink.hasAudio = false
 	sink.hasVideo = false
 	sink.localTrackAudio = nil
 	sink.localTrackVideo = nil
+
+	sink.statusMutex.Unlock()
+
+	// Close the peer connection outside the sink lock
+	if peerConnection != nil {
+		peerConnection.OnICECandidate(nil)
+		peerConnection.OnConnectionStateChange(nil)
+		peerConnection.Close()
+	}
+
+	// Remove the sink from the node outside the sink lock
+	// to prevent lock-order inversions
 	sink.node.removeSink(sink)
 }
