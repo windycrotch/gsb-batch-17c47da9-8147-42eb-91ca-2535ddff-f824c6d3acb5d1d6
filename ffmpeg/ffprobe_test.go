@@ -1,10 +1,14 @@
 package ffmpeg
 
 import (
+	"os/exec"
 	"testing"
 )
 
 func TestFFProbeRun(t *testing.T) {
+	if _, err := exec.LookPath(ffprobeCmd); err != nil {
+		t.Skip("ffprobe not on PATH")
+	}
 	ffprobe := &FFProbe{}
 	probe, err := ffprobe.Run(testFile)
 	if err != nil {

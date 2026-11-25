@@ -108,7 +108,73 @@ Encoding... 34.68% 3.37x @ 80.77 fps
 ![ffmpeg-commander](screenshot.png)
 
 ## WebSocket Demo
-See [demo](demo/) for a websocket client example.
+See [demo](demo/) for a websocket client example. The demo generates and reuses a
+stable `clientId` in `localStorage`, cancels by server task id, and reconnects
+automatically.
+
+## WebSocket task lifecycle
+
+Every encode owns a stable id and a submitter identity. Task events are sent
+only to websocket connections registered for that submitter; they are no longer
+broadcast to every client.
+
+### Client -> server
+
+```jsonc
+// Submit (all identity fields are optional). payload may be the historical
+// JSON string or a raw JSON object.
+{ "type": "encode",
+  "clientId": "browser-abc123",      // stable submitter id, reused on reconnect
+  "clientTaskId": "ui-1",            // optional caller correlation token
+  "input": "in.mp4", "output": "out.mp4", "payload": "..." }
+
+// Cancel precisely one task, by server id or clientTaskId.
+{ "type": "cancel", "taskId": "7" }
+
+// Re-announce identity after (re)connecting; the server then replays the
+// submitter's unfinished tasks as "snapshot" events.
+{ "type": "identify", "clientId": "browser-abc123" }
+
+{ "type": "query", "taskId": "7" }   // one current snapshot
+```
+
+`client_id`/`owner`/`submitter_id`, `task_id`/`id`/`jobId` and numeric `seq`
+aliases are all accepted. A websocket may also present its identity as
+`/ws?clientId=...`. Ids are owner-scoped for websocket requests: a connection
+can only query or cancel its own tasks, so sequential ids cannot be enumerated
+to reach another submitter's work. An id-less `cancel` preserves the old
+behavior and cancels the submitter's running task (falling back to the
+process-wide current task).
+
+### Server -> client
+
+Every phase carries the same server-assigned `taskId` (also under `id`,
+`task_id`, `jobId`), the numeric `seq`, the echoed `clientTaskId`, and the
+submitter identity (`clientId`/`owner`/`submitterId`/`submitter_id`):
+
+```
+identified | accepted | started | progress | completed | failed | cancelled
+snapshot | cancel-ack | error
+```
+
+Lifecycle guarantees:
+
+* `accepted` is always written before `started`/progress for a task.
+* A queued task cancelled before it is dequeued is marked cancelled and the
+  dispatcher skips it: ffmpeg is never started and it gets exactly one
+  `cancelled` terminal event.
+* Cancelling a running task kills its ffmpeg process. Progress after the
+  cancel transition is dropped, and exactly one terminal event is emitted.
+* Cancelling an unknown id returns an `error` (`task ... not found`);
+  cancelling a retained finished task returns `task "<id>" already completed|
+  failed|cancelled`. Repeated cancels never produce a second terminal event.
+* On reconnect with the same `clientId`, the server sends `snapshot` events
+  for the submitter's unfinished tasks and subsequent progress continues to
+  flow. Other submitters never receive those events.
+* A full queue rejects submission with a clear `error` and removes the
+  temporary record, so the rejected `clientTaskId` cannot later be cancelled.
+* Finished records are retained briefly (for late cancel/reconnect lookups),
+  then reaped. Server shutdown cancels work and clears every record.
 
 ## Develop
 Requires Go 1.26 or newer and `ffmpeg`/`ffprobe` on your `$PATH`.
@@ -120,7 +186,13 @@ go build -v
 #### Tests
 ```
 go test ./...
+go test -race ./cmd/...
 ```
+
+The `cmd` package includes deterministic websocket lifecycle tests (queue
+cancellation, running cancellation, reconnect ownership, terminal-state races,
+queue-full rejection, cleanup/shutdown). Tests that shell out to real
+`ffmpeg`/`ffprobe` skip automatically when the binaries are not on `PATH`.
 
 ## TODO
 * Logging levels and output

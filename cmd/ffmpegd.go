@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -58,35 +57,16 @@ var (
 	}
 	allowedOrigins []string
 
-	clients  = &hub{conns: make(map[*websocket.Conn]bool)}
-	jobs     = make(chan Message, maxQueuedJobs)
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return isAllowedOrigin(r.Header.Get("Origin"))
-		},
-	}
+	clients = newHub()
 
-	// The running encode, so a cancel message can stop it.
-	currentMu sync.Mutex
-	current   *ffmpeg.FFmpeg
+	// defaultServer wires the package-level /ws handler and CLI process to the
+	// ownership-aware task lifecycle.
+	defaultServer = NewServer(Options{
+		QueueSize: maxQueuedJobs,
+		Hub:       clients,
+		Runner:    realRunner{},
+	})
 )
-
-// Message payload from client.
-type Message struct {
-	Type    string `json:"type"`
-	Input   string `json:"input"`
-	Output  string `json:"output"`
-	Payload string `json:"payload"`
-}
-
-// Status response to client.
-type Status struct {
-	Percent   float64 `json:"percent"`
-	Speed     string  `json:"speed"`
-	FPS       float64 `json:"fps"`
-	Err       string  `json:"err,omitempty"`
-	Cancelled bool    `json:"cancelled,omitempty"`
-}
 
 // FilesResponse http response for files endpoint.
 type FilesResponse struct {
@@ -100,47 +80,116 @@ type file struct {
 	Size int64  `json:"size"`
 }
 
-// hub is the set of connected clients. gorilla/websocket allows one writer at
-// a time per connection, so writes go through the hub's lock too.
+// sendBuffer is the per-connection outbound queue size. A client that does not
+// read fast enough is evicted instead of stalling every other sender.
+const sendBuffer = 256
+
+// hub is the set of connected clients. It guards only the connection set;
+// writes happen on a per-connection writer goroutine so one slow peer cannot
+// hold the hub lock across a blocking WriteJSON and wedge unrelated clients or
+// the encode dispatcher.
 type hub struct {
 	mu    sync.Mutex
-	conns map[*websocket.Conn]bool
+	conns map[*websocket.Conn]*hubClient
+}
+
+type hubClient struct {
+	conn  *websocket.Conn
+	queue chan any
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newHub() *hub {
+	return &hub{conns: make(map[*websocket.Conn]*hubClient)}
 }
 
 func (h *hub) add(c *websocket.Conn) {
+	hc := &hubClient{
+		conn:  c,
+		queue: make(chan any, sendBuffer),
+		done:  make(chan struct{}),
+	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.conns[c] = true
+	h.conns[c] = hc
+	h.mu.Unlock()
+	go h.writeLoop(hc)
+}
+
+func (h *hub) writeLoop(hc *hubClient) {
+	defer hc.conn.Close()
+	for {
+		select {
+		case <-hc.done:
+			return
+		case v := <-hc.queue:
+			_ = hc.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if err := hc.conn.WriteJSON(v); err != nil {
+				h.remove(hc.conn)
+				return
+			}
+		}
+	}
 }
 
 func (h *hub) remove(c *websocket.Conn) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.conns, c)
-	c.Close()
-}
-
-// send writes a message to one client, dropping it if the write fails.
-func (h *hub) send(c *websocket.Conn, v any) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.write(c, v)
-}
-
-// broadcast writes a message to every client.
-func (h *hub) broadcast(v any) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c := range h.conns {
-		h.write(c, v)
+	hc := h.conns[c]
+	if hc != nil {
+		delete(h.conns, c)
+	}
+	h.mu.Unlock()
+	if hc != nil {
+		// Unblock the writer and any in-flight write promptly.
+		hc.once.Do(func() { close(hc.done) })
+		_ = c.Close()
+	} else {
+		_ = c.Close()
 	}
 }
 
-func (h *hub) write(c *websocket.Conn, v any) {
-	c.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if err := c.WriteJSON(v); err != nil {
-		delete(h.conns, c)
-		c.Close()
+// closeAll disconnects every tracked client (server shutdown).
+func (h *hub) closeAll() {
+	h.mu.Lock()
+	clients := make([]*hubClient, 0, len(h.conns))
+	for _, hc := range h.conns {
+		clients = append(clients, hc)
+	}
+	h.conns = make(map[*websocket.Conn]*hubClient)
+	h.mu.Unlock()
+	for _, hc := range clients {
+		hc.once.Do(func() { close(hc.done) })
+		_ = hc.conn.Close()
+	}
+}
+
+// send enqueues one message for a client without blocking on the network. A
+// full queue evicts the slow consumer.
+func (h *hub) send(c *websocket.Conn, v any) {
+	h.mu.Lock()
+	hc := h.conns[c]
+	h.mu.Unlock()
+	if hc == nil {
+		return
+	}
+	select {
+	case hc.queue <- v:
+	case <-hc.done:
+	default:
+		h.remove(c)
+	}
+}
+
+// broadcast enqueues a message for every tracked client.
+func (h *hub) broadcast(v any) {
+	h.mu.Lock()
+	clients := make([]*hubClient, 0, len(h.conns))
+	for _, hc := range h.conns {
+		clients = append(clients, hc)
+	}
+	h.mu.Unlock()
+	for _, hc := range clients {
+		h.send(hc.conn, v)
 	}
 }
 
@@ -282,46 +331,7 @@ func isAllowedOrigin(origin string) bool {
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
-	if origin := r.Header.Get("Origin"); !isAllowedOrigin(origin) {
-		fmt.Printf("\rRejected connection from %q: not an allowed origin.%s\n", origin, clearLine)
-		http.Error(w, "origin not allowed", http.StatusForbidden)
-		return
-	}
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		fmt.Printf("\rWaiting for connection...\u001b[31m websocket connection failed!\u001b[0m")
-		return
-	}
-	clients.add(ws)
-	defer clients.remove(ws)
-
-	fmt.Printf("\rWaiting for connection......\u001b[32mconnected!\u001b[0m")
-	for {
-		_, data, err := ws.ReadMessage()
-		if err != nil {
-			fmt.Printf("\rWaiting for connection...\u001b[31mdisconnected!\u001b[0m")
-			return
-		}
-
-		var msg Message
-		if err := json.Unmarshal(data, &msg); err != nil {
-			clients.send(ws, Status{Err: "invalid message: " + err.Error()})
-			continue
-		}
-
-		switch msg.Type {
-		case "encode":
-			select {
-			case jobs <- msg:
-			default:
-				clients.send(ws, Status{Err: "too many encodes queued, try again later"})
-			}
-		case "cancel":
-			cancelEncode()
-		default:
-			clients.send(ws, Status{Err: fmt.Sprintf("unknown message type %q", msg.Type)})
-		}
-	}
+	defaultServer.ServeWS(w, r)
 }
 
 func handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -384,10 +394,11 @@ func cors(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleMessages starts the default server's serial queue dispatcher. It is
+// retained as the historical entrypoint invoked by `go handleMessages()` in
+// startServer.
 func handleMessages() {
-	for msg := range jobs {
-		runEncode(msg)
-	}
+	defaultServer.Start()
 }
 
 func verifyFFmpeg() error {
@@ -407,130 +418,11 @@ func verifyFFmpeg() error {
 	return nil
 }
 
+// clearLine erases what's left of a progress line after .
+const clearLine = "[K"
+
+// cancelEncode preserves the historical id-less package entrypoint by
+// cancelling the default server's currently active task.
 func cancelEncode() {
-	currentMu.Lock()
-	defer currentMu.Unlock()
-	if current != nil {
-		current.Cancel()
-	}
-}
-
-func runEncode(msg Message) {
-	// Registered before anything slow, so a cancel that arrives while the
-	// input is still being probed is not lost.
-	f := &ffmpeg.FFmpeg{}
-	currentMu.Lock()
-	current = f
-	currentMu.Unlock()
-	defer func() {
-		currentMu.Lock()
-		current = nil
-		currentMu.Unlock()
-	}()
-
-	fmt.Printf("\rEncoding %s -> %s%s\n", msg.Input, msg.Output, clearLine)
-
-	e, err := ffmpeg.NewEncode(msg.Input, msg.Output, msg.Payload)
-	if err != nil {
-		sendError(err)
-		return
-	}
-	defer e.Close()
-
-	probe, err := ffmpeg.FFProbe{}.Run(msg.Input)
-	if err != nil {
-		sendError(err)
-		return
-	}
-
-	done := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		trackEncodeProgress(f, e.OutputDuration(probe.Duration()), totalFrames(probe), done)
-	}()
-	err = f.RunEncode(e)
-	// Stop progress updates before the final status so none can follow it.
-	close(done)
-	wg.Wait()
-
-	switch {
-	case errors.Is(err, ffmpeg.ErrCancelled):
-		fmt.Printf("\rEncode cancelled.%s\n", clearLine)
-		clients.broadcast(Status{Cancelled: true})
-	case err != nil:
-		sendError(err)
-	default:
-		fmt.Printf("\rEncode finished: %s%s\n", msg.Output, clearLine)
-		clients.broadcast(Status{Percent: 100})
-	}
-	fmt.Printf("Waiting for next job...")
-}
-
-// clearLine erases what's left of a progress line after \r.
-const clearLine = "\u001b[K"
-
-func sendError(err error) {
-	fmt.Printf("\r\u001b[31mEncode failed:\u001b[0m %s%s\n", err, clearLine)
-	clients.broadcast(Status{Err: err.Error()})
-}
-
-// totalFrames returns the frame count of the first video stream, or 0.
-func totalFrames(p *ffmpeg.FFProbeResponse) int {
-	for _, s := range p.Streams {
-		if s.CodecType == "video" {
-			n, _ := strconv.Atoi(s.NbFrames)
-			return n
-		}
-	}
-	return 0
-}
-
-// trackEncodeProgress reports progress to clients until done is closed.
-// Progress is measured against the output duration when it is known, and the
-// frame count otherwise. Each pass of a two-pass encode is half the total.
-func trackEncodeProgress(f *ffmpeg.FFmpeg, duration float64, frames int, done <-chan struct{}) {
-	ticker := time.NewTicker(progressInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			p := f.Progress()
-			if p.Passes == 0 {
-				continue
-			}
-
-			frac := -1.0
-			switch {
-			case duration > 0:
-				frac = float64(p.OutTimeUS) / 1e6 / duration
-			case frames > 0:
-				frac = float64(p.Frame) / float64(frames)
-			}
-
-			var pct float64
-			if frac >= 0 {
-				pct = (float64(p.Pass-1) + math.Min(frac, 1)) / float64(p.Passes) * 100
-				// 100 tells the client the job is done, so hold just short of
-				// it until ffmpeg exits.
-				pct = math.Min(math.Round(pct*100)/100, 99.99)
-			}
-
-			pass := ""
-			if p.Passes > 1 {
-				pass = fmt.Sprintf(" pass %d/%d", p.Pass, p.Passes)
-			}
-			if frac >= 0 {
-				fmt.Printf("\rEncoding...%s %0.2f%% %s @ %0.2f fps%s", pass, pct, p.Speed, p.FPS, clearLine)
-			} else {
-				fmt.Printf("\rEncoding...%s %0.1fs done %s @ %0.2f fps%s", pass, float64(p.OutTimeUS)/1e6, p.Speed, p.FPS, clearLine)
-			}
-
-			clients.broadcast(Status{Percent: pct, Speed: p.Speed, FPS: p.FPS})
-		}
-	}
+	_, _ = defaultServer.CancelActive("")
 }

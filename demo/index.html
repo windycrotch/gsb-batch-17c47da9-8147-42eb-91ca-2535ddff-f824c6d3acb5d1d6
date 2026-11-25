@@ -2,15 +2,25 @@
   <meta charset="utf-8" />
   <title>WebSocket Test Client</title>
   <style>
+      body { font-family: system-ui, sans-serif; margin: 16px; }
       .controls input,
       .controls textarea {
           display: block;
           margin: 5px 0;
           width: 400px;
       }
+      button { margin-right: 8px; }
+      #status { font-weight: 600; }
+      #log p { margin: 2px 0; font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-wrap: break-word; }
+      .phase-accepted, .phase-started { color: #8a6d00; }
+      .phase-progress { color: #1f6feb; }
+      .phase-completed { color: #1a7f37; }
+      .phase-failed, .phase-error { color: #cf222e; }
+      .phase-cancelled { color: #9a6700; }
   </style>
   <body>
     <h1>WebSocket Test Client</h1>
+    <p>Connection: <span id="status">connecting…</span> · Client ID: <code id="client-id"></code></p>
 
     <div class="controls">
         <label for="input">Input</label>
@@ -22,14 +32,31 @@
         <label for="payload">Payload</label>
         <textarea id="payload" rows="6"></textarea>
         <button id="submit">Submit</button>
+        <button id="cancel" disabled>Cancel current task</button>
     </div>
 
     <h4>Log</h4>
     <div id="log"></div>
 
     <script language="javascript" type="text/javascript">
-        var wsUri = "ws://localhost:8080/ws";
-        var log;
+        var wsBase = "ws://localhost:8080/ws";
+        var log = document.getElementById("log");
+        var statusEl = document.getElementById("status");
+        var clientIdEl = document.getElementById("client-id");
+
+        // Stable submitter identity: reused across reconnects so the server can
+        // re-attach this client to its unfinished tasks.
+        var clientId = localStorage.getItem("ffmpegd-client-id");
+        if (!clientId) {
+            clientId = "browser-" + Math.random().toString(36).slice(2, 10);
+            localStorage.setItem("ffmpegd-client-id", clientId);
+        }
+        clientIdEl.textContent = clientId;
+
+        // The server-assigned id of the task currently shown in the controls.
+        var currentTaskId = null;
+        var websocket = null;
+
         var payload = {
             "format": {
                 "container": "mp4",
@@ -79,55 +106,88 @@
 
         function init() {
             document.getElementById("payload").textContent = JSON.stringify(payload, null, 2);
-            document.getElementById("submit").addEventListener('click', onSubmit);
-            log = document.getElementById("log");
-            startWebSocket();
+            document.getElementById("submit").addEventListener("click", onSubmit);
+            document.getElementById("cancel").addEventListener("click", onCancel);
+            connect();
         }
 
-        function startWebSocket() {
-            websocket = new WebSocket(wsUri);
-            websocket.onopen = function(evt) { onOpen(evt) };
-            websocket.onclose = function(evt) { onClose(evt) };
-            websocket.onmessage = function(evt) { onMessage(evt) };
-            websocket.onerror = function(evt) { onError(evt) };
-        }
-
-        function onOpen(evt) {
-            writeToScreen("CONNECTED");
-        }
-
-        function onClose(evt) {
-            writeToScreen("DISCONNECTED");
+        function connect() {
+            statusEl.textContent = "connecting…";
+            websocket = new WebSocket(wsBase + "?clientId=" + encodeURIComponent(clientId));
+            websocket.onopen = function () {
+                statusEl.textContent = "connected";
+                // Also (re-)announce identity for connections opened without
+                // the query parameter, and ask for the owner's active tasks.
+                websocket.send(JSON.stringify({ type: "identify", clientId: clientId }));
+            };
+            websocket.onclose = function () {
+                statusEl.textContent = "disconnected — reconnecting in 1s…";
+                setTimeout(connect, 1000);
+            };
+            websocket.onmessage = onMessage;
+            websocket.onerror = function () { statusEl.textContent = "error"; };
         }
 
         function onMessage(evt) {
-            writeToScreen('<span style="color: blue;">RESPONSE: ' + evt.data + '</span>');
+            var m = JSON.parse(evt.data);
+            var phase = m.type || "message";
+            var who = m.submitter_id || m.owner || m.clientId || "";
+            var id = m.taskId || m.id || "";
+            writeToScreen(
+                '<span class="phase-' + escapeHtml(phase) + '">' + escapeHtml(phase) + "</span> " +
+                (id ? "task=<b>" + escapeHtml(id) + "</b> " : "") +
+                (who ? "owner=" + escapeHtml(who) + " " : "") +
+                (typeof m.percent === "number" ? m.percent + "% " : "") +
+                (m.err ? '<span style="color:#cf222e">' + escapeHtml(m.err) + "</span>" : "")
+            );
+
+            if (m.type === "accepted" || m.type === "snapshot") {
+                currentTaskId = m.taskId;
+                document.getElementById("cancel").disabled = false;
+            }
+            if (m.type === "completed" || m.type === "failed" || m.type === "cancelled") {
+                if (m.taskId === currentTaskId) {
+                    document.getElementById("cancel").disabled = true;
+                }
+            }
         }
 
-        function onError(evt) {
-            writeToScreen('<span style="color: red;">ERROR:</span> ' + evt.data);
-        }
-
-        function onSubmit(evt) {
+        function onSubmit() {
             var input = document.getElementById("input").value;
             var output = document.getElementById("output").value;
-            var payload = document.getElementById("payload").value;
-            sendPayload(input, output, payload);
+            var payloadText = document.getElementById("payload").value;
+            var clientTaskId = "ui-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
+            currentTaskId = null;
+            sendPayload(input, output, payloadText, clientTaskId);
+            document.getElementById("cancel").disabled = false;
         }
 
-        function sendPayload(input, output, payload) {
-            writeToScreen("SENT: " + JSON.stringify({ type: 'encode', input: input, output: output, payload: payload }));
-            websocket.send(JSON.stringify({
-                type: 'encode',
+        function onCancel() {
+            if (!currentTaskId) { return; }
+            websocket.send(JSON.stringify({ type: "cancel", taskId: currentTaskId }));
+        }
+
+        function sendPayload(input, output, payload, clientTaskId) {
+            var msg = {
+                type: "encode",
+                clientId: clientId,
+                clientTaskId: clientTaskId,
                 input: input,
                 output: output,
                 payload: payload
-            }));
+            };
+            writeToScreen("SENT encode " + JSON.stringify({ task: clientTaskId, input: input, output: output }));
+            websocket.send(JSON.stringify(msg));
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, function (ch) {
+                return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch];
+            });
         }
 
         function writeToScreen(message) {
             var pre = document.createElement("p");
-            pre.style.wordWrap = "break-word";
             pre.innerHTML = message;
             log.appendChild(pre);
         }

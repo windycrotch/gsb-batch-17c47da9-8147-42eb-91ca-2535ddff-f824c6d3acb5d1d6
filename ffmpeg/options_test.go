@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -378,13 +379,23 @@ func TestTwoPass(t *testing.T) {
 				return strings.ReplaceAll(s, "\\", "/")
 			}
 
+			// x265 receives its stats path through colon-separated
+			// -x265-params, so a Windows drive letter makes that path
+			// impossible and set2Pass intentionally omits it. Mirror that
+			// platform behaviour in the expectation.
+			wantFirst, wantSecond := tt.first, tt.second
+			if strings.Contains(filepath.ToSlash(e.logDir), ":") {
+				wantFirst = strings.ReplaceAll(wantFirst, ":stats=LOG/x265.log", "")
+				wantSecond = strings.ReplaceAll(wantSecond, ":stats=LOG/x265.log", "")
+			}
+
 			// Pass 1 writes to the null muxer, so it has no output file.
 			i := indexOf(passes[0], "-i")
-			if got := replace(passes[0][i+2:]); got != tt.first {
-				t.Errorf("pass 1:\ngot  %q\nwant %q", got, tt.first)
+			if got := replace(passes[0][i+2:]); got != wantFirst {
+				t.Errorf("pass 1:\ngot  %q\nwant %q", got, wantFirst)
 			}
-			if got := replace(optionArgs(t, passes[1])); got != tt.second {
-				t.Errorf("pass 2:\ngot  %q\nwant %q", got, tt.second)
+			if got := replace(optionArgs(t, passes[1])); got != wantSecond {
+				t.Errorf("pass 2:\ngot  %q\nwant %q", got, wantSecond)
 			}
 			if last := passes[1][len(passes[1])-1]; last != "out.mp4" {
 				t.Errorf("pass 2 output = %q", last)
