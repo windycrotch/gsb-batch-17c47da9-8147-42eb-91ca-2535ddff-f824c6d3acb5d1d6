@@ -193,22 +193,21 @@ func TestOggDecoder_Stream(t *testing.T) {
 	}
 	defer streamer.Close()
 
-	// Read some samples
+	// Read some samples. The synthetic audio packet is not a real Opus frame,
+	// so the codec rejects it: the streamer must surface that error and stop
+	// instead of emitting silence or looping.
 	samples := make([][2]float64, 1024)
-	n, ok := streamer.Stream(samples)
+	_, _ = streamer.Stream(samples)
 
-	// With our minimal test file, we may get 0 samples since
-	// the audio data is just zeros. Just verify no error.
-	if streamer.Err() != nil {
-		t.Errorf("Stream returned error: %v", streamer.Err())
+	if streamer.Err() == nil {
+		t.Error("expected a decode error for the synthetic packet, got nil")
 	}
-
-	// The decoder should return something or indicate end
-	_ = n
-	_ = ok
 }
 
 func TestOggDecoder_StreamUntilEnd(t *testing.T) {
+	// Real decoder behavior on valid data is covered by the Vorbis fixture
+	// and the fake-codec seek tests; here the synthetic Opus packet fails to
+	// decode and the streamer must end with that error rather than hang.
 	tf := createTestOpusFileWithDuration(t, 48000+312, 312)
 	r := &readSeekCloser{bytes.NewReader(tf.data)}
 
@@ -218,19 +217,16 @@ func TestOggDecoder_StreamUntilEnd(t *testing.T) {
 	}
 	defer streamer.Close()
 
-	// Read all samples
+	// Read until the streamer refuses more data.
 	samples := make([][2]float64, 256)
-	totalRead := 0
-	for {
-		n, ok := streamer.Stream(samples)
-		totalRead += n
-		if !ok {
+	for range 10 {
+		if _, ok := streamer.Stream(samples); !ok {
 			break
 		}
 	}
 
-	if streamer.Err() != nil {
-		t.Errorf("Unexpected error: %v", streamer.Err())
+	if streamer.Err() == nil {
+		t.Error("expected the undecodable synthetic packet to end the stream with an error")
 	}
 }
 

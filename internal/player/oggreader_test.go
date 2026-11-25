@@ -220,17 +220,23 @@ func writeOggPage(w *bytes.Buffer, granule int64, flags byte, serial, sequence u
 		bodyData = append(bodyData, pkt...)
 	}
 
-	// Write header
-	w.WriteString("OggS")
-	w.WriteByte(0) // version
-	w.WriteByte(flags)
-	_ = binary.Write(w, binary.LittleEndian, granule)
-	_ = binary.Write(w, binary.LittleEndian, serial)
-	_ = binary.Write(w, binary.LittleEndian, sequence)
-	_ = binary.Write(w, binary.LittleEndian, uint32(0)) // checksum placeholder
-	w.WriteByte(byte(len(segments)))
-	w.Write(segments)
-	w.Write(bodyData)
+	// Assemble the page with a zeroed checksum field first, then compute the
+	// RFC 3533 CRC over the complete page and patch it in.
+	header := make([]byte, 27+len(segments))
+	copy(header[0:4], "OggS")
+	header[4] = 0 // version
+	header[5] = flags
+	binary.LittleEndian.PutUint64(header[6:14], uint64(granule)) //nolint:gosec // test granule is non-negative
+	binary.LittleEndian.PutUint32(header[14:18], serial)
+	binary.LittleEndian.PutUint32(header[18:22], sequence)
+	// header[22:26] checksum stays zero
+	header[26] = byte(len(segments))
+	copy(header[27:], segments)
+
+	page := append(header, bodyData...)
+	checksum := oggChecksum(page)
+	binary.LittleEndian.PutUint32(page[22:26], checksum)
+	w.Write(page)
 }
 
 func TestNewOggReader(t *testing.T) {
@@ -372,11 +378,13 @@ func TestOggReader_SeekToGranule(t *testing.T) {
 		name        string
 		target      int64
 		wantGranule int64 // Expected granule of page we land on (≤ target)
+		wantEOF     bool  // A target at/past the last page converges on EOF
 	}{
-		{"seek to start", 0, 48000},            // First audio page
-		{"seek to 2 seconds", 96000, 96000},    // Exactly on page boundary
-		{"seek to 2.5 seconds", 120000, 96000}, // Between pages, land on earlier
-		{"seek to end", 240000, 240000},        // Last page
+		{"seek to start", 0, 48000, false},            // First audio page
+		{"seek to 2 seconds", 96000, 96000, false},    // Exactly on page boundary
+		{"seek to 2.5 seconds", 120000, 96000, false}, // Between pages, land on earlier
+		{"seek to end", 240000, 0, true},              // Last granule: converge to EOF
+		{"seek past end", 999999, 0, true},            // Beyond duration: converge to EOF
 	}
 
 	for _, tt := range tests {
@@ -386,6 +394,12 @@ func TestOggReader_SeekToGranule(t *testing.T) {
 			}
 
 			page, err := ogr.ReadPage()
+			if tt.wantEOF {
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("expected EOF after end-seek, got page=%v err=%v", page, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("ReadPage after seek failed: %v", err)
 			}

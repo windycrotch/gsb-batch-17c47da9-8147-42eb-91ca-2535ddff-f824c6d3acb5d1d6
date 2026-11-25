@@ -63,19 +63,14 @@ func TestOpusDecoder_Stream(t *testing.T) {
 	}
 	defer streamer.Close()
 
-	// Read some samples
+	// The synthetic audio packet is not a valid Opus frame: the streamer must
+	// surface the codec error instead of silently producing silence.
 	samples := make([][2]float64, 1024)
-	n, ok := streamer.Stream(samples)
+	_, _ = streamer.Stream(samples)
 
-	// With our minimal test file, we may get 0 samples since
-	// the audio data is just zeros. Just verify no error.
-	if streamer.Err() != nil {
-		t.Errorf("Stream returned error: %v", streamer.Err())
+	if streamer.Err() == nil {
+		t.Error("expected a decode error for the synthetic packet, got nil")
 	}
-
-	// The decoder should return something or indicate end
-	_ = n
-	_ = ok
 }
 
 func TestOpusDecoder_StreamUntilEnd(t *testing.T) {
@@ -88,19 +83,17 @@ func TestOpusDecoder_StreamUntilEnd(t *testing.T) {
 	}
 	defer streamer.Close()
 
-	// Read all samples
+	// The undecodable synthetic packet must end the stream with an error
+	// rather than loop forever emitting nothing.
 	samples := make([][2]float64, 256)
-	totalRead := 0
-	for {
-		n, ok := streamer.Stream(samples)
-		totalRead += n
-		if !ok {
+	for range 10 {
+		if _, ok := streamer.Stream(samples); !ok {
 			break
 		}
 	}
 
-	if streamer.Err() != nil {
-		t.Errorf("Unexpected error: %v", streamer.Err())
+	if streamer.Err() == nil {
+		t.Error("expected the undecodable synthetic packet to end the stream with an error")
 	}
 }
 

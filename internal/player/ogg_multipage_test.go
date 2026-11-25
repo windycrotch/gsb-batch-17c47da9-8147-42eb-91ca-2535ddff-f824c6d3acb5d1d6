@@ -254,14 +254,16 @@ func buildOggPageWithData(t *testing.T, serialNumber, sequenceNum uint32, segmen
 	binary.LittleEndian.PutUint32(page[14:18], serialNumber)
 	// Page sequence number (4 bytes)
 	binary.LittleEndian.PutUint32(page[18:22], sequenceNum)
-	// CRC checksum (4 bytes) - we skip validation so use 0
-	binary.LittleEndian.PutUint32(page[22:26], 0)
+	// CRC checksum (4 bytes) - computed below over the full page
 	// Number of segments (test data always has < 255 segments)
 	page[26] = uint8(len(segments)) //nolint:gosec // test data uses small segment counts
 	// Segment table
 	copy(page[27:27+len(segments)], segments)
 	// Body
 	copy(page[headerSize:], body)
+
+	// Patch in the RFC 3533 checksum (field is zero while computing).
+	binary.LittleEndian.PutUint32(page[22:26], oggChecksum(page))
 
 	return page
 }
