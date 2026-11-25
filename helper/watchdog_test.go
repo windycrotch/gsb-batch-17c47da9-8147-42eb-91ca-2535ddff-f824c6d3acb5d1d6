@@ -1,16 +1,12 @@
 package main
 
 import (
-	"os/exec"
 	"testing"
 	"time"
 )
 
 func TestWatchParentFires(t *testing.T) {
-	cmd := exec.Command("/bin/sleep", "30")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
+	cmd := startStubProcess(t, "sleep")
 	fired := make(chan struct{})
 	WatchParent(cmd.Process.Pid, func() { close(fired) })
 	cmd.Process.Kill()

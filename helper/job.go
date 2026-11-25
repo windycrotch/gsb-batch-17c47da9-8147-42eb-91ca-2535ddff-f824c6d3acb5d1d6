@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -170,9 +169,7 @@ func ProgressPct(outTimeUS int64, duration float64) float64 {
 func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 	done := make(chan error, 1)
 	cmd := exec.Command(c.FFmpeg, BuildArgs(c)...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	setProcAttr(cmd)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
@@ -219,17 +216,17 @@ func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 		close(finished)
 	}()
 
-	// stop signals ffmpeg's process group and returns only once ffmpeg has
-	// exited: the caller sweeps the output directory next, and a segment
-	// ffmpeg was still flushing would otherwise reappear after the sweep.
-	// ffmpeg honours SIGTERM within a fraction of a second; a process that
-	// ignores it is SIGKILLed after a grace period chosen to stay inside the
-	// 3s the `stop` subcommand's TakeOver waits for the old instance.
-	// Safe to call more than once and after done has fired.
+	// stop signals ffmpeg and returns only once ffmpeg has exited: the
+	// caller sweeps the output directory next, and a segment ffmpeg was
+	// still flushing would otherwise reappear after the sweep. ffmpeg
+	// honours SIGTERM within a fraction of a second; a process that ignores
+	// it is force-killed after a grace period chosen to stay inside the 3s
+	// the `stop` subcommand's TakeOver waits for the old instance. Safe to
+	// call more than once and after done has fired.
 	stop := func() {
 		// Only signal if job is still running
 		if jobDone.Load() == 0 {
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			terminateJob(cmd)
 			// Close stdout to help the scanner exit if it's still reading
 			if c, ok := stdout.(io.Closer); ok {
 				c.Close()
@@ -240,7 +237,7 @@ func RunJob(c JobConfig, out io.Writer) (func(), <-chan error) {
 			return
 		case <-time.After(2 * time.Second):
 		}
-		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		killJob(cmd)
 		select {
 		case <-finished:
 		case <-time.After(time.Second):

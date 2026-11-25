@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestServerMIMEAndRange(t *testing.T) {
@@ -15,7 +16,7 @@ func TestServerMIMEAndRange(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n"), 0o644)
 	os.WriteFile(filepath.Join(dir, "seg_0000.m4s"), []byte("0123456789"), 0o644)
 
-	port, shutdown, err := StartServer(dir, "", "", 0, "")
+	port, shutdown, _, err := StartServer(dir, "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,7 @@ func TestServerRewritesMasterPlaylist(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "master.m3u8"), []byte(master), 0o644)
 	os.WriteFile(filepath.Join(dir, "seg_0000.vtt"), []byte("WEBVTT\n"), 0o644)
 
-	port, shutdown, err := StartServer(dir, "English", "en", 0, "")
+	port, shutdown, _, err := StartServer(dir, "English", "en", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +88,7 @@ func TestServerRewritesMasterPlaylist(t *testing.T) {
 
 func TestServerMissingMasterFallsThrough(t *testing.T) {
 	dir := t.TempDir()
-	port, shutdown, err := StartServer(dir, "", "", 0, "")
+	port, shutdown, _, err := StartServer(dir, "", "", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +111,7 @@ func TestServerAddsVariantToIncompleteMaster(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "master.m3u8"), []byte(ffmpegMasterNoVariant), 0o644)
 
-	port, shutdown, err := StartServer(dir, "English", "en", 7_000_000, "")
+	port, shutdown, _, err := StartServer(dir, "English", "en", 7_000_000, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +142,7 @@ func TestServerAddsCodecsAndVideoRangeFromInitSegment(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "init.mp4"), hdrInit(0, 24000, 0), 0o644)
 	os.WriteFile(filepath.Join(dir, "seg_0000.m4s"), mediaSegment(traf(tfhd(1, 1001), trunDurations(1001, 1001))), 0o644)
 
-	port, shutdown, err := StartServer(dir, "English", "en", 7_000_000, "")
+	port, shutdown, _, err := StartServer(dir, "English", "en", 7_000_000, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +165,7 @@ func TestServerUsesRangeHintWithoutColr(t *testing.T) {
 		trak("soun", audioEntry("ec-3", 0)),
 	), 0o644)
 
-	port, shutdown, err := StartServer(dir, "English", "en", 7_000_000, "PQ")
+	port, shutdown, _, err := StartServer(dir, "English", "en", 7_000_000, "PQ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,4 +186,27 @@ func getBody(t *testing.T, url string) string {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return string(b)
+}
+
+// The idle timeout keys off server activity: every request must move the
+// clock, and a quiet server must not.
+func TestServerTracksActivity(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n"), 0o644)
+	port, shutdown, activity, err := StartServer(dir, "", "", 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown()
+
+	before := activity.Last()
+	time.Sleep(20 * time.Millisecond)
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/index.m3u8", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !activity.Last().After(before) {
+		t.Fatal("a request must bump the activity clock")
+	}
 }

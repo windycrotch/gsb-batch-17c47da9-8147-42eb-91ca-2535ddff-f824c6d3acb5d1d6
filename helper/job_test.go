@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -168,13 +167,6 @@ func TestProgressPct(t *testing.T) {
 	}
 }
 
-func writeStubFFmpeg(t *testing.T, script string) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "ffmpeg")
-	os.WriteFile(p, []byte("#!/bin/sh\n"+script), 0o755)
-	return p
-}
-
 func collectEvents(t *testing.T, buf *bytes.Buffer) []map[string]any {
 	t.Helper()
 	var evs []map[string]any
@@ -192,10 +184,9 @@ func collectEvents(t *testing.T, buf *bytes.Buffer) []map[string]any {
 }
 
 func TestRunJobEmitsProgressAndPackaged(t *testing.T) {
-	stub := writeStubFFmpeg(t,
-		`echo "out_time_us=2700000000"; echo "progress=continue"; echo "out_time_us=5400000000"; echo "progress=end"`)
+	useStub(t, "progress", t.TempDir())
 	c := baseCfg()
-	c.FFmpeg = stub
+	c.FFmpeg = stubPath(t)
 	var buf bytes.Buffer
 	_, done := RunJob(c, &buf)
 	if err := <-done; err != nil {
@@ -219,9 +210,9 @@ func TestRunJobEmitsProgressAndPackaged(t *testing.T) {
 }
 
 func TestRunJobFailureCarriesStderr(t *testing.T) {
-	stub := writeStubFFmpeg(t, `echo "Unknown encoder 'nope'" >&2; exit 1`)
+	useStub(t, "fail", t.TempDir())
 	c := baseCfg()
-	c.FFmpeg = stub
+	c.FFmpeg = stubPath(t)
 	var buf bytes.Buffer
 	_, done := RunJob(c, &buf)
 	err := <-done
@@ -231,9 +222,9 @@ func TestRunJobFailureCarriesStderr(t *testing.T) {
 }
 
 func TestRunJobStop(t *testing.T) {
-	stub := writeStubFFmpeg(t, `trap 'exit 0' TERM; sleep 30`)
+	useStub(t, "idle-cast", t.TempDir())
 	c := baseCfg()
-	c.FFmpeg = stub
+	c.FFmpeg = stubPath(t)
 	var buf bytes.Buffer
 	stop, done := RunJob(c, &buf)
 	time.Sleep(200 * time.Millisecond)
@@ -246,9 +237,9 @@ func TestRunJobStop(t *testing.T) {
 }
 
 func TestRunJobStopAfterDone(t *testing.T) {
-	stub := writeStubFFmpeg(t, `exit 0`)
+	useStub(t, "progress", t.TempDir())
 	c := baseCfg()
-	c.FFmpeg = stub
+	c.FFmpeg = stubPath(t)
 	var buf bytes.Buffer
 	stop, done := RunJob(c, &buf)
 	// Wait for job to complete
@@ -262,7 +253,8 @@ func TestRunJobStopAfterDone(t *testing.T) {
 
 func TestBuildArgsNoSubByteIdentical(t *testing.T) {
 	// Pin the exact no-subs command line: subtitle support must not disturb
-	// the proven recipe when no sub is configured (spec §2).
+	// the proven recipe when no sub is configured (spec §2). The output
+	// paths go through filepath.Join, so they follow the host's separator.
 	got := strings.Join(BuildArgs(baseCfg()), " ")
 	want := strings.Join([]string{
 		"-hide_banner", "-nostats", "-loglevel", "warning", "-y",
@@ -274,8 +266,8 @@ func TestBuildArgsNoSubByteIdentical(t *testing.T) {
 		"-f", "hls", "-hls_time", "6", "-hls_playlist_type", "event",
 		"-hls_segment_type", "fmp4", "-hls_flags", "independent_segments",
 		"-hls_fmp4_init_filename", "init.mp4",
-		"-hls_segment_filename", "/tmp/out/seg_%04d.m4s",
-		"/tmp/out/index.m3u8",
+		"-hls_segment_filename", filepath.Join("/tmp/out", "seg_%04d.m4s"),
+		filepath.Join("/tmp/out", "index.m3u8"),
 	}, " ")
 	if got != want {
 		t.Fatalf("no-subs args changed:\ngot:  %s\nwant: %s", got, want)
@@ -330,12 +322,11 @@ func TestHasSubAndPlaylistName(t *testing.T) {
 
 // stop() must not return until ffmpeg is gone: the caller sweeps the output
 // directory right after, and a segment ffmpeg is still flushing would come
-// back. A stub that ignores TERM (sleep inherits the ignored disposition)
-// proves the KILL escalation as well.
+// back. A stub that ignores TERM proves the force-kill escalation as well.
 func TestRunJobStopWaitsForExit(t *testing.T) {
-	stub := writeStubFFmpeg(t, `trap '' TERM; sleep 30`)
+	useStub(t, "ignore-term-cast", t.TempDir())
 	c := baseCfg()
-	c.FFmpeg = stub
+	c.FFmpeg = stubPath(t)
 	var buf bytes.Buffer
 	stop, done := RunJob(c, &buf)
 	time.Sleep(200 * time.Millisecond)

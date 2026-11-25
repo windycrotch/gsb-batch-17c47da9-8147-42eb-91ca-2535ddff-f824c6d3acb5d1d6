@@ -22,6 +22,17 @@ func init() {
 	mime.AddExtensionType(".vtt", "text/vtt")
 }
 
+// Activity records when anything was last pulled from the server. The
+// Apple TV polls the playlist constantly while it is watching, so a quiet
+// server after packaging has completed means an unwatched cast — the idle
+// timeout in main.go keys off this.
+type Activity struct{ last atomic.Int64 }
+
+func (a *Activity) touch() { a.last.Store(time.Now().UnixNano()) }
+
+// Last returns the time of the most recent request (server start if none).
+func (a *Activity) Last() time.Time { return time.Unix(0, a.last.Load()) }
+
 // StartServer serves dir. master.m3u8 is rewritten on the way out
 // (RewriteMasterPlaylist) so the subtitle rendition is on by default and
 // labeled with the real track name/language, and given a variant line
@@ -33,14 +44,17 @@ func init() {
 // Everything else is a plain file serve. subName/subLang/rangeHint may be
 // empty (no-subs casts never produce a master.m3u8, so the rewrite path
 // simply never runs for them).
-func StartServer(dir, subName, subLang string, bandwidth int, rangeHint string) (int, func(), error) {
+func StartServer(dir, subName, subLang string, bandwidth int, rangeHint string) (int, func(), *Activity, error) {
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
+	activity := &Activity{}
+	activity.touch()
 	files := http.FileServer(http.Dir(dir))
 	var warnedFrameRate atomic.Bool
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		activity.touch()
 		if r.URL.Path == "/master.m3u8" {
 			if b, rerr := os.ReadFile(filepath.Join(dir, "master.m3u8")); rerr == nil {
 				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -66,5 +80,5 @@ func StartServer(dir, subName, subLang string, bandwidth int, rangeHint string) 
 		defer cancel()
 		srv.Shutdown(ctx)
 	}
-	return ln.Addr().(*net.TCPAddr).Port, shutdown, nil
+	return ln.Addr().(*net.TCPAddr).Port, shutdown, activity, nil
 }
