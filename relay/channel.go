@@ -1,8 +1,8 @@
 package relay
 
 import (
+	"errors"
 	"log"
-
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -33,6 +33,9 @@ var (
 	)
 )
 
+// ErrChannelClosed is returned when interacting with a channel that has been torn down.
+var ErrChannelClosed = errors.New("channel closed")
+
 type UnsubscribeFunc func()
 
 type Channel struct {
@@ -41,6 +44,7 @@ type Channel struct {
 	subs       Subs
 	maxPackets uint
 	closed     chan struct{}
+	closeOnce  sync.Once
 
 	// statistics
 	clients atomic.Value
@@ -57,11 +61,13 @@ type Stats struct {
 	created time.Time
 }
 
-// Remove single subscriber
-func (subs Subs) Remove(sub chan *Buffer) Subs {
+// Remove removes a single subscriber, draining queued buffers back to the
+// pool before closing its delivery channel. It reports whether the subscriber
+// was present, so callers can keep their accounting idempotent.
+func (subs Subs) Remove(sub *Subscriber) (Subs, bool) {
 	idx := -1
 	for i := range subs {
-		if subs[i].ch == sub {
+		if subs[i] == sub {
 			idx = i
 			break
 		}
@@ -69,18 +75,18 @@ func (subs Subs) Remove(sub chan *Buffer) Subs {
 
 	// subscriber was already removed
 	if idx < 0 {
-		return subs
+		return subs, false
 	}
 
 	for {
 		select {
-		case buf := <-sub:
+		case buf := <-sub.ch:
 			if buf != nil {
 				buf.Release()
 			}
 		default:
-			close(sub)
-			return slices.Delete(subs, idx, idx+1)
+			close(sub.ch)
+			return slices.Delete(subs, idx, idx+1), true
 		}
 	}
 }
@@ -101,10 +107,16 @@ func NewChannel(name string, maxPackets uint) *Channel {
 	return ch
 }
 
-// Sub subscribes to a channel
-func (ch *Channel) Sub() (*Subscriber, UnsubscribeFunc) {
+// Sub subscribes to a channel. It fails once the channel has been closed so
+// that a torn-down channel can never accumulate new subscribers or metrics.
+func (ch *Channel) Sub() (*Subscriber, UnsubscribeFunc, error) {
 	ch.mutex.Lock()
 	defer ch.mutex.Unlock()
+
+	if ch.isClosed() {
+		return nil, nil, ErrChannelClosed
+	}
+
 	sub := &Subscriber{
 		ch:         make(chan *Buffer, ch.maxPackets),
 		chanClosed: ch.closed,
@@ -117,22 +129,43 @@ func (ch *Channel) Sub() (*Subscriber, UnsubscribeFunc) {
 		ch.mutex.Lock()
 		defer ch.mutex.Unlock()
 
-		// Channel already closed, just skip unsub
+		// Channel already closed: its teardown owns all remaining accounting.
 		if ch.subs == nil {
 			return
 		}
 
-		ch.subs = ch.subs.Remove(sub.ch)
+		// Idempotent: an overflow drop (or a previous unsubscribe) already
+		// removed this subscriber and accounted for it.
+		var removed bool
+		ch.subs, removed = ch.subs.Remove(sub)
+		if !removed {
+			return
+		}
 		ch.clients.Store(len(ch.subs))
 		ch.activeClients.Dec()
 	}
-	return sub, unsub
+	return sub, unsub, nil
+}
+
+func (ch *Channel) isClosed() bool {
+	select {
+	case <-ch.closed:
+		return true
+	default:
+		return false
+	}
 }
 
 // Pub publishes a packet to a channel
 func (ch *Channel) Pub(b *Buffer) {
 	ch.mutex.Lock()
 	defer ch.mutex.Unlock()
+
+	// A closed channel no longer delivers anything; the publisher relay has
+	// been torn down and queued buffers are reclaimed by Close.
+	if ch.isClosed() {
+		return
+	}
 
 	toRemove := make(Subs, 0, 5)
 	for i := range ch.subs {
@@ -149,26 +182,34 @@ func (ch *Channel) Pub(b *Buffer) {
 		}
 	}
 	for _, sub := range toRemove {
-		ch.subs = ch.subs.Remove(sub.ch)
-		ch.activeClients.Dec()
+		var removed bool
+		ch.subs, removed = ch.subs.Remove(sub)
+		if removed {
+			ch.activeClients.Dec()
+		}
 	}
 	ch.clients.Store(len(ch.subs))
 	b.Release()
 }
 
-// Close closes a channel
+// Close closes a channel. It is idempotent and safe to call concurrently:
+// subscribers are removed explicitly so queued buffers return to the pool and
+// all statistics settle at zero.
 func (ch *Channel) Close() {
-	ch.mutex.Lock()
-	defer ch.mutex.Unlock()
-	close(ch.closed)
-	// Remove subscribers explicitly to return queued buffers to the pool.
-	for len(ch.subs) > 0 {
-		ch.subs = ch.subs.Remove(ch.subs[0].ch)
-	}
-	ch.subs = nil
-	ch.clients.Store(0)
-	activeClients.DeleteLabelValues(ch.name)
-	channelCreatedTimestamp.DeleteLabelValues(ch.name)
+	ch.closeOnce.Do(func() {
+		ch.mutex.Lock()
+		defer ch.mutex.Unlock()
+
+		close(ch.closed)
+		// Remove subscribers explicitly to return queued buffers to the pool.
+		for len(ch.subs) > 0 {
+			ch.subs, _ = ch.subs.Remove(ch.subs[0])
+		}
+		ch.subs = nil
+		ch.clients.Store(0)
+		activeClients.DeleteLabelValues(ch.name)
+		channelCreatedTimestamp.DeleteLabelValues(ch.name)
+	})
 }
 
 func (ch *Channel) Stats() Stats {

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestChannel_PubSub(t *testing.T) {
@@ -14,7 +16,10 @@ func TestChannel_PubSub(t *testing.T) {
 	expected := []byte{1, 2, 3, 4}
 
 	// sub
-	out, unsub := ch.Sub()
+	out, unsub, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
 	data := pool.Get()
 	copy(data.Bytes(), expected)
 	data.Resize(4)
@@ -46,7 +51,10 @@ func TestChannel_PubSub(t *testing.T) {
 func TestChannel_DropOnOverflow(t *testing.T) {
 	ch := NewChannel("test", uint(1316*50))
 
-	sub, _ := ch.Sub()
+	sub, _, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
 	capacity := cap(sub.ch) + 1
 	pool := NewBufferPool(1)
 
@@ -70,8 +78,14 @@ func TestChannel_DropOnOverflow(t *testing.T) {
 
 func TestChannel_Close(t *testing.T) {
 	ch := NewChannel("test", 1)
-	sub1, _ := ch.Sub()
-	_, _ = ch.Sub()
+	sub1, _, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got := len(ch.subs); got != 2 {
 		t.Fatalf("Expected 2 subscribers on channel, got %d", got)
@@ -93,9 +107,13 @@ func TestChannel_Close(t *testing.T) {
 
 func TestChannel_UnsubscribeAfterClose(t *testing.T) {
 	ch := NewChannel("test", 0)
-	_, unsubscribe := ch.Sub()
+	_, unsubscribe, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ch.Close()
+	unsubscribe()
 	unsubscribe()
 
 	if got := ch.Stats().clients; got != 0 {
@@ -106,13 +124,122 @@ func TestChannel_UnsubscribeAfterClose(t *testing.T) {
 	}
 }
 
+func TestChannel_CloseIsIdempotent(t *testing.T) {
+	ch := NewChannel("test", 1)
+	sub, unsubscribe, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Repeated and concurrent closes must not panic on close(closed).
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ch.Close()
+		}()
+	}
+	wg.Wait()
+	ch.Close()
+
+	if _, err := sub.Read(); err == nil {
+		t.Error("Subscriber channel should be closed after Close")
+	}
+	// Unsubscribing after a completed teardown must stay a no-op.
+	unsubscribe()
+}
+
+func TestChannel_SubscribeAfterCloseFails(t *testing.T) {
+	ch := NewChannel("test", 1)
+	ch.Close()
+
+	sub, unsub, err := ch.Sub()
+	if err != ErrChannelClosed {
+		t.Fatalf("Sub after close: got err=%v sub=%v, want ErrChannelClosed", err, sub)
+	}
+	if unsub != nil {
+		t.Error("Sub after close should not return an unsubscribe function")
+	}
+	// No phantom subscribers or metrics may be created on the closed channel.
+	if ch.subs != nil {
+		t.Errorf("Expected nil subscribers slice, got len=%d", len(ch.subs))
+	}
+	if got := ch.Stats().clients; got != 0 {
+		t.Errorf("Expected 0 clients after failed Sub, got %d", got)
+	}
+}
+
+func TestChannel_OverflowDropThenUnsubscribeIdempotent(t *testing.T) {
+	ch := NewChannel("test", 1)
+	pool := NewBufferPool(1)
+
+	sub, unsub, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Overflow the subscriber queue so Pub drops it and decrements the gauge.
+	for range cap(sub.ch) + 1 {
+		buf := pool.Get()
+		buf.Resize(0)
+		ch.Pub(buf)
+	}
+
+	if got := len(ch.subs); got != 0 {
+		t.Fatalf("expected no remaining subscribers after overflow, got %d", got)
+	}
+	if got := ch.Stats().clients; got != 0 {
+		t.Errorf("expected 0 clients after overflow drop, got %d", got)
+	}
+	if got := testutil.ToFloat64(ch.activeClients); got != 0 {
+		t.Errorf("gauge after overflow drop: got %v, want 0", got)
+	}
+
+	// The dropped client's later (and repeated) cancellation must not go
+	// negative or touch the slice.
+	unsub()
+	unsub()
+	if got := testutil.ToFloat64(ch.activeClients); got != 0 {
+		t.Errorf("gauge after late unsubscribe: got %v, want 0", got)
+	}
+}
+
+func TestChannel_CloseDrainsQueuedBuffers(t *testing.T) {
+	ch := NewChannel("test", 4)
+	pool := NewBufferPool(1)
+
+	sub, _, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Queue buffers without consuming them.
+	for range 3 {
+		buf := pool.Get()
+		buf.Resize(0)
+		ch.Pub(buf)
+	}
+
+	ch.Close()
+
+	// Delivery channel is closed and every queued buffer was released back
+	// to the pool; reads return an error instead of returning recycled data.
+	if _, err := sub.Read(); err == nil {
+		t.Error("expected subscriber read to fail after close")
+	}
+}
+
 func TestChannel_Stats(t *testing.T) {
 	ch := NewChannel("test", 0)
 	if num := ch.Stats().clients; num != 0 {
 		t.Errorf("Expected 0 clients after create, got %d", num)
 	}
 
-	_, unsubscribe := ch.Sub()
+	_, unsubscribe, err := ch.Sub()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if num := ch.Stats().clients; num != 1 {
 		t.Errorf("Expected 1 clients after subscribe, got %d", num)
 	}
@@ -150,7 +277,10 @@ func TestChannel_PubMultipleSubscribers(t *testing.T) {
 	}
 
 	for range numReaders {
-		sub, _ := ch.Sub()
+		sub, _, err := ch.Sub()
+		if err != nil {
+			t.Fatal(err)
+		}
 		go readAndRelease(sub)
 	}
 

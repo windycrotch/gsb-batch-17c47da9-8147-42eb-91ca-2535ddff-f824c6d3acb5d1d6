@@ -42,7 +42,7 @@ func TestServerImpl_GetStatistics(t *testing.T) {
 			}, PublicAddress: "testserver.de:1337",
 		},
 	}
-	if _, err := r.Publish("s1"); err != nil {
+	if _, _, err := r.Publish("s1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := r.Subscribe("s1"); err != nil {
@@ -143,5 +143,133 @@ func TestPublish(t *testing.T) {
 	wg.Wait()
 	if wr.numWritten != 100 {
 		t.Errorf("Wrong number of packets written: got %d, expected %d", wr.numWritten, 100)
+	}
+}
+
+// TestPublishReconnect exercises the full observable lifecycle through the
+// server's own handlers: publisher disconnect releases the stream, the old
+// player observes upstream closure and exits, a replacement publisher reclaims
+// the same name, and a new player receives its data.
+func TestPublishReconnect(t *testing.T) {
+	s := NewServer(&Config{
+		Server: ServerConfig{PacketSize: 1316},
+		Relay:  relay.RelayConfig{BufferSize: 50, PacketSize: 1316},
+	})
+
+	id, err := stream.NewStreamID("test", "", stream.ModePublish)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First publisher plus a player that joins mid-stream.
+	pub1 := testSocket{ch: make(chan []byte)}
+	player1 := testSocket{}
+
+	var pubWg sync.WaitGroup
+	pubWg.Add(1)
+	go func() {
+		defer pubWg.Done()
+		if err := s.publish(&srtConn{
+			log:      slog.Default(),
+			socket:   &pub1,
+			streamid: id,
+		}); err != io.EOF {
+			t.Error("first publisher error", err)
+		}
+	}()
+
+	var playerWg sync.WaitGroup
+	go func() {
+		// Wait for the first publisher to register before subscribing,
+		// mirroring a real client joining an existing stream.
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && !s.relay.ChannelExists("test") {
+			time.Sleep(time.Millisecond)
+		}
+		playerWg.Add(1)
+		defer playerWg.Done()
+		if err := s.play(&srtConn{
+			log:      slog.Default(),
+			socket:   &player1,
+			streamid: id,
+		}); err != nil {
+			t.Error("first player error", err)
+		}
+	}()
+
+	// Send a first batch, then the publisher connection drops (read EOF).
+	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 50; i++ {
+		pub1.ch <- []byte{1, 2, 3, 4}
+		time.Sleep(1 * time.Millisecond)
+	}
+	close(pub1.ch)
+	pubWg.Wait()
+
+	// Teardown is synchronous inside publish(): the name is free immediately.
+	if s.relay.ChannelExists("test") {
+		t.Fatal("stream should be released after publisher disconnect")
+	}
+
+	// The old player must terminate on upstream closure rather than hang.
+	done := make(chan struct{})
+	go func() {
+		playerWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old player did not disconnect after publisher teardown")
+	}
+	if player1.numWritten != 50 {
+		t.Errorf("old player packets: got %d, expected 50", player1.numWritten)
+	}
+
+	// A replacement publisher claims the same name without being rejected.
+	pub2 := testSocket{ch: make(chan []byte)}
+	player2 := testSocket{}
+
+	pubWg.Add(1)
+	go func() {
+		defer pubWg.Done()
+		if err := s.publish(&srtConn{
+			log:      slog.Default(),
+			socket:   &pub2,
+			streamid: id,
+		}); err != io.EOF {
+			t.Error("second publisher error", err)
+		}
+	}()
+
+	// Give the replacement publisher time to register before playing.
+	time.Sleep(50 * time.Millisecond)
+	if !s.relay.ChannelExists("test") {
+		t.Fatal("stream should exist after replacement publisher connected")
+	}
+
+	playerWg.Add(1)
+	go func() {
+		defer playerWg.Done()
+		if err := s.play(&srtConn{
+			log:      slog.Default(),
+			socket:   &player2,
+			streamid: id,
+		}); err != nil {
+			t.Error("second player error", err)
+		}
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 75; i++ {
+		pub2.ch <- []byte{5, 6, 7, 8}
+		time.Sleep(1 * time.Millisecond)
+	}
+	close(pub2.ch)
+	pubWg.Wait()
+
+	playerWg.Wait()
+	if player2.numWritten != 75 {
+		t.Errorf("new player packets: got %d, expected 75", player2.numWritten)
 	}
 }

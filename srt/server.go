@@ -258,11 +258,14 @@ func (s *Server) play(conn *srtConn) error {
 
 // publish a stream to the server
 func (s *Server) publish(conn *srtConn) error {
-	pub, err := s.relay.Publish(conn.streamid.Name())
+	pub, unpublish, err := s.relay.Publish(conn.streamid.Name())
 	if err != nil {
 		return err
 	}
-	defer close(pub)
+	// Tear down synchronously on any return (clean EOF or read error): when
+	// this call completes the stream name is released and old subscribers
+	// have been notified of upstream closure.
+	defer unpublish()
 	conn.log.Info("publish")
 
 	for {
