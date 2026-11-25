@@ -26,8 +26,9 @@ func (self *playerManger) DelPlayer(objid string) {
 	delete(self.PlayerMap, objid)
 }
 
+// Close 在关停保存完成后清空内存中的玩家索引。
+// 真正的同步落库由 session.Manager.Shutdown 统一完成，
+// 这里不再重复保存，避免同一玩家被写两次。
 func (self *playerManger) Close() {
-	for _, player := range self.PlayerMap {
-		player.SaveSync()
-	}
+	self.PlayerMap = make(map[string]*Player)
 }

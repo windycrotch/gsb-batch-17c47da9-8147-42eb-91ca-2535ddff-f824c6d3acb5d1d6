@@ -1,9 +1,9 @@
 package internal
 
 import (
-	"runtime/debug"
 	"reflect"
-	
+	"runtime/debug"
+
 	"leaf_server/base"
 	"leaf_server/msg"
 
@@ -38,8 +38,15 @@ func onClientMsg(args []interface{}) {
 	}
 
 	account := udata.(*base.AccountInfo)
+	// 被顶替或已下线的连接不得再处理该玩家的业务消息，
+	// 防止旧连接迟到的消息改动新会话的数据。
+	if !SessionMgr.IsCurrent(account.ObjID, &agentConn{agent: a}) {
+		log.Error("agent is no longer the active session:", account.Account, " ", account.ObjID)
+		return
+	}
+
 	player := PlayerManager.Get(account.ObjID)
-	if nil == player {
+	if nil == player || !player.IsActive() {
 		log.Error("player isn't online:", account.Account, " ", account.ObjID)
 		return
 	}

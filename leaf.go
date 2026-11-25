@@ -6,9 +6,10 @@ import (
 	"github.com/name5566/leaf/console"
 	"github.com/name5566/leaf/log"
 	"github.com/name5566/leaf/module"
+	serverconf "leaf_server/conf"
+	"leaf_server/oss"
 	"os"
 	"os/signal"
-	"leaf_server/oss"
 )
 
 func Run(mods ...module.Module) {
@@ -22,7 +23,7 @@ func Run(mods ...module.Module) {
 		defer logger.Close()
 	}
 
-	osslogger, err := oss.NewLogger("udp", conf.OssLogAddr, "test")
+	osslogger, err := oss.NewLogger("udp", serverconf.Server.OssLogAddr, "test")
 	if nil != err {
 		log.Error("init oss logger failed:", err.Error())
 		return
@@ -30,7 +31,6 @@ func Run(mods ...module.Module) {
 	oss.Export(osslogger)
 	defer oss.Close()
 
-	
 	log.Release("starting up")
 
 	// module
