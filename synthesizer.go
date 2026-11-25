@@ -2,6 +2,7 @@ package xm
 
 import (
 	"errors"
+	"io"
 
 	"github.com/quasilyte/xm/xmfile"
 )
@@ -15,6 +16,12 @@ import (
 type Synthesizer struct {
 	stream       *Stream
 	noteCompiler *moduleCompiler
+
+	// trialTempo is the number of ticks per row for the current trial.
+	// It's re-applied after a rewind, since the stream otherwise falls
+	// back to the module default tempo.
+	// A zero value means "no trial is prepared".
+	trialTempo int
 }
 
 type SynthesizerInstruments struct {
@@ -68,7 +75,6 @@ func (s *Synthesizer) SetInstruments(is *SynthesizerInstruments) error {
 		return errors.New("mismatching channel count")
 	}
 
-	s.stream.activeChannels = s.stream.activeChannels[:0]
 	s.stream.assignCompiledModule(is.instOnly)
 
 	return nil
@@ -81,8 +87,13 @@ func (s *Synthesizer) SetInstruments(is *SynthesizerInstruments) error {
 // the module re-compilation.
 // The instruments are only compatible if the number of channels is matching.
 func (s *Synthesizer) GetInstruments() *SynthesizerInstruments {
+	instOnly := s.stream.module
+	// Don't share the per-play trial data (effect and note tables)
+	// with the snapshot; they're overwritten by every PlayNote call.
+	instOnly.effectTab = nil
+	instOnly.noteTab = nil
 	return &SynthesizerInstruments{
-		instOnly:    s.stream.module,
+		instOnly:    instOnly,
 		numChannels: len(s.stream.channels),
 	}
 }
@@ -99,8 +110,6 @@ func (s *Synthesizer) GetInstruments() *SynthesizerInstruments {
 // is only interested in instruments (and samples).
 func (s *Synthesizer) LoadInstruments(m *xmfile.Module, config LoadModuleConfig) error {
 	s.stream.applyConfigDefaults(m, &config)
-
-	s.stream.activeChannels = s.stream.activeChannels[:0]
 
 	instOnly, err := s.compileModuleInstruments(m, config)
 	if err != nil {
@@ -151,37 +160,68 @@ func (s *Synthesizer) compileModuleInstruments(m *xmfile.Module, config LoadModu
 }
 
 func (s *Synthesizer) prepareToPlay(duration float64) {
-	s.noteCompiler.reset(&s.stream.module)
+	// Start every trial from a clean state. rewind() drops the channel
+	// runtime state (volumes, panning, envelopes, sample positions,
+	// vibrato/arpeggio/portamento/effect values), the stream position,
+	// the global volume and the timing values.
+	s.stream.rewind()
 
+	// Clear the per-trial tables as well. The effect table must be
+	// rebuilt from scratch, since the effect keys of the compiled
+	// notes index into it.
+	s.noteCompiler.reset(&s.stream.module)
 	s.stream.module.effectTab = s.stream.module.effectTab[:0]
 	s.stream.module.noteTab = s.stream.module.noteTab[:0]
 
 	if duration == 0 {
-		s.stream.setTempo(240)
+		s.trialTempo = 240
 	} else {
-		s.stream.setTempo(1 + int(ticksPerSecond(s.stream.bpm)*duration))
+		s.trialTempo = 1 + int(ticksPerSecond(s.stream.bpm)*duration)
+	}
+	s.stream.setTempo(s.trialTempo)
+}
+
+// rewindTrialRewind rewinds the underlying stream and re-applies the
+// current trial tempo, so that a single trial can be replayed with the
+// same timing as when it was prepared by PlayNote.
+func (s *Synthesizer) rewindTrial() {
+	s.stream.Rewind()
+	if s.trialTempo != 0 {
+		s.stream.setTempo(s.trialTempo)
 	}
 }
 
 // PlayNote plays one or more notes up to the specified duration.
 // Using 0 for the duration will play it for several seconds.
+//
+// Every note is assigned to its own channel, in the order they were
+// passed. Notes that don't fit into the configured number of channels
+// are ignored. Any trial state left by the previous PlayNote call is
+// discarded before the new notes are prepared.
 func (s *Synthesizer) PlayNote(duration float64, notes ...xmfile.PatternNote) error {
 	s.prepareToPlay(duration)
 
+	numChannels := len(s.stream.channels)
 	chansUsed := 0
 	for _, note := range notes {
+		if chansUsed >= numChannels {
+			// Too many notes: the remaining ones are ignored.
+			break
+		}
 		n, _, err := s.noteCompiler.compileNote(note)
 		if err != nil {
+			// Keep the stream in a consistent silent state instead of
+			// leaving a half-compiled effect table behind.
+			s.clearTrialNotes()
 			return err
 		}
 		s.stream.module.noteTab = append(s.stream.module.noteTab, n)
 		chansUsed++
-		if chansUsed >= len(s.stream.channels) {
-			break
-		}
 	}
 
-	for chansUsed < len(s.stream.channels) {
+	// Every channel must have a note entry, even if there is no note
+	// for it; otherwise the pattern data would index out of bounds.
+	for chansUsed < numChannels {
 		s.stream.module.noteTab = append(s.stream.module.noteTab, patternNote{})
 		chansUsed++
 	}
@@ -189,14 +229,31 @@ func (s *Synthesizer) PlayNote(duration float64, notes ...xmfile.PatternNote) er
 	return nil
 }
 
+// clearTrialNotes replaces the trial notes with silent ones so the
+// stream can be read safely after a failed PlayNote call.
+func (s *Synthesizer) clearTrialNotes() {
+	s.stream.module.effectTab = s.stream.module.effectTab[:0]
+	s.stream.module.noteTab = s.stream.module.noteTab[:0]
+	for i := 0; i < len(s.stream.channels); i++ {
+		s.stream.module.noteTab = append(s.stream.module.noteTab, patternNote{})
+	}
+}
+
 func (s *Synthesizer) Read(b []byte) (int, error) {
 	return s.stream.Read(b)
 }
 
 func (s *Synthesizer) Rewind() {
-	s.stream.Rewind()
+	s.rewindTrial()
 }
 
 func (s *Synthesizer) Seek(offset int64, whence int) (int64, error) {
-	return s.stream.Seek(offset, whence)
+	if whence == io.SeekStart && offset == 0 {
+		s.rewindTrial()
+		return 0, nil
+	}
+	if whence == io.SeekCurrent && offset == 0 {
+		return int64(s.stream.bytePos), nil
+	}
+	return 0, errors.New("unsupported Seek call")
 }

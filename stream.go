@@ -171,6 +171,25 @@ func (s *Stream) assignCompiledModule(m module) {
 
 	// Call a rewind() that won't trigger a Sync event.
 	s.rewind()
+
+	// The stream now starts a brand new playback session, so tell the
+	// event handler that its time counter should restart from zero.
+	// The event must not carry the previous module's time.
+	s.notifyReset()
+}
+
+// notifyReset reports to the event handler that the stream timeline
+// has been restarted. Both the event time and its data are zero,
+// describing the new state of the stream.
+func (s *Stream) notifyReset() {
+	if s.settings.eventHandler == nil {
+		return
+	}
+	s.settings.eventHandler(StreamEvent{
+		Kind:  EventSync,
+		Time:  0,
+		value: math.Float64bits(0),
+	})
 }
 
 // LoadModule assigns a new XM module to this stream.
@@ -178,6 +197,9 @@ func (s *Stream) assignCompiledModule(m module) {
 // Loading a module involves its compilation which is a slow process.
 // You want to load modules as rarely as possible (preferably exactly once)
 // and then play them via streams without ever releasing the memory.
+//
+// If the module can't be loaded, this stream keeps playing the previously
+// loaded module (if any); no partially initialized state is left behind.
 func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 	s.applyConfigDefaults(m, &config)
 
@@ -185,13 +207,8 @@ func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 		return errors.New("unsupported sample rate (only 44100 is supported)")
 	}
 
-	if cap(s.channels) < m.NumChannels {
-		s.channels = make([]streamChannel, m.NumChannels)
-		s.activeChannels = make([]*streamChannel, m.NumChannels)
-	}
-	s.channels = s.channels[:m.NumChannels]
-	s.activeChannels = s.activeChannels[:0]
-
+	// Compile the module before touching the stream state.
+	// A compilation error must leave the currently playing module intact.
 	compiled, err := compileModule(m, moduleConfig{
 		sampleRate: config.SampleRate,
 		bpm:        config.BPM,
@@ -202,9 +219,25 @@ func (s *Stream) LoadModule(m *xmfile.Module, config LoadModuleConfig) error {
 		return err
 	}
 
+	s.setChannelCount(m.NumChannels)
 	s.assignCompiledModule(compiled)
 
 	return nil
+}
+
+// setChannelCount prepares the channel arrays for a module with n channels.
+// The channels themselves are (re)initialized by rewind().
+func (s *Stream) setChannelCount(n int) {
+	if cap(s.channels) < n {
+		s.channels = make([]streamChannel, n)
+	} else {
+		s.channels = s.channels[:n]
+	}
+	if cap(s.activeChannels) < n {
+		s.activeChannels = make([]*streamChannel, 0, n)
+	} else {
+		s.activeChannels = s.activeChannels[:0]
+	}
 }
 
 func (s *Stream) applyConfigDefaults(m *xmfile.Module, config *LoadModuleConfig) {
@@ -293,14 +326,12 @@ func (s *Stream) Read(b []byte) (int, error) {
 // Rewind prepares the stream to play the module right from the start.
 // Doing rewind is relatively cheap.
 func (s *Stream) Rewind() {
-	if s.settings.eventHandler != nil {
-		s.settings.eventHandler(StreamEvent{
-			Kind:  EventSync,
-			Time:  s.t,
-			value: math.Float64bits(0),
-		})
-	}
 	s.rewind()
+
+	// The stream is back at its start, so the sync event is reported
+	// at time 0. Reporting the pre-rewind timestamp would leak the
+	// old playback session's time to the caller.
+	s.notifyReset()
 }
 
 func (s *Stream) rewind() {
@@ -315,6 +346,10 @@ func (s *Stream) rewind() {
 
 	// Now initialize the player to the "ready to start" state.
 	// This code is used as a final part of the constructor as well.
+
+	// Drop any channels that were active in the previous playback session.
+	// The slice itself is retained so its capacity is reused.
+	s.activeChannels = s.activeChannels[:0]
 
 	for i := range s.channels {
 		ch := &s.channels[i]
@@ -334,14 +369,20 @@ func (s *Stream) rewind() {
 }
 
 func (s *Stream) setTempo(tempo int) {
-	s.module.ticksPerRow = tempo
-	s.secondsPerRow = calcSecondsPerRow(s.module.ticksPerRow, s.bpm)
+	// Note: don't write into s.module.ticksPerRow here.
+	// The module object is shared between all streams that were loaded
+	// from the same compiled module, so modifying it would leak the
+	// tempo of one stream (or a synthesizer trial) into another one.
+	s.ticksPerRow = tempo
+	s.secondsPerRow = calcSecondsPerRow(s.ticksPerRow, s.bpm)
 }
 
 func (s *Stream) setBPM(bpm float64) {
 	s.bpm = bpm
 	s.samplesPerTick, s.bytesPerTick = calcSamplesPerTick(s.module.sampleRate, s.bpm)
-	s.secondsPerRow = calcSecondsPerRow(s.module.ticksPerRow, s.bpm)
+	// Use the stream tempo, not the module default: the tempo may have been
+	// changed by the playback (or by a synthesizer trial) since the rewind.
+	s.secondsPerRow = calcSecondsPerRow(s.ticksPerRow, s.bpm)
 }
 
 // GetInfo returns stream-related info.
