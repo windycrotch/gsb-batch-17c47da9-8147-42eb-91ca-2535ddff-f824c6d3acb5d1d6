@@ -24,6 +24,7 @@ The server extracts the audio using yt-dlp, converts it to MP3 via ffmpeg, and s
 - Converts to MP3 for maximum receiver compatibility (WiiM, Sonos, etc.)
 - Chunked transfer for long content (6h+ streams tested)
 - Minimal resource usage - pipes directly, no disk storage
+- Configurable limit on concurrent streams, with `503` rejection when busy
 - Single binary with yt-dlp and ffmpeg as runtime dependencies
 
 ## Installation
@@ -74,6 +75,9 @@ go build -o yt-dlp-restream .
 
 # Custom yt-dlp path
 ./yt-dlp-restream -ytdlp /usr/local/bin/yt-dlp
+
+# Cap concurrent streams (default 2)
+./yt-dlp-restream -max-sessions 4
 ```
 
 ### Stream Audio
@@ -96,6 +100,29 @@ curl http://localhost:8080/health
 |------|---------------------|---------|-------------|
 | `-port` | `PORT` | `8080` | Server port |
 | `-ytdlp` | `YTDLP_PATH` | `yt-dlp` | Path to yt-dlp binary |
+| `-max-sessions` | `MAX_STREAMS` | `2` | Maximum number of concurrent streaming sessions |
+
+For every option the command-line flag takes precedence over the environment
+variable, which takes precedence over the default (same rule as `-port`/`PORT`).
+
+### Concurrent Session Limit
+
+Each active stream runs a yt-dlp and an ffmpeg subprocess, so the server caps
+how many can run at once. When the cap is reached, a new request to `/stream`
+is rejected immediately with `503 Service Unavailable` and a plain-text body
+explaining that the server is busy — before any subprocess is started. Already
+running streams are not affected. A session's slot is released as soon as the
+stream ends, whether it finishes normally, the client disconnects, or the
+upstream extractor fails. `HEAD` requests reserve a slot for the duration of
+the probe but do not start any process.
+
+```bash
+# Allow up to 4 concurrent streams
+./yt-dlp-restream -max-sessions 4
+
+# Or via environment
+MAX_STREAMS=4 ./yt-dlp-restream
+```
 
 ## API Endpoints
 
@@ -109,6 +136,8 @@ Streams audio from the specified URL.
 **Response:**
 - `Content-Type: audio/mpeg`
 - Chunked transfer encoding
+- `503 Service Unavailable` (plain text, with `Retry-After`) when the concurrent
+  session limit is reached; no subprocess is started for a rejected request
 
 **Example:**
 ```bash

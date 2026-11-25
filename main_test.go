@@ -111,7 +111,7 @@ func TestServerRoutes(t *testing.T) {
 	ytdlp := &YtDlp{Path: "yt-dlp"}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", NewStreamHandler(ytdlp))
+	mux.HandleFunc("/stream", NewStreamHandler(ytdlp, nil))
 	mux.HandleFunc("/health", HealthHandler)
 
 	server := httptest.NewServer(mux)
@@ -163,7 +163,7 @@ func TestServerConfiguration(t *testing.T) {
 	ytdlp := &YtDlp{Path: "yt-dlp"}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", NewStreamHandler(ytdlp))
+	mux.HandleFunc("/stream", NewStreamHandler(ytdlp, nil))
 	mux.HandleFunc("/health", HealthHandler)
 
 	server := &http.Server{
@@ -187,7 +187,7 @@ func TestServerGracefulShutdown(t *testing.T) {
 	ytdlp := &YtDlp{Path: "yt-dlp"}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", NewStreamHandler(ytdlp))
+	mux.HandleFunc("/stream", NewStreamHandler(ytdlp, nil))
 	mux.HandleFunc("/health", HealthHandler)
 
 	server := httptest.NewServer(mux)
@@ -213,7 +213,7 @@ func TestServerWithContext(t *testing.T) {
 	ytdlp := &YtDlp{Path: "yt-dlp"}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", NewStreamHandler(ytdlp))
+	mux.HandleFunc("/stream", NewStreamHandler(ytdlp, nil))
 	mux.HandleFunc("/health", HealthHandler)
 
 	server := &http.Server{
@@ -311,7 +311,7 @@ func TestIntegration_FullServer(t *testing.T) {
 	ytdlp := &YtDlp{Path: "yt-dlp"}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", NewStreamHandler(ytdlp))
+	mux.HandleFunc("/stream", NewStreamHandler(ytdlp, nil))
 	mux.HandleFunc("/health", HealthHandler)
 
 	server := httptest.NewServer(mux)

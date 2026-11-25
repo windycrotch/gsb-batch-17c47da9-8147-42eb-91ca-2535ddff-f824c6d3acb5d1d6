@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os/exec"
+	"sync"
 )
 
 // YtDlp wraps yt-dlp binary execution.
@@ -18,6 +19,8 @@ type StreamResult struct {
 	ytdlp  *exec.Cmd
 	ffmpeg *exec.Cmd
 	cancel context.CancelFunc
+
+	closeOnce sync.Once
 }
 
 // Stream starts yt-dlp piped to ffmpeg and returns a reader for the MP3 stream.
@@ -88,18 +91,25 @@ func (y *YtDlp) Stream(ctx context.Context, url string) (*StreamResult, error) {
 }
 
 // Close terminates both processes and cleans up.
+//
+// Close is idempotent: repeated calls are safe and the processes are only
+// killed and reaped once.
 func (s *StreamResult) Close() error {
-	s.cancel()
-	if s.Stdout != nil {
-		s.Stdout.Close()
-	}
-	if s.ytdlp != nil && s.ytdlp.Process != nil {
-		s.ytdlp.Process.Kill()
-		s.ytdlp.Wait()
-	}
-	if s.ffmpeg != nil && s.ffmpeg.Process != nil {
-		s.ffmpeg.Process.Kill()
-		s.ffmpeg.Wait()
-	}
+	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.Stdout != nil {
+			s.Stdout.Close()
+		}
+		if s.ytdlp != nil && s.ytdlp.Process != nil {
+			s.ytdlp.Process.Kill()
+			s.ytdlp.Wait()
+		}
+		if s.ffmpeg != nil && s.ffmpeg.Process != nil {
+			s.ffmpeg.Process.Kill()
+			s.ffmpeg.Wait()
+		}
+	})
 	return nil
 }
