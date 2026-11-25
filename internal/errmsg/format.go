@@ -1,0 +1,118 @@
+// Package errmsg provides consistent error formatting for user-facing messages.
+package errmsg
+
+import "fmt"
+
+// Op represents an operation that can fail.
+type Op string
+
+// Operation constants - grouped by domain.
+const (
+	// Library operations
+	OpLibraryDelete  Op = "delete track from library"
+	OpLibraryScan    Op = "scan library"
+	OpLibraryLoad    Op = "load library"
+	OpLibraryRebuild Op = "rebuild library index"
+
+	// Source operations
+	OpSourceAdd    Op = "add library source"
+	OpSourceRemove Op = "remove library source"
+	OpSourceLoad   Op = "load library sources"
+
+	// Download operations
+	OpDownloadQueue   Op = "queue download"
+	OpDownloadDelete  Op = "delete download"
+	OpDownloadClear   Op = "clear completed downloads"
+	OpDownloadRefresh Op = "refresh downloads"
+	OpDownloadRetry   Op = "retry download"
+	OpDownloadCleanup Op = "clean up imported download"
+	OpReleasesRefresh Op = "refresh new releases"
+
+	// Import operations
+	OpImportFile Op = "import file"
+	OpImportTags Op = "read file tags"
+
+	// Playlist operations
+	OpPlaylistCreate   Op = "create playlist"
+	OpPlaylistRename   Op = "rename playlist"
+	OpPlaylistDelete   Op = "delete playlist"
+	OpPlaylistAddTrack Op = "add track to playlist"
+	OpPlaylistRemove   Op = "remove track from playlist"
+	OpPlaylistMove     Op = "move playlist item"
+
+	// Folder operations
+	OpFolderCreate Op = "create folder"
+	OpFolderRename Op = "rename folder"
+	OpFolderDelete Op = "delete folder"
+
+	// Navigation
+	OpNavigate         Op = "go to item"
+	OpSelectionRestore Op = "restore saved selection"
+
+	// Queue operations
+	OpQueueLoad Op = "load queue"
+	OpQueueSave Op = "save queue"
+	OpQueueAdd  Op = "add to queue"
+	// The queue read again from the library, after a scan or a retag.
+	OpQueueRefresh Op = "refresh queue"
+
+	// Playback operations
+	OpPlaybackStart Op = "start playback"
+	OpPlaybackSeek  Op = "seek"
+	OpVolumeLoad    Op = "load volume"
+	OpVolumeSave    Op = "save volume"
+
+	// Favorites
+	OpFavoriteToggle Op = "update favorites"
+
+	// File operations
+	OpFileDelete Op = "delete file"
+	OpFileLoad   Op = "load file"
+
+	// Album view
+	OpAlbumLoad    Op = "load albums"
+	OpPresetLoad   Op = "load album presets"
+	OpPresetSave   Op = "save album preset"
+	OpPresetDelete Op = "delete album preset"
+
+	// Last.fm operations
+	OpLastfmAuth     Op = "authenticate with Last.fm"
+	OpLastfmScrobble Op = "scrobble to Last.fm"
+
+	// Radio operations
+	OpRadioFill Op = "fill queue from radio"
+
+	// Export operations
+	OpExportTracks  Op = "read tracks to export"
+	OpExportFile    Op = "export file"
+	OpExportConvert Op = "convert file"
+	OpExportTarget  Op = "load export target"
+	OpTargetDelete  Op = "delete export target"
+	OpTargetRename  Op = "rename export target"
+	OpVolumeDetect  Op = "detect volumes"
+	OpTargetsLoad   Op = "load export targets"
+	OpTargetCreate  Op = "save export target"
+	OpFolderList    Op = "list folder"
+
+	// Notification operations
+	OpNotify Op = "send notification"
+)
+
+// Format creates a user-friendly error message.
+func Format(op Op, err error) string {
+	if err == nil {
+		return ""
+	}
+	return fmt.Sprintf("Failed to %s: %v", op, err)
+}
+
+// FormatWith creates an error message with additional context.
+func FormatWith(op Op, context string, err error) string {
+	if err == nil {
+		return ""
+	}
+	if context == "" {
+		return Format(op, err)
+	}
+	return fmt.Sprintf("Failed to %s '%s': %v", op, context, err)
+}

@@ -1,0 +1,158 @@
+package core
+
+import (
+	"time"
+
+	"github.com/llehouerou/waves/internal/errmsg"
+	"github.com/llehouerou/waves/internal/playback"
+	"github.com/llehouerou/waves/internal/radio"
+)
+
+// radioNearEnd is how close to the end of the last track the queue is filled
+// when nothing filled it earlier.
+const radioNearEnd = 15 * time.Second
+
+// CycleRepeatMode moves to the next repeat mode and returns it:
+// Off -> All -> One -> Radio -> Off. Radio is skipped when the core has no
+// radio: Last.fm is not configured. An account is not needed.
+func (p *Playback) CycleRepeatMode() RepeatMode {
+	current := p.RepeatMode()
+	next := RepeatOff
+	switch current {
+	case RepeatOff:
+		next = RepeatAll
+	case RepeatAll:
+		next = RepeatOne
+	case RepeatOne:
+		if p.core.radio != nil {
+			next = RepeatRadio
+		}
+	case RepeatRadio:
+	}
+	p.SetRepeatMode(next)
+	return next
+}
+
+// SetRepeatMode sets the repeat mode. Radio is refused, the mode left as it
+// was, when the core has no radio: Last.fm is not configured.
+func (p *Playback) SetRepeatMode(mode RepeatMode) {
+	if mode == RepeatRadio && p.core.radio == nil {
+		return
+	}
+	p.svc.SetRepeatMode(mode)
+}
+
+// repeatChanged follows the repeat mode into and out of radio, whatever
+// changed it: the client, MPRIS or the service. Leaving radio ends its
+// session: radio forgets it. Entering it changes nothing in radio: its next
+// fill is seeded on the track playing then.
+//
+// The transition is read from the events, not from the live mode: a leave
+// and a return read together still end the session. The service drops the
+// events a full buffer cannot hold (16): a burst of mode changes that
+// overflows it while the loop is busy may leave c.repeat behind the live mode
+// until the next change it reads.
+func (c *Core) repeatChanged(mode RepeatMode) {
+	left := c.repeat
+	c.repeat = mode
+	if c.radio != nil && left == RepeatRadio && mode != RepeatRadio {
+		c.radio.Forget()
+	}
+}
+
+// radioActive reports whether the queue is to be kept filled by radio.
+func (c *Core) radioActive() bool {
+	return c.radio != nil && c.playback.RepeatMode() == RepeatRadio
+}
+
+// fillRadioOnLastTrack fetches more tracks when the track that started at
+// index is the last of the queue, so that they are there before it ends.
+func (c *Core) fillRadioOnLastTrack(index int) {
+	pb := c.playback
+	if !c.radioActive() || pb.QueueIsEmpty() || index < pb.QueueLen()-1 {
+		return
+	}
+	c.startRadioFill()
+}
+
+// fillRadioNearEnd fetches more tracks when the track playing is about to end
+// with nothing after it: it became the last one after it started, because the
+// queue was edited. Called by the loop on every clock tick, it fills once per
+// play.
+func (c *Core) fillRadioNearEnd() {
+	pb := c.playback
+	if !c.radioActive() || c.play == nil || c.play.radioFilled || pb.QueueHasNext() {
+		return
+	}
+	duration, position := pb.Duration(), pb.Position()
+	if duration <= 0 || position <= 0 || duration-position > radioNearEnd {
+		return
+	}
+	c.play.radioFilled = c.startRadioFill()
+}
+
+// startRadioFill asks radio for tracks similar to the artist of the current
+// track, the seed of the fill, off the loop: the answer comes back on c.fills.
+// It reports whether a fill started: none starts with no current track, or
+// one with no artist.
+func (c *Core) startRadioFill() bool {
+	if c.filling {
+		return false
+	}
+
+	track := c.playback.CurrentTrack()
+	if track == nil || track.Artist == "" {
+		return false
+	}
+	seed := track.Artist
+
+	// Favorites only boost the score: without them the fill is still good.
+	favorites, _ := c.playlists.pls.FavoriteTrackIDs() //nolint:errcheck // see above
+
+	c.filling = true
+	r := c.radio
+	go func() { c.fills <- r.Fill(seed, favorites) }()
+	return true
+}
+
+// radioFilled puts the tracks radio found at the end of the queue, and resumes
+// playback on the track that follows the one the queue ran out on, the first
+// of them unless the client added others in between, when the queue ran out
+// while they were being fetched. A player stopped for any other reason stays
+// stopped.
+//
+// A fill that lands when the queue is no longer in radio mode, whatever left
+// it, is dropped: the user no longer asked for its tracks, nor for its error.
+func (c *Core) radioFilled(res radio.FillResult) {
+	c.filling = false
+	if !c.radioActive() {
+		// A dropped fill does not fill the play in progress: radio turned on
+		// again fills it. One fill at a time, so a play marked as filled was
+		// marked by this fill.
+		if c.play != nil {
+			c.play.radioFilled = false
+		}
+		return
+	}
+	if res.Err != nil {
+		c.emit(Failed{Op: errmsg.OpRadioFill, Err: res.Err})
+		return
+	}
+	if len(res.Tracks) == 0 {
+		return
+	}
+
+	tracks := playback.TracksFromPlaylist(res.Tracks)
+	pb := c.playback
+	pb.AddTracks(tracks...)
+
+	// Radio remembers what it gave to avoid repeating itself.
+	for _, track := range tracks {
+		c.radio.AddToRecentlyPlayed(track.Path, track.Artist)
+	}
+	c.radio.AddRecentSeeds(res.Seeds...)
+
+	// The live state of the service, not the events read so far: the stop
+	// that preceded this fill may not be read yet.
+	_ = pb.svc.ResumeAfterRunOut() //nolint:errcheck // a track that fails to open reaches the client as PlaybackFailed
+}

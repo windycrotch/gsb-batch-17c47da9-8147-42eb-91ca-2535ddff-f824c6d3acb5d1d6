@@ -1,0 +1,508 @@
+package importer
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/llehouerou/waves/internal/downloads"
+	"github.com/llehouerou/waves/internal/musicbrainz"
+	"github.com/llehouerou/waves/internal/rename"
+	"github.com/llehouerou/waves/internal/tags"
+	"github.com/llehouerou/waves/internal/tags/tagstest"
+)
+
+// planned is the plan of downloaded's three files, with cover as the cover of
+// release A.
+func planned(t *testing.T, completed string, cover []byte) Plan {
+	t.Helper()
+	mb := &fakeMB{covers: map[string][]byte{"A": cover}}
+	plan, err := Prepare(downloaded(t, completed, tags.Tag{}), completed, mb, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	return plan
+}
+
+func states(files []FileProgress) []FileState {
+	out := make([]FileState, len(files))
+	for i, f := range files {
+		out[i] = f.State
+	}
+	return out
+}
+
+func TestRun_TagsAndMovesEachFileToWhereThePlanSaid(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	plan := planned(t, completed, nil)
+	var reports [][]FileState
+
+	done := Run(plan, library, rename.DefaultConfig(), func(files []FileProgress) {
+		reports = append(reports, states(files))
+	}, nil)
+
+	if want := []FileState{FileDone, FileDone, FileDone}; !slices.Equal(states(done), want) {
+		t.Fatalf("files ended %v (%+v), want all done", states(done), done)
+	}
+	for i, title := range []string{"One", "Two", "Three"} {
+		dest := filepath.Join(library, plan.Files[i].Dest)
+		if done[i].Path != plan.Files[i].Source || done[i].Dest != dest {
+			t.Errorf("file %d went from %s to %s, want from %s to %s", i, done[i].Path, done[i].Dest, plan.Files[i].Source, dest)
+		}
+		tag, err := tags.Read(dest)
+		if err != nil {
+			t.Fatalf("file %d is not at its destination: %v", i, err)
+		}
+		if tag.Title != title || tag.Album != "Album A" || tag.MBReleaseID != "A" || tag.TrackNumber != i+1 {
+			t.Errorf("file %d tagged %q on %q (release %q, track %d), want %q on Album A (release A, track %d)",
+				i, tag.Title, tag.Album, tag.MBReleaseID, tag.TrackNumber, title, i+1)
+		}
+		if _, err := os.Stat(plan.Files[i].Source); !os.IsNotExist(err) {
+			t.Errorf("file %d is still in the download folder: %v", i, err)
+		}
+	}
+
+	// One report before each file: it is being worked on, those before it are settled.
+	want := [][]FileState{
+		{FileWorking, FilePending, FilePending},
+		{FileDone, FileWorking, FilePending},
+		{FileDone, FileDone, FileWorking},
+	}
+	if !slices.EqualFunc(reports, want, slices.Equal[[]FileState]) {
+		t.Errorf("reports = %v, want %v", reports, want)
+	}
+}
+
+// Files tagged as another release are tagged with that release's own group.
+func TestRun_FilesOfAnotherReleaseAreTaggedWithItsReleaseGroup(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	mb := &fakeMB{releases: map[string]*musicbrainz.ReleaseDetails{"B": liveEP()}}
+	plan, err := Prepare(downloaded(t, completed, tags.Tag{MBReleaseID: "B"}), completed, mb, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	if done[0].State != FileDone {
+		t.Fatalf("first file ended %v: %v", done[0].State, done[0].Err)
+	}
+	tag, err := tags.Read(done[0].Dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.MBReleaseID != "B" || tag.MBReleaseGroupID != "rgB" || tag.OriginalDate != "2001-05-05" ||
+		tag.ReleaseType != "ep; live" || tag.Genre != "Slowcore" {
+		t.Errorf("imported file tagged release %q, group %q, original date %q, type %q, genre %q; "+
+			"want B, rgB, 2001-05-05, ep; live, Slowcore",
+			tag.MBReleaseID, tag.MBReleaseGroupID, tag.OriginalDate, tag.ReleaseType, tag.Genre)
+	}
+}
+
+// A download with more files than the release has tracks used to map every
+// extra file onto the last track, and the move overwrote it. An extra file
+// has no destination: the plan says so, and the import fails it untouched.
+func TestRun_AFileWithNoTrackIsLeftWhereItIs(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	d := downloaded(t, completed, tags.Tag{})
+	d.Files = append(d.Files, files(`@@bob\Album\04 bonus.mp3`)...)
+	bonus := downloads.ExpectedDiskPath(completed, d.Files[3].Filename)
+	tagstest.WriteMP3(t, bonus, tags.Tag{})
+	plan, err := Prepare(d, completed, &fakeMB{}, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if extra := plan.Files[3]; extra.Track != -1 || extra.Dest != "" {
+		t.Fatalf("the extra file is planned as track %d to %q, want no track and no destination", extra.Track, extra.Dest)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	if want := []FileState{FileDone, FileDone, FileDone, FileFailed}; !slices.Equal(states(done), want) {
+		t.Fatalf("files ended %v, want the three tracks done and the extra file failed", states(done))
+	}
+	if err := done[3].Err; err == nil || !strings.Contains(err.Error(), "no MusicBrainz track") {
+		t.Errorf("the extra file failed with %v, want it to say it has no MusicBrainz track", err)
+	}
+	if _, err := os.Stat(bonus); err != nil {
+		t.Errorf("the extra file left the download folder: %v", err)
+	}
+}
+
+// Waves only downloads audio, so an image in the (possibly shared) download
+// folder is never this download's: the album gets the cover fetched from the
+// Cover Art Archive, and the download folder is left alone.
+func TestRun_TheAlbumGetsTheFetchedCover(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	fetched := append([]byte("\xff\xd8\xff\xe0"), make([]byte, 16)...) // a JPEG header
+	plan := planned(t, completed, fetched)
+	foreign := filepath.Join(completed, "Album", "cover.jpg")
+	if err := os.WriteFile(foreign, []byte("another download's cover"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	cover := filepath.Join(filepath.Dir(done[0].Dest), "cover.jpg")
+	if got, err := os.ReadFile(cover); err != nil || !bytes.Equal(got, fetched) {
+		t.Errorf("album cover = %q, %v; want the fetched cover", got, err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("the download folder's image was taken: %v", err)
+	}
+}
+
+// partlyImported runs the plan of downloaded's three files with the third
+// one missing, as an import that failed on it leaves a download, then puts
+// the third file back: the plan is ready to be run again.
+func partlyImported(t *testing.T, completed, library string) Plan {
+	t.Helper()
+	plan := planned(t, completed, nil)
+	third := plan.Files[2].Source
+	if err := os.Rename(third, third+".away"); err != nil {
+		t.Fatal(err)
+	}
+	first := Run(plan, library, rename.DefaultConfig(), nil, nil)
+	if want := []FileState{FileDone, FileDone, FileFailed}; !slices.Equal(states(first), want) {
+		t.Fatalf("first import ended %v, want the third file failed", states(first))
+	}
+	if err := os.Rename(third+".away", third); err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+// The files a first import moved are gone from the download folder, so
+// importing again failed on each of them and the download could never be
+// finished. A file whose track is in the library counts as already imported:
+// the second import brings the rest and is a full success.
+func TestRun_AgainFinishesAPartlyImportedDownload(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	plan := partlyImported(t, completed, library)
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	if want := []FileState{FileAlreadyImported, FileAlreadyImported, FileDone}; !slices.Equal(states(done), want) {
+		t.Fatalf("second import ended %v (%+v), want two files already imported and the third done", states(done), done)
+	}
+	for i := range done {
+		if _, err := os.Stat(done[i].Dest); err != nil {
+			t.Errorf("file %d is not in the library: %v", i, err)
+		}
+	}
+}
+
+// A file gone from the download folder without being in the library was not
+// imported: it still fails.
+func TestRun_AgainFailsAFileGoneEverywhere(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	plan := partlyImported(t, completed, library)
+	if err := os.Remove(filepath.Join(library, plan.Files[1].Dest)); err != nil {
+		t.Fatal(err)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	if want := []FileState{FileAlreadyImported, FileFailed, FileDone}; !slices.Equal(states(done), want) {
+		t.Errorf("second import ended %v, want the second file failed", states(done))
+	}
+}
+
+// gapped is a download of a four-track release A that lacks track 3: its
+// files 01, 02 and 04, written under completed, are tagged as tracks 1, 2 and 4.
+func gapped(t *testing.T, completed string) *downloads.Download {
+	t.Helper()
+	r := release("A")
+	r.Tracks = append(r.Tracks, musicbrainz.Track{Position: 4, Title: "Four"})
+	d := &downloads.Download{
+		ID:               1,
+		MBReleaseDetails: r,
+		MBReleaseGroup:   &musicbrainz.ReleaseGroup{ID: "rg", PrimaryType: "Album"},
+		Files:            files(`@@bob\Album\01 one.mp3`, `@@bob\Album\02 two.mp3`, `@@bob\Album\04 four.mp3`),
+	}
+	for i, track := range []int{1, 2, 4} {
+		tagstest.WriteMP3(t, downloads.ExpectedDiskPath(completed, d.Files[i].Filename), tags.Tag{TrackNumber: track})
+	}
+	return d
+}
+
+// prepare plans the import of d from completed.
+func prepare(t *testing.T, d *downloads.Download, completed string) Plan {
+	t.Helper()
+	plan, err := Prepare(d, completed, &fakeMB{}, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	return plan
+}
+
+// The files a first import moved used to make the second plan match the rest
+// by position: 04 went in as track 3. The files still there match by their
+// tags, the moved ones by the number in their filename.
+func TestRun_AgainImportsTheRestAsTheTracksTheirTagsName(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	d := gapped(t, completed)
+	asked := 0
+	first := Run(prepare(t, d, completed), library, rename.DefaultConfig(), nil, func() bool {
+		asked++
+		return asked > 2 // after the second file
+	})
+	if want := []FileState{FileDone, FileDone, FilePending}; !slices.Equal(states(first), want) {
+		t.Fatalf("first import ended %v, want it stopped after the second file", states(first))
+	}
+
+	plan := prepare(t, d, completed)
+	if got := []int{plan.Files[0].Track, plan.Files[1].Track, plan.Files[2].Track}; !slices.Equal(got, []int{0, 1, 3}) {
+		t.Fatalf("second plan matched the files to tracks %v, want [0 1 3]", got)
+	}
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	if want := []FileState{FileAlreadyImported, FileAlreadyImported, FileDone}; !slices.Equal(states(done), want) {
+		t.Fatalf("second import ended %v (%+v), want two files already imported and the third done", states(done), done)
+	}
+	tag, err := tags.Read(done[2].Dest)
+	if err != nil {
+		t.Fatalf("04 is not at its destination: %v", err)
+	}
+	if tag.Title != "Four" || tag.TrackNumber != 4 {
+		t.Errorf("04 tagged %q, track %d; want Four, track 4", tag.Title, tag.TrackNumber)
+	}
+}
+
+// With track 3 missing from the download, a moved 04 is found in the library
+// by the number in its filename: the download counts as fully imported.
+func TestRun_AgainFindsAMovedFileByItsFilename(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	d := gapped(t, completed)
+	plan := prepare(t, d, completed)
+	firstFile := plan.Files[0].Source
+	if err := os.Rename(firstFile, firstFile+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if want := []FileState{FileFailed, FileDone, FileDone}; !slices.Equal(states(Run(plan, library, rename.DefaultConfig(), nil, nil)), want) {
+		t.Fatalf("first import did not end %v", want)
+	}
+	if err := os.Rename(firstFile+".away", firstFile); err != nil {
+		t.Fatal(err)
+	}
+
+	done := Run(prepare(t, d, completed), library, rename.DefaultConfig(), nil, nil)
+
+	if want := []FileState{FileDone, FileAlreadyImported, FileAlreadyImported}; !slices.Equal(states(done), want) {
+		t.Errorf("second import ended %v (%+v), want the first file done and the others already imported", states(done), done)
+	}
+}
+
+func TestRun_StopsBeforeTheNextFileWhenAsked(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	plan := planned(t, completed, nil)
+	asked := 0
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, func() bool {
+		asked++
+		return asked > 1 // after the first file
+	})
+
+	if want := []FileState{FileDone, FilePending, FilePending}; !slices.Equal(states(done), want) {
+		t.Fatalf("files ended %v, want the run stopped after the first", states(done))
+	}
+	if _, err := os.Stat(plan.Files[1].Source); err != nil {
+		t.Errorf("a file not reached left the download folder: %v", err)
+	}
+}
+
+// An import tags each file with the format of its own track's medium, as a
+// retag does: the CD's files are CD and the DVD's DVD-Video, whatever Media
+// the downloaded files had.
+func TestRun_TagsEachFileWithTheFormatOfItsMedium(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	release := doubleAlbum()
+	release.Formats = "CD, DVD-Video"
+	for i, format := range []string{"CD", "CD", "DVD-Video", "DVD-Video"} {
+		release.Tracks[i].MediumFormat = format
+		release.Tracks[i].ArtistIDs = []string{"artist"}
+	}
+	d := &downloads.Download{
+		ID:               1,
+		MBReleaseDetails: release,
+		MBReleaseGroup:   &musicbrainz.ReleaseGroup{ID: "rg", PrimaryType: "Album"},
+		Files:            files(`@@bob\Double\CD1\01.mp3`, `@@bob\Double\CD1\02.mp3`, `@@bob\Double\CD2\01.mp3`, `@@bob\Double\CD2\02.mp3`),
+	}
+	for _, f := range d.Files {
+		tagstest.WriteMP3(t, downloads.ExpectedDiskPath(completed, f.Filename), tags.Tag{Media: "CD, DVD-Video"})
+	}
+	mb := &fakeMB{}
+	plan, err := Prepare(d, completed, mb, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	for i, want := range []string{"CD", "CD", "DVD-Video", "DVD-Video"} {
+		if done[i].State != FileDone {
+			t.Fatalf("file %d ended %v: %v", i, done[i].State, done[i].Err)
+		}
+		tag, err := tags.Read(done[i].Dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tag.Media != want {
+			t.Errorf("file %d (%s): Media %q, want %q", i, done[i].Dest, tag.Media, want)
+		}
+	}
+	if slices.Contains(mb.asked, "release double") {
+		t.Errorf("asked MusicBrainz for %v, want the queued release kept: its tracks carry their format", mb.asked)
+	}
+}
+
+// A download queued before tracks carried the format of their medium, whose
+// release MusicBrainz does not return again, is imported as queued: its files
+// get no Media rather than the line of every medium of the release.
+func TestRun_AnOldDownloadMusicBrainzDoesNotReturnGetsNoMedia(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	d := downloaded(t, completed, tags.Tag{Media: "CD"})
+	d.MBReleaseDetails.Formats = "CD, CD"
+	plan, err := Prepare(d, completed, &fakeMB{}, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	for i := range done {
+		if done[i].State != FileDone {
+			t.Fatalf("file %d ended %v: %v", i, done[i].State, done[i].Err)
+		}
+		if tag, err := tags.Read(done[i].Dest); err != nil || tag.Media != "" {
+			t.Errorf("file %d: Media %q (err %v), want none", i, tag.Media, err)
+		}
+	}
+}
+
+// A name that starts with a dot would make a folder or a file waves hides: the
+// plan and the import write its dot as "_", and the tags keep the name as it is.
+func TestRun_NoFolderOrFileItWritesIsHidden(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	r := &musicbrainz.ReleaseDetails{
+		Release: musicbrainz.Release{
+			ID: "38", Title: "Wild-Eyed Southern Boys", Artist: ".38 Special", ArtistID: "38special",
+			Status: "Official", Date: "1981",
+		},
+		Tracks: []musicbrainz.Track{{Position: 1, Title: "Hold On Loosely", ArtistIDs: []string{"38special"}}},
+	}
+	d := &downloads.Download{
+		ID:               1,
+		MBReleaseDetails: r,
+		MBReleaseGroup:   &musicbrainz.ReleaseGroup{ID: "rg38", PrimaryType: "Album", FirstRelease: "1981"},
+		Files:            files(`@@bob\Wild-Eyed\01 hold on loosely.mp3`),
+	}
+	tagstest.WriteMP3(t, downloads.ExpectedDiskPath(completed, d.Files[0].Filename), tags.Tag{})
+
+	plan, err := Prepare(d, completed, &fakeMB{}, rename.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	want := filepath.Join("_38 Special", "1981 • Wild-Eyed Southern Boys",
+		"_38 Special • Wild-Eyed Southern Boys • 01 · Hold On Loosely.mp3")
+	if plan.Files[0].Dest != want {
+		t.Fatalf("plan announces %q, want %q", plan.Files[0].Dest, want)
+	}
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	if done[0].State != FileDone || done[0].Dest != filepath.Join(library, want) {
+		t.Fatalf("file ended %v at %q (%v), want done at %q", done[0].State, done[0].Dest, done[0].Err, filepath.Join(library, want))
+	}
+	tag, err := tags.Read(done[0].Dest)
+	if err != nil {
+		t.Fatalf("file is not at its destination: %v", err)
+	}
+	if tag.Artist != ".38 Special" || tag.AlbumArtist != ".38 Special" {
+		t.Errorf("file tagged artist %q, album artist %q, want .38 Special for both", tag.Artist, tag.AlbumArtist)
+	}
+}
+
+// prepareChanged plans, with cfg, the import of downloaded's three files after change
+// rewrote its release, the cover of release A fetched as cover.
+func prepareChanged(t *testing.T, completed string, cfg rename.Config, cover []byte, change func(*musicbrainz.ReleaseDetails)) Plan {
+	t.Helper()
+	d := downloaded(t, completed, tags.Tag{})
+	change(d.MBReleaseDetails)
+	plan, err := Prepare(d, completed, &fakeMB{covers: map[string][]byte{"A": cover}}, cfg)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	return plan
+}
+
+// An artist named "?" cleans to an empty name: its folder used to be dropped,
+// and the album went to the root of the library source. The folder is "_",
+// the plan says so, and the tags keep the artist as it is.
+func TestRun_AnArtistThatCleansToNothingIsImportedUnderUnderscore(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	cover := append([]byte("\xff\xd8\xff\xe0"), make([]byte, 16)...) // a JPEG header
+	plan := prepareChanged(t, completed, rename.DefaultConfig(), cover, func(r *musicbrainz.ReleaseDetails) { r.Artist = "?" })
+	album := filepath.Join("_", "1994 • Album A")
+
+	done := Run(plan, library, rename.DefaultConfig(), nil, nil)
+
+	for i := range done {
+		if done[i].State != FileDone {
+			t.Fatalf("file %d ended %v: %v", i, done[i].State, done[i].Err)
+		}
+		if filepath.Dir(plan.Files[i].Dest) != album {
+			t.Errorf("file %d planned to %q, want it in %q", i, plan.Files[i].Dest, album)
+		}
+		if want := filepath.Join(library, plan.Files[i].Dest); done[i].Dest != want {
+			t.Errorf("file %d went to %s, want %s, where the plan said", i, done[i].Dest, want)
+		}
+		tag, err := tags.Read(done[i].Dest)
+		if err != nil {
+			t.Fatalf("file %d is not at its destination: %v", i, err)
+		}
+		if tag.Artist != "?" || tag.AlbumArtist != "?" {
+			t.Errorf("file %d tagged artist %q, album artist %q; want ?, ?", i, tag.Artist, tag.AlbumArtist)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(library, album, "cover.jpg")); err != nil || !bytes.Equal(got, cover) {
+		t.Errorf("album cover = %q, %v; want the fetched cover in %s", got, err, album)
+	}
+	root, err := os.ReadDir(library)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(root) != 1 || root[0].Name() != "_" || !root[0].IsDir() {
+		t.Errorf("the library source holds %v, want the folder _ alone", root)
+	}
+}
+
+// A title "?" under a file template of the title alone used to give the file
+// no name: it took its album folder's name, next to it. The file is "_",
+// inside its album folder, and the tags keep the title as it is.
+func TestRun_ATitleThatCleansToNothingIsImportedAsUnderscore(t *testing.T) {
+	completed, library := t.TempDir(), t.TempDir()
+	cfg := rename.DefaultConfig()
+	cfg.Folder, cfg.Filename = "{albumartist}/{album}", "{title}"
+	plan := prepareChanged(t, completed, cfg, nil, func(r *musicbrainz.ReleaseDetails) { r.Tracks[0].Title = "?" })
+	want := filepath.Join("Artist", "Album A", "_.mp3")
+
+	done := Run(plan, library, cfg, nil, nil)
+
+	if done[0].State != FileDone {
+		t.Fatalf("first file ended %v: %v", done[0].State, done[0].Err)
+	}
+	if plan.Files[0].Dest != want || done[0].Dest != filepath.Join(library, want) {
+		t.Errorf("first file planned to %q and moved to %q, want %q", plan.Files[0].Dest, done[0].Dest, want)
+	}
+	tag, err := tags.Read(filepath.Join(library, want))
+	if err != nil {
+		t.Fatalf("first file is not at %s: %v", want, err)
+	}
+	if tag.Title != "?" {
+		t.Errorf("first file tagged title %q, want ?", tag.Title)
+	}
+}

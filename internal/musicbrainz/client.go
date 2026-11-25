@@ -1,0 +1,494 @@
+package musicbrainz
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/llehouerou/waves/internal/version"
+)
+
+const (
+	baseURL      = "https://musicbrainz.org/ws/2"
+	rateLimitDur = time.Second // MusicBrainz requires 1 request per second
+
+	// Retry configuration
+	maxRetries   = 3
+	initialDelay = 2 * time.Second
+	maxDelay     = 30 * time.Second
+)
+
+// Client provides access to the MusicBrainz API.
+type Client struct {
+	httpClient  *http.Client
+	lastRequest time.Time
+	mu          sync.Mutex
+}
+
+// NewClient creates a new MusicBrainz API client.
+func NewClient() *Client {
+	return &Client{
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// SearchReleases searches for album releases matching the query.
+// Query can be artist name, album name, or both.
+func (c *Client) SearchReleases(query string) ([]Release, error) {
+	// Build search URL with album filter
+	// Use MusicBrainz Lucene query syntax to filter by primary type
+	// Wrap user query in parentheses for proper boolean logic
+	params := url.Values{}
+	params.Set("query", "("+query+") AND primarytype:album")
+	params.Set("fmt", "json")
+	params.Set("limit", "25")
+
+	var result searchResponse
+	if err := c.getJSON(fmt.Sprintf("%s/release?%s", baseURL, params.Encode()), &result); err != nil {
+		return nil, err
+	}
+	return c.convertReleases(result.Releases), nil
+}
+
+// GetRelease fetches detailed information about a specific release.
+func (c *Client) GetRelease(mbid string) (*ReleaseDetails, error) {
+	// Include recordings (tracks), genres, labels, ISRCs, and release-groups in the response
+	params := url.Values{}
+	params.Set("fmt", "json")
+	params.Set("inc", "recordings+artist-credits+genres+labels+isrcs+release-groups")
+
+	var result releaseDetailsResponse
+	if err := c.getJSON(fmt.Sprintf("%s/release/%s?%s", baseURL, mbid, params.Encode()), &result); err != nil {
+		return nil, err
+	}
+	return c.convertReleaseDetails(result), nil
+}
+
+// waitForRateLimit ensures we don't exceed MusicBrainz rate limits.
+func (c *Client) waitForRateLimit() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	elapsed := time.Since(c.lastRequest)
+	if elapsed < rateLimitDur {
+		time.Sleep(rateLimitDur - elapsed)
+	}
+	c.lastRequest = time.Now()
+}
+
+// doRequestWithRetry executes an HTTP request with exponential backoff retry.
+// Retries on 5xx errors and network errors.
+func (c *Client) doRequestWithRetry(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	delay := initialDelay
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(delay)
+			delay = min(delay*2, maxDelay)
+			c.waitForRateLimit() // Re-apply rate limit after retry delay
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Success or client error (4xx) - don't retry
+		if resp.StatusCode < 500 {
+			return resp, nil
+		}
+
+		// Server error (5xx) - retry
+		resp.Body.Close()
+		lastErr = fmt.Errorf("server returned status %d", resp.StatusCode)
+	}
+
+	return nil, fmt.Errorf("request failed after %d retries: %w", maxRetries+1, lastErr)
+}
+
+// getJSON sends a GET request to reqURL, once the rate limit allows it, and
+// decodes the JSON response into v.
+func (c *Client) getJSON(reqURL string, v any) error {
+	c.waitForRateLimit()
+
+	req, err := http.NewRequest(http.MethodGet, reqURL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("User-Agent", version.UserAgent())
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.doRequestWithRetry(req)
+	if err != nil {
+		return fmt.Errorf("execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API status %d: %s", resp.StatusCode, string(body))
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
+}
+
+// convertReleases converts raw API results to Release structs.
+func (c *Client) convertReleases(results []releaseResult) []Release {
+	releases := make([]Release, 0, len(results))
+
+	for i := range results {
+		r := &results[i]
+		release := Release{
+			ID:      r.ID,
+			Title:   r.Title,
+			Artist:  extractArtist(r.ArtistCredit),
+			Date:    r.Date,
+			Country: r.Country,
+			Score:   r.Score,
+		}
+
+		if r.ReleaseGroup != nil {
+			release.ReleaseType = r.ReleaseGroup.PrimaryType
+		}
+
+		// Sum track counts and collect formats
+		var formats []string
+		for _, m := range r.Media {
+			release.TrackCount += m.TrackCount
+			if m.Format != "" {
+				formats = append(formats, m.Format)
+			}
+		}
+		release.Formats = strings.Join(formats, ", ")
+
+		releases = append(releases, release)
+	}
+
+	// Sort by release date descending (newest first)
+	sort.Slice(releases, func(i, j int) bool {
+		return releases[i].Date > releases[j].Date
+	})
+
+	return releases
+}
+
+// convertReleaseDetails converts a raw release details response.
+func (c *Client) convertReleaseDetails(r releaseDetailsResponse) *ReleaseDetails {
+	// Extract artist info
+	artistName, artistID, artistSortName := extractArtistInfo(r.ArtistCredit)
+
+	details := &ReleaseDetails{
+		Release: Release{
+			ID:             r.ID,
+			Title:          r.Title,
+			Artist:         artistName,
+			ArtistID:       artistID,
+			ArtistSortName: artistSortName,
+			Date:           r.Date,
+			Country:        r.Country,
+			Status:         r.Status,
+			Barcode:        r.Barcode,
+			Genres:         extractGenres(r.Genres),
+		},
+	}
+
+	if r.ReleaseGroup != nil {
+		details.ReleaseType = r.ReleaseGroup.PrimaryType
+		group := convertReleaseGroup(r.ReleaseGroup)
+		details.ReleaseGroup = &group
+	}
+
+	// Extract label info (use first label if multiple)
+	if len(r.LabelInfo) > 0 {
+		li := r.LabelInfo[0]
+		details.CatalogNumber = li.CatalogNumber
+		if li.Label != nil {
+			details.Label = li.Label.Name
+		}
+	}
+
+	// Extract script
+	if r.TextRepresentation != nil {
+		details.Script = r.TextRepresentation.Script
+	}
+
+	// Collect all tracks from all media
+	var formats []string
+	for _, m := range r.Media {
+		details.TrackCount += m.TrackCount
+		if m.Format != "" {
+			formats = append(formats, m.Format)
+		}
+		details.DiscCount++
+
+		discNum := m.Position
+		if discNum == 0 {
+			discNum = details.DiscCount // Fallback if position not set
+		}
+
+		for _, t := range m.Tracks {
+			track := Track{
+				Position:     t.Position,
+				Title:        t.Title,
+				Length:       t.Length,
+				DiscNumber:   discNum,
+				MediumFormat: m.Format,
+				TrackID:      t.ID,
+				Artist:       extractArtist(t.ArtistCredit),
+				ArtistIDs:    extractArtistIDs(t.ArtistCredit),
+			}
+			if t.Recording != nil {
+				track.RecordingID = t.Recording.ID
+				if len(t.Recording.ISRCs) > 0 {
+					track.ISRC = t.Recording.ISRCs[0]
+				}
+			}
+			details.Tracks = append(details.Tracks, track)
+		}
+	}
+	details.Formats = strings.Join(formats, ", ")
+
+	return details
+}
+
+// extractArtist extracts the artist name from artist credits.
+func extractArtist(credits []artistCredit) string {
+	if len(credits) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(credits))
+	for _, c := range credits {
+		name := c.Name
+		if name == "" {
+			name = c.Artist.Name
+		}
+		parts = append(parts, name+c.JoinPhrase)
+	}
+	return strings.Join(parts, "")
+}
+
+// extractArtistIDs extracts the artist IDs of artist credits, in credit
+// order; a credit with no ID gives none.
+func extractArtistIDs(credits []artistCredit) []string {
+	var ids []string
+	for _, c := range credits {
+		if c.Artist.ID != "" {
+			ids = append(ids, c.Artist.ID)
+		}
+	}
+	return ids
+}
+
+// extractArtistInfo extracts artist name, ID, and sort name from artist credits.
+// For multiple artists, returns the first artist's ID and sort name.
+func extractArtistInfo(credits []artistCredit) (name, id, sortName string) {
+	if len(credits) == 0 {
+		return "", "", ""
+	}
+
+	// Build full artist name (including join phrases for collaborations)
+	parts := make([]string, 0, len(credits))
+	for _, c := range credits {
+		n := c.Name
+		if n == "" {
+			n = c.Artist.Name
+		}
+		parts = append(parts, n+c.JoinPhrase)
+	}
+	name = strings.Join(parts, "")
+
+	// Use first artist's ID and sort name
+	id = credits[0].Artist.ID
+	sortName = credits[0].Artist.SortName
+
+	return name, id, sortName
+}
+
+// extractGenres extracts genre names from the genres array.
+func extractGenres(genres []genre) []string {
+	names := make([]string, 0, len(genres))
+	for _, g := range genres {
+		if g.Name != "" {
+			names = append(names, g.Name)
+		}
+	}
+	return names
+}
+
+// SearchArtists searches for artists matching the query.
+func (c *Client) SearchArtists(query string) ([]Artist, error) {
+	params := url.Values{}
+	params.Set("query", query)
+	params.Set("fmt", "json")
+	params.Set("limit", "25")
+
+	var result artistSearchResponse
+	if err := c.getJSON(fmt.Sprintf("%s/artist?%s", baseURL, params.Encode()), &result); err != nil {
+		return nil, err
+	}
+	return c.convertArtists(result.Artists), nil
+}
+
+// convertArtists converts raw API results to Artist structs.
+func (c *Client) convertArtists(results []artistResult) []Artist {
+	artists := make([]Artist, 0, len(results))
+	for _, r := range results {
+		a := Artist{
+			ID:             r.ID,
+			Name:           r.Name,
+			SortName:       r.SortName,
+			Type:           r.Type,
+			Country:        r.Country,
+			Score:          r.Score,
+			Disambiguation: r.Disambiguation,
+		}
+		if r.LifeSpan != nil {
+			a.BeginYear = extractYear(r.LifeSpan.Begin)
+			a.EndYear = extractYear(r.LifeSpan.End)
+		}
+		artists = append(artists, a)
+	}
+	return artists
+}
+
+// extractYear returns the year portion of a date string (YYYY-MM-DD or YYYY).
+func extractYear(date string) string {
+	if len(date) >= 4 {
+		return date[:4]
+	}
+	return date
+}
+
+// GetArtistReleaseGroups returns the release groups of an artist, newest
+// first, and how many MusicBrainz has: all of them, unless the artist has
+// more than maxBrowsePages pages of them, in which case the first
+// maxBrowsePages pages MusicBrainz gave.
+func (c *Client) GetArtistReleaseGroups(artistID string) (Browsed[ReleaseGroup], error) {
+	params := url.Values{}
+	params.Set("artist", artistID)
+	// A browsed release group carries its artist credit only when asked.
+	params.Set("inc", "genres artist-credits")
+
+	results, total, err := browse[releaseGroupResult, releaseGroupBrowseResponse](c, "release-group", params)
+	if err != nil {
+		return Browsed[ReleaseGroup]{}, err
+	}
+
+	// An artist's release groups are listed newest first.
+	groups := convertReleaseGroups(results)
+	sort.SliceStable(groups, func(i, j int) bool {
+		return groups[i].FirstRelease > groups[j].FirstRelease
+	})
+	return Browsed[ReleaseGroup]{Items: groups, Total: total}, nil
+}
+
+// convertReleaseGroups converts raw API results to ReleaseGroup structs, in
+// the order of the response: a search keeps the order of relevance
+// MusicBrainz gives it.
+func convertReleaseGroups(results []releaseGroupResult) []ReleaseGroup {
+	groups := make([]ReleaseGroup, 0, len(results))
+	for i := range results {
+		groups = append(groups, convertReleaseGroup(&results[i]))
+	}
+	return groups
+}
+
+// convertReleaseGroup converts a raw release group, browsed, searched or
+// embedded in a release.
+func convertReleaseGroup(r *releaseGroupResult) ReleaseGroup {
+	return ReleaseGroup{
+		ID:             r.ID,
+		Title:          r.Title,
+		PrimaryType:    r.PrimaryType,
+		SecondaryTypes: r.SecondaryTypes,
+		FirstRelease:   r.FirstRelease,
+		Artist:         extractArtist(r.ArtistCredit),
+		Genres:         extractGenres(r.Genres),
+	}
+}
+
+// GetReleaseGroupReleases returns the releases of a release group, newest
+// first, and how many MusicBrainz has: all of them, unless the group has more
+// than maxBrowsePages pages of them, in which case the first maxBrowsePages
+// pages MusicBrainz gave.
+func (c *Client) GetReleaseGroupReleases(releaseGroupID string) (Browsed[Release], error) {
+	params := url.Values{}
+	params.Set("release-group", releaseGroupID)
+	params.Set("inc", "media")
+
+	results, total, err := browse[releaseResult, releaseBrowseResponse](c, "release", params)
+	if err != nil {
+		return Browsed[Release]{}, err
+	}
+	return Browsed[Release]{Items: c.convertReleases(results), Total: total}, nil
+}
+
+// SearchReleaseGroups searches for release groups by query (artist + album name).
+// For better results with artist and album, use SearchReleaseGroupsByArtistAlbum.
+func (c *Client) SearchReleaseGroups(query string) ([]ReleaseGroup, error) {
+	params := url.Values{}
+	params.Set("query", query)
+	params.Set("fmt", "json")
+	params.Set("limit", "25")
+
+	var result releaseGroupSearchResponse
+	if err := c.getJSON(fmt.Sprintf("%s/release-group?%s", baseURL, params.Encode()), &result); err != nil {
+		return nil, err
+	}
+	return convertReleaseGroups(result.ReleaseGroups), nil
+}
+
+// SearchReleaseGroupsByArtistAlbum searches for release groups using field-specific
+// Lucene query syntax for better accuracy when both artist and album are known.
+func (c *Client) SearchReleaseGroupsByArtistAlbum(artist, album string) ([]ReleaseGroup, error) {
+	// Build Lucene query with field specifiers for better matching
+	// Escape special characters in artist and album names
+	escapedArtist := escapeLucene(artist)
+	escapedAlbum := escapeLucene(album)
+
+	// Use artist: and releasegroup: field specifiers
+	query := fmt.Sprintf("artist:(%s) AND releasegroup:(%s)", escapedArtist, escapedAlbum)
+
+	params := url.Values{}
+	params.Set("query", query)
+	params.Set("fmt", "json")
+	params.Set("limit", "25")
+
+	var result releaseGroupSearchResponse
+	if err := c.getJSON(fmt.Sprintf("%s/release-group?%s", baseURL, params.Encode()), &result); err != nil {
+		return nil, err
+	}
+	return convertReleaseGroups(result.ReleaseGroups), nil
+}
+
+// escapeLucene escapes special characters for Lucene query syntax.
+func escapeLucene(s string) string {
+	// Lucene special characters: + - && || ! ( ) { } [ ] ^ " ~ * ? : \ /
+	// For simplicity, we'll quote the entire string if it contains special chars
+	special := `+-&|!(){}[]^"~*?:\\/`
+	needsQuote := false
+	for _, c := range s {
+		if strings.ContainsRune(special, c) {
+			needsQuote = true
+			break
+		}
+	}
+	if needsQuote {
+		// Escape quotes and wrap in quotes
+		escaped := strings.ReplaceAll(s, `"`, `\"`)
+		return `"` + escaped + `"`
+	}
+	return s
+}

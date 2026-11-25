@@ -1,0 +1,105 @@
+# Waves Configuration Example
+# Copy this file to config.toml and adjust as needed.
+# Config is loaded from:
+#   1. ~/.config/waves/config.toml
+#   2. ./config.toml (higher priority)
+
+# Default folder to open on startup
+# If empty or not set, uses current working directory
+# Supports ~ for home directory
+default_folder = "~/Music"
+
+# Icon style: "nerd" (Nerd Font), "unicode" (emoji), "none" (text suffixes)
+# icons = "nerd"
+
+# Library source paths to scan for music (DEPRECATED)
+# Use 'f p' in the library view to manage sources instead.
+# This setting is only used for initial migration to the in-app manager.
+# Supports ~ for home directory
+# library_sources = ["~/Music", "/mnt/external/music"]
+
+# slskd integration for downloading music from Soulseek
+# When configured, enables the download popup (f d keybinding)
+# [slskd]
+# url = "http://localhost:5030"
+# apikey = "your-api-key-here"
+# completed_path = "~/downloads/complete"  # Path to slskd's completed downloads folder
+#
+# # Default search filters
+# [slskd.filters]
+# format = "both"       # "both", "lossless", or "lossy"
+# no_slot = true        # Filter out users with no free upload slot
+# track_count = true    # Filter out results with fewer tracks than expected
+
+# MusicBrainz settings
+# [musicbrainz]
+# albums_only = true    # Filter release groups to show only albums (default: true)
+
+# Last.fm scrobbling integration
+# When configured, enables scrobbling and the Last.fm settings popup (f l keybinding)
+# Get your API key at: https://www.last.fm/api/account/create
+# [lastfm]
+# api_key = "your-api-key-here"
+# api_secret = "your-api-secret-here"
+
+# Radio mode settings
+# Requires Last.fm API credentials above.
+# Press R to cycle to radio mode.
+# [radio]
+# # Queue behavior
+# buffer_size = 1              # Tracks to queue ahead (1-20)
+#
+# # Artist selection
+# similar_artists_limit = 50   # Similar artists to fetch from API
+# artists_per_fill = 5         # Artists to use per fill
+# artist_match_threshold = 0.8 # Fuzzy match threshold (0.0-1.0); 0 matches the closest library artist, unless none is similar at all
+#
+# # Variety enforcement
+# max_artist_repeat = 2        # Max times same artist in window
+# artist_repeat_window = 20    # Window size for repeat check
+# recent_seeds_window = 3      # Seeds to remember for A→B→A prevention; 0 remembers none (prevention off)
+#
+# # Scoring weights
+# top_track_boost = 3.0        # Boost multiplier for top tracks; 0 scores them as any other track
+# user_boost = 1.3             # Multiplier for user-scrobbled tracks
+# favorite_boost = 2.0         # Multiplier for favorite tracks (replaces user_boost)
+# decay_factor = 0.1           # Score multiplier for recently played (0.0-1.0); 0 scores them 0, so other tracks are picked first
+# min_similarity_weight = 0.1  # Floor for similarity score (0.0-1.0); 0 is no floor
+#
+# # Cache
+# cache_ttl_days = 7           # Cache TTL in days
+
+# Desktop notifications (Linux, over D-Bus). Disabled by default.
+# [notifications]
+# enabled = true           # Master toggle (required)
+# now_playing = true       # Notify on track change
+# downloads = true         # Notify when an import finishes
+# show_album_art = true    # Include album art in notifications
+# timeout = 5000           # Notification timeout in ms (default: 5000, 0 = never expire)
+
+# File renaming on import: folder structure and file name
+# [rename]
+# # Templates (defaults shown). Placeholders: {artist} {albumartist} {album}
+# # {title} {year} {tracknumber} {discnumber} {date} {originalyear}
+# folder = "{albumartist}/{year} • {album}"
+# filename = "{artist} • {album} • {tracknumber} · {title}"
+#
+# # Smart features (all default to true)
+# reissue_notation = true      # Add [YYYY reissue] suffix for reissues
+# va_brackets = true           # Wrap "Various Artists" in brackets
+# singles_handling = true      # Special handling for singles
+# release_type_notes = true    # Add [soundtrack], [live], etc.
+# and_to_ampersand = true      # Convert "and" to "&"
+# remove_feat = true           # Remove "feat." patterns from titles
+# ellipsis_normalize = true    # Convert "..." to "…"
+
+# Theme customisation
+# All colors are optional — omitted values use defaults.
+# Colors must be hex format: #RGB or #RRGGBB
+# [theme]
+# accent = "#a78bfa"      # Primary accent (focused borders, highlights, progress bars)
+# secondary = "#f1a208"   # Secondary accent (radio mode, logo, warnings)
+# text = "#c0c0c0"        # Primary text
+# muted = "#808080"       # Dimmed/secondary text
+# background = "#1a1a1a"  # Panel backgrounds
+# border = "#585858"      # Unfocused borders

@@ -1,0 +1,490 @@
+package downloads
+
+import (
+	"database/sql"
+	"reflect"
+	"testing"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/llehouerou/waves/internal/slskd"
+)
+
+// setupTestDB creates a temporary SQLite database with the required schema.
+func setupTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+
+	// Use temp file to avoid in-memory database connection issues
+	tmpFile := t.TempDir() + "/test.db"
+	db, err := sql.Open("sqlite", tmpFile+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("failed to open test database: %v", err)
+	}
+
+	statements := []string{
+		`CREATE TABLE downloads (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			mb_release_group_id TEXT NOT NULL,
+			mb_release_id TEXT,
+			mb_artist_name TEXT NOT NULL,
+			mb_album_title TEXT NOT NULL,
+			mb_release_year TEXT,
+			mb_release_group_json TEXT,
+			mb_release_details_json TEXT,
+			slskd_username TEXT NOT NULL,
+			slskd_directory TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE download_files (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			download_id INTEGER NOT NULL REFERENCES downloads(id) ON DELETE CASCADE,
+			filename TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			bytes_read INTEGER NOT NULL DEFAULT 0,
+			verified_on_disk INTEGER NOT NULL DEFAULT 0,
+			slskd_state TEXT NOT NULL DEFAULT '',
+			UNIQUE(download_id, filename)
+		)`,
+	}
+
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			t.Fatalf("failed to create schema: %v (stmt: %s)", err, stmt[:50])
+		}
+	}
+
+	return db
+}
+
+func TestDownloadProgress(t *testing.T) {
+	tests := []struct {
+		name          string
+		files         []DownloadFile
+		wantCompleted int
+		wantTotal     int
+		wantPercent   float64
+	}{
+		{
+			name:          "empty files",
+			files:         nil,
+			wantCompleted: 0,
+			wantTotal:     0,
+			wantPercent:   0,
+		},
+		{
+			name: "all pending",
+			files: []DownloadFile{
+				{Size: 1000, BytesRead: 0, Status: StatusPending},
+				{Size: 1000, BytesRead: 0, Status: StatusPending},
+			},
+			wantCompleted: 0,
+			wantTotal:     2,
+			wantPercent:   0,
+		},
+		{
+			name: "half completed",
+			files: []DownloadFile{
+				{Size: 1000, BytesRead: 1000, Status: StatusCompleted},
+				{Size: 1000, BytesRead: 0, Status: StatusPending},
+			},
+			wantCompleted: 1,
+			wantTotal:     2,
+			wantPercent:   50,
+		},
+		{
+			name: "all completed",
+			files: []DownloadFile{
+				{Size: 1000, BytesRead: 1000, Status: StatusCompleted},
+				{Size: 2000, BytesRead: 2000, Status: StatusCompleted},
+			},
+			wantCompleted: 2,
+			wantTotal:     2,
+			wantPercent:   100,
+		},
+		{
+			name: "in progress with bytes",
+			files: []DownloadFile{
+				{Size: 1000, BytesRead: 500, Status: StatusDownloading},
+				{Size: 1000, BytesRead: 250, Status: StatusDownloading},
+			},
+			wantCompleted: 0,
+			wantTotal:     2,
+			wantPercent:   37.5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Download{Files: tt.files}
+			completed, total, percent := d.Progress()
+
+			if completed != tt.wantCompleted {
+				t.Errorf("completed = %d, want %d", completed, tt.wantCompleted)
+			}
+			if total != tt.wantTotal {
+				t.Errorf("total = %d, want %d", total, tt.wantTotal)
+			}
+			if percent != tt.wantPercent {
+				t.Errorf("percent = %f, want %f", percent, tt.wantPercent)
+			}
+		})
+	}
+}
+
+func TestExtractFolderName(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{`@@user1\Music\Artist - Album`, "Artist - Album"},
+		{`@@user\path\to\folder`, "folder"},
+		{`\\some\windows\path`, "path"},
+		{"/unix/style/path", "path"},
+		{"simple", "simple"},
+		{`@@user`, "user"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := ExtractFolderName(tt.input)
+			if got != tt.want {
+				t.Errorf("ExtractFolderName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildDiskPath(t *testing.T) {
+	tests := []struct {
+		completedPath string
+		slskdDir      string
+		want          string
+	}{
+		{"/downloads/complete", `@@user\Music\Album`, "/downloads/complete/Album"},
+		{"/mnt/music", `\\share\Artist - Album`, "/mnt/music/Artist - Album"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.slskdDir, func(t *testing.T) {
+			got := BuildDiskPath(tt.completedPath, tt.slskdDir)
+			if got != tt.want {
+				t.Errorf("BuildDiskPath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseTrackNumber(t *testing.T) {
+	tests := []struct {
+		filename string
+		want     int
+	}{
+		{"01 - Song.flac", 1},
+		{"1. Song.mp3", 1},
+		{"01_Song.flac", 1},
+		{"12 Track Name.mp3", 12},
+		{`path\to\05 - Track.flac`, 5},
+		{"Song Without Number.mp3", 0},
+		{"", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.filename, func(t *testing.T) {
+			got := ParseTrackNumber(tt.filename)
+			if got != tt.want {
+				t.Errorf("ParseTrackNumber(%q) = %d, want %d", tt.filename, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSortFilesByTrackNumber(t *testing.T) {
+	files := []DownloadFile{
+		{Filename: "03 - Third.mp3"},
+		{Filename: "01 - First.mp3"},
+		{Filename: "No Number.mp3"},
+		{Filename: "02 - Second.mp3"},
+		{Filename: "Another No Number.mp3"},
+	}
+
+	sorted := SortFilesByTrackNumber(files)
+
+	// Expected order: 01, 02, 03, then alphabetically: "Another...", "No..."
+	expected := []string{
+		"01 - First.mp3",
+		"02 - Second.mp3",
+		"03 - Third.mp3",
+		"Another No Number.mp3",
+		"No Number.mp3",
+	}
+
+	if len(sorted) != len(expected) {
+		t.Fatalf("len(sorted) = %d, want %d", len(sorted), len(expected))
+	}
+
+	for i, want := range expected {
+		if sorted[i].Filename != want {
+			t.Errorf("sorted[%d].Filename = %q, want %q", i, sorted[i].Filename, want)
+		}
+	}
+}
+
+func TestSortFilesByTrackNumber_DoesNotMutateOriginal(t *testing.T) {
+	original := []DownloadFile{
+		{Filename: "03 - Third.mp3"},
+		{Filename: "01 - First.mp3"},
+	}
+
+	_ = SortFilesByTrackNumber(original)
+
+	// Original should be unchanged
+	if original[0].Filename != "03 - Third.mp3" {
+		t.Error("original slice was mutated")
+	}
+}
+
+// Disc folders sort in disc order (CD10 after CD2), each by track number.
+func TestSortFilesByTrackNumber_DiscFolders(t *testing.T) {
+	files := []DownloadFile{
+		{Filename: `@@u\A\CD10\01.flac`},
+		{Filename: `@@u\A\CD1\02.flac`},
+		{Filename: `@@u\A\CD2\01.flac`},
+		{Filename: `@@u\A\CD1\01.flac`},
+	}
+	got := make([]string, 0, len(files))
+	for _, f := range SortFilesByTrackNumber(files) {
+		got = append(got, f.Filename)
+	}
+	want := []string{`@@u\A\CD1\01.flac`, `@@u\A\CD1\02.flac`, `@@u\A\CD2\01.flac`, `@@u\A\CD10\01.flac`}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("sorted = %q, want %q", got, want)
+	}
+}
+
+func TestDiscNumber(t *testing.T) {
+	for name, want := range map[string]int{
+		"CD1": 1, "cd 2": 2, "CD02": 2, "Disc 1": 1, "disk2": 2, "DISC 3": 3,
+		"CD1 - Live": 1, "CD2_Bonus": 2, "Disc 2 (Remixes)": 2,
+		"Album": 0, "Scans": 0, "CDs": 0, "CD1 Live": 0, "Discography": 0, "My CD1": 0,
+	} {
+		if got := DiscNumber(name); got != want {
+			t.Errorf("DiscNumber(%q) = %d, want %d", name, got, want)
+		}
+	}
+}
+
+func TestSlskdFolder(t *testing.T) {
+	for path, want := range map[string]string{
+		`C:\Users\Music\Artist\Album\track.mp3`: `C:\Users\Music\Artist\Album`,
+		"/home/user/music/track.flac":           "/home/user/music",
+		`Album\track.mp3`:                       "Album",
+		"track.mp3":                             ".",
+		"":                                      ".",
+	} {
+		if got := SlskdFolder(path); got != want {
+			t.Errorf("SlskdFolder(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// A download's folders are its files' folders, each once.
+func TestDownloadFolders(t *testing.T) {
+	d := Download{Files: []DownloadFile{
+		{Filename: `@@u\A\CD1\01.flac`}, {Filename: `@@u\A\CD1\02.flac`}, {Filename: `@@u\A\CD2\01.flac`},
+	}}
+	if got, want := d.Folders(), []string{`@@u\A\CD1`, `@@u\A\CD2`}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Folders() = %q, want %q", got, want)
+	}
+}
+
+func TestMapSlskdState(t *testing.T) {
+	tests := []struct {
+		state string
+		want  string
+	}{
+		// Completed states: only Succeeded is a success
+		{"Completed, Succeeded", StatusCompleted},
+		{"Succeeded", StatusCompleted},
+		{"Completed", StatusFailed},
+
+		// In progress states
+		{"InProgress", StatusDownloading},
+		{"Initializing", StatusDownloading},
+		{"Requested", StatusDownloading},
+
+		// Failed states (slskd reports them as "Completed, <reason>")
+		{"Errored", StatusFailed},
+		{"Completed, Errored", StatusFailed},
+		{"Completed, Cancelled", StatusFailed},
+		{"Completed, TimedOut", StatusFailed},
+		{"Completed, Rejected", StatusFailed},
+		{"Completed, Aborted", StatusFailed},
+
+		// Pending states
+		{"Queued", StatusPending},
+		{"Queued, Remotely", StatusPending},
+		{"None", StatusPending},
+		{"", StatusPending},
+
+		// Unknown states
+		{"SomeUnknownState", StatusPending},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			got := mapSlskdState(tt.state)
+			if got != tt.want {
+				t.Errorf("mapSlskdState(%q) = %q, want %q", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestManagerCreate(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	m := New(db, nil, "")
+
+	download := Download{
+		MBReleaseGroupID: "rg-123",
+		MBArtistName:     "Test Artist",
+		MBAlbumTitle:     "Test Album",
+		MBReleaseYear:    "2024",
+		SlskdUsername:    "user1",
+		SlskdDirectory:   `@@user1\Music\Test Album`,
+		Files: []DownloadFile{
+			{Filename: "01 - Track 1.flac", Size: 1000},
+			{Filename: "02 - Track 2.flac", Size: 2000},
+		},
+	}
+
+	id, err := m.create(download)
+	if err != nil {
+		t.Fatalf("create() error = %v", err)
+	}
+	if id <= 0 {
+		t.Errorf("create() returned invalid id = %d", id)
+	}
+
+	// Verify it was created
+	got, err := m.Get(id)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+
+	if got.MBReleaseGroupID != "rg-123" {
+		t.Errorf("MBReleaseGroupID = %q, want %q", got.MBReleaseGroupID, "rg-123")
+	}
+	if got.MBArtistName != "Test Artist" {
+		t.Errorf("MBArtistName = %q, want %q", got.MBArtistName, "Test Artist")
+	}
+	if len(got.Files) != 2 {
+		t.Errorf("len(Files) = %d, want 2", len(got.Files))
+	}
+	if got.Status != StatusPending {
+		t.Errorf("Status = %q, want %q", got.Status, StatusPending)
+	}
+}
+
+// The app tells "nothing left" from "couldn't read" by nil: deleting the last
+// download must empty the view, not leave it stale.
+func TestManagerList_EmptyIsNotNil(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	list, err := New(db, nil, "").List()
+	if err != nil || list == nil {
+		t.Fatalf("List() = %#v, %v; want empty non-nil", list, err)
+	}
+}
+
+func TestManagerList(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	m := New(db, nil, "")
+
+	// Empty list
+	downloads, err := m.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(downloads) != 0 {
+		t.Errorf("expected 0 downloads, got %d", len(downloads))
+	}
+
+	// Create some downloads
+	_, _ = m.create(Download{
+		MBReleaseGroupID: "rg-1",
+		MBArtistName:     "Artist 1",
+		MBAlbumTitle:     "Album 1",
+		SlskdUsername:    "user1",
+		SlskdDirectory:   "dir1",
+	})
+	_, _ = m.create(Download{
+		MBReleaseGroupID: "rg-2",
+		MBArtistName:     "Artist 2",
+		MBAlbumTitle:     "Album 2",
+		SlskdUsername:    "user2",
+		SlskdDirectory:   "dir2",
+	})
+
+	downloads, err = m.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(downloads) != 2 {
+		t.Errorf("expected 2 downloads, got %d", len(downloads))
+	}
+}
+
+func TestUpdateFromSlskd_FailedFileAndRetryDedup(t *testing.T) {
+	db := setupTestDB(t)
+	defer db.Close()
+	m := New(db, nil, "")
+
+	id, err := m.create(Download{
+		MBReleaseGroupID: "rg", MBArtistName: "A", MBAlbumTitle: "B",
+		SlskdUsername: "user1", SlskdDirectory: `@@user1\Music\B`,
+		Files: []DownloadFile{
+			{Filename: `@@user1\Music\B\01.flac`, Size: 100},
+			{Filename: `@@user1\Music\B\02.flac`, Size: 100},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One succeeded, one rejected: the album is failed, not completed.
+	err = m.updateFromSlskd([]slskd.Download{
+		{Username: "user1", Filename: `@@user1\Music\B\01.flac`, State: "Completed, Succeeded", BytesTransferred: 100},
+		{Username: "user1", Filename: `@@user1\Music\B\02.flac`, State: "Completed, Rejected"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := m.Get(id)
+	if d.Status != StatusFailed {
+		t.Fatalf("album status = %q, want failed", d.Status)
+	}
+	if d.Files[1].Status != StatusFailed || d.Files[1].FailReason() != "Rejected" {
+		t.Fatalf("file 02 = %q/%q, want failed/Rejected", d.Files[1].Status, d.Files[1].FailReason())
+	}
+
+	// After a retry slskd reports both the old errored record and the new one:
+	// the non-failed record wins regardless of order.
+	err = m.updateFromSlskd([]slskd.Download{
+		{Username: "user1", Filename: `@@user1\Music\B\01.flac`, State: "Completed, Succeeded", BytesTransferred: 100},
+		{Username: "user1", Filename: `@@user1\Music\B\02.flac`, State: "InProgress", BytesTransferred: 40},
+		{Username: "user1", Filename: `@@user1\Music\B\02.flac`, State: "Completed, Rejected"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ = m.Get(id)
+	if d.Status != StatusDownloading || d.Files[1].Status != StatusDownloading || d.Files[1].BytesRead != 40 {
+		t.Fatalf("after retry: album=%q file=%q bytes=%d", d.Status, d.Files[1].Status, d.Files[1].BytesRead)
+	}
+}

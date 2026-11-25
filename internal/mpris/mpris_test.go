@@ -1,0 +1,747 @@
+//go:build linux || freebsd
+
+package mpris
+
+import (
+	"errors"
+	"math"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/godbus/dbus/v5"
+	"github.com/quarckster/go-mpris-server/pkg/types"
+
+	"github.com/llehouerou/waves/internal/playback"
+	"github.com/llehouerou/waves/internal/player"
+	"github.com/llehouerou/waves/internal/playlist"
+	"github.com/llehouerou/waves/internal/tags"
+)
+
+// fakeService is a minimal playback.Service stub for testing.
+type fakeService struct {
+	track    *playback.Track
+	duration time.Duration
+}
+
+func (f *fakeService) CurrentTrack() *playback.Track { return f.track }
+
+func (f *fakeService) Duration() time.Duration { return f.duration }
+
+// Unused interface methods — stubs.
+func (f *fakeService) Play() error { return nil }
+
+func (f *fakeService) Pause() error { return nil }
+
+func (f *fakeService) Resume() error { return nil }
+
+func (f *fakeService) Stop() error { return nil }
+
+func (f *fakeService) Toggle() error { return nil }
+
+func (f *fakeService) Next() error { return nil }
+
+func (f *fakeService) Previous() error { return nil }
+
+func (f *fakeService) Seek(time.Duration) error { return nil }
+
+func (f *fakeService) SeekTo(time.Duration) error { return nil }
+
+func (f *fakeService) JumpTo(int) error { return nil }
+
+func (f *fakeService) QueueAdvance() *playback.Track { return nil }
+
+func (f *fakeService) QueueMoveTo(int) *playback.Track { return nil }
+
+func (f *fakeService) AddTracks(...playback.Track) {}
+
+func (f *fakeService) ReplaceTracks(...playback.Track) *playback.Track { return nil }
+
+func (f *fakeService) ClearQueue() {}
+
+func (f *fakeService) RestoreQueue(playback.SavedQueue) {}
+
+func (f *fakeService) LibraryTrackIDs() []int64 { return nil }
+
+func (f *fakeService) RefreshLibraryTracks(map[int64]playback.Track) {}
+
+func (f *fakeService) RemoveTracks([]int) {}
+
+func (f *fakeService) MoveTracks([]int, int) {}
+
+func (f *fakeService) State() playback.State { return playback.StateStopped }
+
+func (f *fakeService) IsPlaying() bool { return false }
+
+func (f *fakeService) IsStopped() bool { return true }
+
+func (f *fakeService) IsPaused() bool { return false }
+
+func (f *fakeService) Position() time.Duration { return 0 }
+
+func (f *fakeService) TrackInfo() *tags.FileInfo { return nil }
+
+func (f *fakeService) QueueTracks() []playback.Track { return nil }
+
+func (f *fakeService) QueueEntries() []playback.QueueEntry { return nil }
+
+func (f *fakeService) QueueCurrentIndex() int { return 0 }
+
+func (f *fakeService) QueueLen() int { return 0 }
+
+func (f *fakeService) QueueIsEmpty() bool { return true }
+
+func (f *fakeService) QueueHasNext() bool { return false }
+
+func (f *fakeService) QueuePeekNext() *playback.Track { return nil }
+
+func (f *fakeService) Undo() bool { return false }
+
+func (f *fakeService) Redo() bool { return false }
+
+func (f *fakeService) RepeatMode() playback.RepeatMode { return playback.RepeatOff }
+
+func (f *fakeService) SetRepeatMode(playback.RepeatMode) {}
+
+func (f *fakeService) CycleRepeatMode() playback.RepeatMode { return playback.RepeatOff }
+
+func (f *fakeService) ResumeAfterRunOut() error { return nil }
+
+func (f *fakeService) Shuffle() bool { return false }
+
+func (f *fakeService) SetShuffle(bool) {}
+
+func (f *fakeService) ToggleShuffle() bool { return false }
+
+func (f *fakeService) Subscribe() *playback.Subscription { return nil }
+
+func (f *fakeService) Close() error { return nil }
+
+func TestMetadata_NoTrack_ValidObjectPath(t *testing.T) {
+	adapter := &playerAdapter{service: &fakeService{}}
+
+	meta, err := adapter.Metadata()
+	if err != nil {
+		t.Fatalf("Metadata() error = %v", err)
+	}
+
+	if !meta.TrackId.IsValid() {
+		t.Errorf("TrackId = %q, want valid dbus ObjectPath", meta.TrackId)
+	}
+
+	want := dbus.ObjectPath("/org/mpris/MediaPlayer2/TrackList/NoTrack")
+	if meta.TrackId != want {
+		t.Errorf("TrackId = %q, want %q", meta.TrackId, want)
+	}
+}
+
+func TestMetadata_WithTrack_SetsUrl(t *testing.T) {
+	svc := &fakeService{
+		track: &playback.Track{Path: "/music/artist/album/song.flac"},
+	}
+	adapter := &playerAdapter{service: svc}
+
+	meta, err := adapter.Metadata()
+	if err != nil {
+		t.Fatalf("Metadata() error = %v", err)
+	}
+
+	want := "file:///music/artist/album/song.flac"
+	if meta.Url != want {
+		t.Errorf("Url = %q, want %q", meta.Url, want)
+	}
+}
+
+func TestMetadata_WithTrack_SetsExtendedFields(t *testing.T) {
+	svc := &fakeService{
+		track: &playback.Track{
+			Path:        "/music/song.flac",
+			DiscNumber:  2,
+			Genre:       "Rock",
+			Year:        2024,
+			TrackNumber: 5,
+		},
+	}
+	adapter := &playerAdapter{service: svc}
+
+	meta, err := adapter.Metadata()
+	if err != nil {
+		t.Fatalf("Metadata() error = %v", err)
+	}
+
+	if meta.DiscNumber != 2 {
+		t.Errorf("DiscNumber = %d, want 2", meta.DiscNumber)
+	}
+	if len(meta.Genre) != 1 || meta.Genre[0] != "Rock" {
+		t.Errorf("Genre = %v, want [Rock]", meta.Genre)
+	}
+	if meta.ContentCreated != "2024" {
+		t.Errorf("ContentCreated = %q, want %q", meta.ContentCreated, "2024")
+	}
+}
+
+func TestMetadata_WithTrack_UsesServiceDuration(t *testing.T) {
+	svc := &fakeService{
+		track:    &playback.Track{Path: "/music/song.flac"},
+		duration: 3*time.Minute + 30*time.Second,
+	}
+	adapter := &playerAdapter{service: svc}
+
+	meta, err := adapter.Metadata()
+	if err != nil {
+		t.Fatalf("Metadata() error = %v", err)
+	}
+
+	want := types.Microseconds((3*time.Minute + 30*time.Second).Microseconds())
+	if meta.Length != want {
+		t.Errorf("Length = %d, want %d", meta.Length, want)
+	}
+}
+
+// signals stands in for the session bus: it keeps the names of the
+// PropertiesChanged signals the adapter asks for.
+type signals struct {
+	mu   sync.Mutex
+	sent []string
+}
+
+func (s *signals) record(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sent = append(s.sent, name)
+	return nil
+}
+
+func (s *signals) OnEnded() error { return s.record("ended") }
+
+func (s *signals) OnVolume() error { return s.record("volume") }
+
+func (s *signals) OnPlayback() error { return s.record("playback") }
+
+func (s *signals) OnPlayPause() error { return s.record("playpause") }
+
+func (s *signals) OnTitle() error { return s.record("title") }
+
+func (s *signals) OnSeek(types.Microseconds) error { return s.record("seek") }
+
+func (s *signals) OnOptions() error { return s.record("options") }
+
+func (s *signals) OnAll() error { return s.record("all") }
+
+// wait fails the test unless the signal name is asked for n times.
+func (s *signals) wait(t *testing.T, name string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		got := 0
+		for _, sent := range s.sent {
+			if sent == name {
+				got++
+			}
+		}
+		all := slices.Clone(s.sent)
+		s.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("signals = %v, want %q %d times", all, name, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// No session bus here: the adapter listens to a real playback service, and
+// what it would emit is kept.
+func TestEventLoop_TellsTheBusWhatPlaybackDoes(t *testing.T) {
+	svc := playback.New(player.NewMock(), playlist.NewQueue())
+	t.Cleanup(func() { svc.Close() })
+	bus := &signals{}
+	a := &Adapter{player: bus, done: make(chan struct{})}
+	go a.runEventLoop(svc.Subscribe())
+	t.Cleanup(func() { close(a.done) })
+
+	svc.AddTracks(playback.Track{Path: "/music/a.flac"}, playback.Track{Path: "/music/b.flac"})
+	svc.QueueMoveTo(0)
+	bus.wait(t, "options", 2) // what can be skipped to changed twice
+
+	if err := svc.Play(); err != nil {
+		t.Fatalf("play: %v", err)
+	}
+	bus.wait(t, "playback", 1)
+
+	if err := svc.Next(); err != nil {
+		t.Fatalf("next: %v", err)
+	}
+	bus.wait(t, "title", 1)
+
+	if err := svc.Seek(10 * time.Second); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+	bus.wait(t, "seek", 1)
+
+	svc.SetShuffle(true)
+	bus.wait(t, "options", 3)
+
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	bus.wait(t, "ended", 1)
+}
+
+// MPRIS Next onto a track that fails to open stops playback: the widgets are
+// told it ended, not left showing it playing, and told the track it moved to,
+// not left showing the one it left.
+func TestEventLoop_TellsTheBusOfANextThatFailsToOpen(t *testing.T) {
+	mock := player.NewMock()
+	svc := playback.New(mock, playlist.NewQueue())
+	t.Cleanup(func() { svc.Close() })
+	bus := &signals{}
+	a := &Adapter{player: bus, done: make(chan struct{})}
+	go a.runEventLoop(svc.Subscribe())
+	t.Cleanup(func() { close(a.done) })
+
+	svc.AddTracks(playback.Track{Path: "/music/a.flac"}, playback.Track{Path: "/music/b.flac"})
+	svc.QueueMoveTo(0)
+	if err := svc.Play(); err != nil {
+		t.Fatalf("play: %v", err)
+	}
+	bus.wait(t, "playback", 1)
+
+	mock.SetPlayError(errors.New("unreadable"))
+	adapter := &playerAdapter{service: svc, bus: bus}
+	if err := adapter.Next(); err == nil {
+		t.Fatal("next succeeded, want the open failure")
+	}
+	bus.wait(t, "ended", 1)
+	bus.wait(t, "title", 1)
+}
+
+// emptyAdapter is a playerAdapter over a real playback service with an empty
+// queue, and the service's events.
+func emptyAdapter(t *testing.T) (*playerAdapter, *player.Mock, *playback.Subscription) {
+	t.Helper()
+	mock := player.NewMock()
+	svc := playback.New(mock, playlist.NewQueue())
+	t.Cleanup(func() { svc.Close() })
+	return &playerAdapter{service: svc}, mock, svc.Subscribe()
+}
+
+// queuedAdapter is emptyAdapter with one track queued and current.
+func queuedAdapter(t *testing.T) (*playerAdapter, *player.Mock, *playback.Subscription) {
+	t.Helper()
+	adapter, mock, sub := emptyAdapter(t)
+	adapter.service.AddTracks(playback.Track{Path: "/music/a.flac"})
+	adapter.service.QueueMoveTo(0)
+	return adapter, mock, sub
+}
+
+// starts are the two MPRIS methods that start playback from stopped.
+var starts = map[string]func(*playerAdapter) error{
+	"Play":      (*playerAdapter).Play,
+	"PlayPause": (*playerAdapter).PlayPause,
+}
+
+// drainStates empties the StateChanged events the service already emitted:
+// it emits them as it acts.
+func drainStates(sub *playback.Subscription) []playback.StateChange {
+	var got []playback.StateChange
+	for {
+		select {
+		case e := <-sub.StateChanged:
+			got = append(got, e)
+		default:
+			return got
+		}
+	}
+}
+
+func TestPlay_WhenStopped_StartsTheCurrentTrack(t *testing.T) {
+	adapter, mock, sub := queuedAdapter(t)
+
+	if err := adapter.Play(); err != nil {
+		t.Fatalf("Play: %v", err)
+	}
+
+	if status, _ := adapter.PlaybackStatus(); status != types.PlaybackStatusPlaying {
+		t.Errorf("PlaybackStatus = %v, want Playing", status)
+	}
+	if got := mock.PlayCalls(); !slices.Equal(got, []string{"/music/a.flac"}) {
+		t.Errorf("tracks opened = %v, want the current track", got)
+	}
+	want := []playback.StateChange{{Previous: playback.StateStopped, Current: playback.StatePlaying}}
+	if got := drainStates(sub); !slices.Equal(got, want) {
+		t.Errorf("state changes = %v, want %v", got, want)
+	}
+}
+
+// The MPRIS spec: "If already playing, this has no effect."
+func TestPlay_WhenPlaying_HasNoEffect(t *testing.T) {
+	adapter, mock, sub := queuedAdapter(t)
+	if err := adapter.Play(); err != nil {
+		t.Fatalf("Play: %v", err)
+	}
+	mock.SetPosition(42 * time.Second)
+	drainStates(sub)
+
+	if err := adapter.Play(); err != nil {
+		t.Fatalf("Play while playing: %v", err)
+	}
+
+	if state := adapter.service.State(); state != playback.StatePlaying {
+		t.Errorf("state = %v, want Playing", state)
+	}
+	if status, _ := adapter.PlaybackStatus(); status != types.PlaybackStatusPlaying {
+		t.Errorf("PlaybackStatus = %v, want Playing", status)
+	}
+	if got := mock.PlayCalls(); len(got) != 1 {
+		t.Errorf("tracks opened = %v, want the first Play's only", got)
+	}
+	if got := adapter.service.Position(); got != 42*time.Second {
+		t.Errorf("position = %v, want 42s kept", got)
+	}
+	if got := drainStates(sub); len(got) != 0 {
+		t.Errorf("state changes = %v, want none", got)
+	}
+}
+
+// The MPRIS spec: "If paused, playback resumes from the current position."
+func TestPlay_WhenPaused_Resumes(t *testing.T) {
+	adapter, mock, sub := queuedAdapter(t)
+	if err := adapter.Play(); err != nil {
+		t.Fatalf("Play: %v", err)
+	}
+	if err := adapter.Pause(); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	drainStates(sub)
+
+	if err := adapter.Play(); err != nil {
+		t.Fatalf("Play while paused: %v", err)
+	}
+
+	if status, _ := adapter.PlaybackStatus(); status != types.PlaybackStatusPlaying {
+		t.Errorf("PlaybackStatus = %v, want Playing", status)
+	}
+	if got := mock.PlayCalls(); len(got) != 1 {
+		t.Errorf("tracks opened = %v, want the first Play's only", got)
+	}
+	want := []playback.StateChange{{Previous: playback.StatePaused, Current: playback.StatePlaying}}
+	if got := drainStates(sub); !slices.Equal(got, want) {
+		t.Errorf("state changes = %v, want %v", got, want)
+	}
+}
+
+func TestPlayPause_TogglesPlayingAndPaused(t *testing.T) {
+	adapter, _, _ := queuedAdapter(t)
+	if err := adapter.Play(); err != nil {
+		t.Fatalf("Play: %v", err)
+	}
+
+	if err := adapter.PlayPause(); err != nil {
+		t.Fatalf("PlayPause while playing: %v", err)
+	}
+	if status, _ := adapter.PlaybackStatus(); status != types.PlaybackStatusPaused {
+		t.Errorf("PlaybackStatus after PlayPause while playing = %v, want Paused", status)
+	}
+
+	if err := adapter.PlayPause(); err != nil {
+		t.Fatalf("PlayPause while paused: %v", err)
+	}
+	if status, _ := adapter.PlaybackStatus(); status != types.PlaybackStatusPlaying {
+		t.Errorf("PlaybackStatus after PlayPause while paused = %v, want Playing", status)
+	}
+}
+
+// A queue with a track and no current one can be played, and Play and
+// PlayPause both start that track.
+func TestPlay_WithNoCurrentTrack_StartsTheFirstTrack(t *testing.T) {
+	for name, start := range map[string]func(*playerAdapter) error{
+		"Play":      (*playerAdapter).Play,
+		"PlayPause": (*playerAdapter).PlayPause,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mock := player.NewMock()
+			svc := playback.New(mock, playlist.NewQueue())
+			t.Cleanup(func() { svc.Close() })
+			svc.AddTracks(playback.Track{Path: "/music/a.flac"})
+			adapter := &playerAdapter{service: svc}
+
+			if can, _ := adapter.CanPlay(); !can {
+				t.Error("CanPlay = false, want true")
+			}
+			if err := start(adapter); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if status, _ := adapter.PlaybackStatus(); status != types.PlaybackStatusPlaying {
+				t.Errorf("PlaybackStatus = %v, want Playing", status)
+			}
+			if got := mock.PlayCalls(); !slices.Equal(got, []string{"/music/a.flac"}) {
+				t.Errorf("tracks opened = %v, want the first track", got)
+			}
+		})
+	}
+}
+
+// The MPRIS spec: "If there is no track to play, this has no effect." Play
+// and PlayPause on an empty queue report success and change nothing.
+func TestPlay_OnAnEmptyQueue_HasNoEffect(t *testing.T) {
+	for name, start := range starts {
+		t.Run(name, func(t *testing.T) {
+			adapter, mock, sub := emptyAdapter(t)
+
+			if can, _ := adapter.CanPlay(); can {
+				t.Error("CanPlay = true, want false")
+			}
+			if err := start(adapter); err != nil {
+				t.Fatalf("%s: %v, want nil", name, err)
+			}
+			if state := adapter.service.State(); state != playback.StateStopped {
+				t.Errorf("state = %v, want Stopped", state)
+			}
+			if got := mock.PlayCalls(); len(got) != 0 {
+				t.Errorf("tracks opened = %v, want none", got)
+			}
+			if got := drainStates(sub); len(got) != 0 {
+				t.Errorf("state changes = %v, want none", got)
+			}
+			select {
+			case e := <-sub.TrackChanged:
+				t.Errorf("track change %v, want none", e)
+			default:
+			}
+		})
+	}
+}
+
+// A track that fails to open is still an error on the bus.
+func TestPlay_WhenTheTrackFailsToOpen_ReturnsTheError(t *testing.T) {
+	for name, start := range starts {
+		t.Run(name, func(t *testing.T) {
+			adapter, mock, _ := queuedAdapter(t)
+			openErr := errors.New("unreadable")
+			mock.SetPlayError(openErr)
+
+			if err := start(adapter); !errors.Is(err, openErr) {
+				t.Errorf("%s = %v, want the open error", name, err)
+			}
+		})
+	}
+}
+
+// fakeVolume stands in for the volume of the core.
+type fakeVolume struct {
+	level float64
+	set   []float64
+}
+
+func (f *fakeVolume) Volume() float64 { return f.level }
+
+func (f *fakeVolume) SetVolume(level float64) {
+	f.level = level
+	f.set = append(f.set, level)
+}
+
+func TestVolume_IsTheVolumeOfWaves(t *testing.T) {
+	adapter := &playerAdapter{service: &fakeService{}, volume: &fakeVolume{level: 0.7}}
+
+	if got, err := adapter.Volume(); err != nil || got != 0.7 {
+		t.Errorf("Volume() = %v, %v, want 0.7", got, err)
+	}
+}
+
+// The MPRIS spec: a negative volume is 0. Above 1 is louder than waves goes.
+func TestSetVolume_SetsTheVolumeOfWavesWithinItsRange(t *testing.T) {
+	for _, tc := range []struct{ asked, want float64 }{{0.4, 0.4}, {-1, 0}, {2, 1}} {
+		vol := &fakeVolume{}
+		bus := &signals{}
+		adapter := &playerAdapter{service: &fakeService{}, volume: vol, bus: bus}
+
+		if err := adapter.SetVolume(tc.asked); err != nil {
+			t.Fatalf("SetVolume(%v): %v", tc.asked, err)
+		}
+
+		if !slices.Equal(vol.set, []float64{tc.want}) {
+			t.Errorf("SetVolume(%v) set %v, want %v", tc.asked, vol.set, tc.want)
+		}
+		// Other widgets listen too.
+		if !slices.Equal(bus.sent, []string{"volume"}) {
+			t.Errorf("SetVolume(%v) sent %v, want one volume signal", tc.asked, bus.sent)
+		}
+	}
+}
+
+func TestSetVolume_RefusesWhatIsNotANumber(t *testing.T) {
+	vol := &fakeVolume{level: 0.5}
+	adapter := &playerAdapter{service: &fakeService{}, volume: vol, bus: &signals{}}
+
+	if err := adapter.SetVolume(math.NaN()); err == nil {
+		t.Error("SetVolume(NaN) succeeded")
+	}
+	if vol.set != nil {
+		t.Errorf("SetVolume(NaN) set %v", vol.set)
+	}
+}
+
+func TestVolumeChanged_TellsTheBus(t *testing.T) {
+	bus := &signals{}
+	a := &Adapter{player: bus}
+
+	a.VolumeChanged()
+
+	if !slices.Equal(bus.sent, []string{"volume"}) {
+		t.Errorf("sent %v, want one volume signal", bus.sent)
+	}
+}
+
+// changes are the properties each signal of the event handler tells the bus
+// changed, as the MPRIS library sends them.
+var changes = map[string][]string{
+	"title":   {"Metadata"},
+	"options": {"CanGoNext", "CanGoPrevious", "CanPause", "CanPlay", "LoopStatus", "Shuffle"},
+}
+
+// mark is the number of signals asked for so far.
+func (s *signals) mark() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sent)
+}
+
+// waitChanged fails the test unless the signals asked for after the mark
+// tell the bus every property given changed.
+func (s *signals) waitChanged(t *testing.T, mark int, props ...string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.mu.Lock()
+		since := slices.Clone(s.sent[mark:])
+		s.mu.Unlock()
+		told := map[string]bool{}
+		for _, name := range since {
+			for _, prop := range changes[name] {
+				told[prop] = true
+			}
+		}
+		missing := slices.DeleteFunc(slices.Clone(props), func(p string) bool { return told[p] })
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("signals = %v, %v not told changed", since, missing)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The current track and what can follow or precede it change together,
+// whichever playback event reports it: the bus is told of all of them.
+func TestEventLoop_TellsTheBusOfTheTrackAndWhatSurroundsIt(t *testing.T) {
+	play := func(t *testing.T, svc playback.Service, _ *player.Mock) {
+		t.Helper()
+		if err := svc.Play(); err != nil {
+			t.Fatalf("play: %v", err)
+		}
+	}
+	stopped := func(*testing.T, playback.Service, *player.Mock) {}
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, playback.Service, *player.Mock)
+		act   func(*testing.T, playback.Service, *player.Mock)
+	}{
+		{"move while stopped", stopped, func(_ *testing.T, svc playback.Service, _ *player.Mock) {
+			svc.QueueMoveTo(1)
+		}},
+		{"next", play, func(t *testing.T, svc playback.Service, _ *player.Mock) {
+			if err := svc.Next(); err != nil {
+				t.Fatalf("next: %v", err)
+			}
+		}},
+		{"track finishes", play, func(_ *testing.T, _ playback.Service, mock *player.Mock) {
+			mock.SimulateFinished()
+		}},
+		{"clear", play, func(_ *testing.T, svc playback.Service, _ *player.Mock) {
+			svc.ClearQueue()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := player.NewMock()
+			svc := playback.New(mock, playlist.NewQueue())
+			t.Cleanup(func() { svc.Close() })
+			bus := &signals{}
+			a := &Adapter{player: bus, done: make(chan struct{})}
+			go a.runEventLoop(svc.Subscribe())
+			t.Cleanup(func() { close(a.done) })
+
+			svc.AddTracks(playback.Track{Path: "/music/a.flac"}, playback.Track{Path: "/music/b.flac"})
+			svc.QueueMoveTo(0)
+			bus.wait(t, "options", 2)
+			tc.setup(t, svc, mock)
+			if svc.IsPlaying() {
+				bus.wait(t, "playback", 1)
+			}
+			mark := bus.mark()
+
+			tc.act(t, svc, mock)
+
+			bus.waitChanged(t, mark, "Metadata", "CanGoNext", "CanGoPrevious")
+		})
+	}
+}
+
+// The MPRIS spec: SetPosition with the ID of a track that is not the current
+// one is stale, and a position below 0 or past the length of the track does
+// nothing. Each reports success. A position within the current track seeks
+// there.
+func TestSetPosition_SeeksWithinTheCurrentTrackOnly(t *testing.T) {
+	current := dbus.ObjectPath(formatTrackID("/music/a.flac"))
+	for _, tc := range []struct {
+		name     string
+		trackID  string
+		position time.Duration
+		want     []time.Duration
+	}{
+		{"within the track", string(current), time.Minute, []time.Duration{50 * time.Second}},
+		{"at its end", string(current), 3 * time.Minute, []time.Duration{2*time.Minute + 50*time.Second}},
+		{"another track", formatTrackID("/music/b.flac"), time.Minute, nil},
+		{"past the end", string(current), 10 * time.Minute, nil},
+		{"below 0", string(current), -5 * time.Second, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapter, mock, _ := queuedAdapter(t)
+			adapter.service.AddTracks(playback.Track{Path: "/music/b.flac"})
+			if err := adapter.Play(); err != nil {
+				t.Fatalf("Play: %v", err)
+			}
+			mock.SetDuration(3 * time.Minute)
+			mock.SetPosition(10 * time.Second)
+			if meta, _ := adapter.Metadata(); meta.TrackId != current {
+				t.Fatalf("current track ID = %q, want %q", meta.TrackId, current)
+			}
+
+			err := adapter.SetPosition(tc.trackID, types.Microseconds(tc.position.Microseconds()))
+			if err != nil {
+				t.Fatalf("SetPosition: %v, want nil", err)
+			}
+
+			if got := mock.SeekCalls(); !slices.Equal(got, tc.want) {
+				t.Errorf("seeks = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// With no current track, every track ID is stale.
+func TestSetPosition_WithNoCurrentTrack_DoesNothing(t *testing.T) {
+	adapter, mock, _ := emptyAdapter(t)
+
+	if err := adapter.SetPosition("/org/mpris/MediaPlayer2/TrackList/NoTrack", 0); err != nil {
+		t.Fatalf("SetPosition: %v, want nil", err)
+	}
+
+	if got := mock.SeekCalls(); len(got) != 0 {
+		t.Errorf("seeks = %v, want none", got)
+	}
+}

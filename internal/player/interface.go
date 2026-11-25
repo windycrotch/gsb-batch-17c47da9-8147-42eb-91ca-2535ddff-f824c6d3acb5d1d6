@@ -1,0 +1,47 @@
+// internal/player/interface.go
+package player
+
+import (
+	"time"
+
+	"github.com/llehouerou/waves/internal/tags"
+)
+
+// Interface defines the player contract for dependency injection and testing.
+type Interface interface {
+	Play(path string) error
+	Stop()
+	Pause()
+	Resume()
+	Toggle()
+	State() State
+	TrackInfo() *tags.FileInfo
+	Position() time.Duration
+	Duration() time.Duration
+	Seek(delta time.Duration)
+
+	// Volume control
+	SetVolume(level float64) // 0.0 to 1.0
+	Volume() float64
+	SetMuted(muted bool)
+	Muted() bool
+
+	OnFinished(fn func())
+	// FinishedChan receives the start count (TrackStarts) of each track that
+	// finishes, so a consumer can tell which start a finish ends.
+	FinishedChan() <-chan uint64
+	Done() <-chan struct{}
+
+	// TrackStarts counts playback starts, so a consumer can tell a transition
+	// the player made itself from one it must perform.
+	TrackStarts() uint64
+
+	// Gapless playback
+	SetPreloadFunc(fn func() string)
+	SetPreloadDuration(d time.Duration)
+	// ClearPreload drops the preloaded next track and any preload in flight.
+	ClearPreload()
+}
+
+// Verify Player implements Interface at compile time.
+var _ Interface = (*Player)(nil)

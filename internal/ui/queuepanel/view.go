@@ -1,0 +1,196 @@
+package queuepanel
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/icons"
+	"github.com/llehouerou/waves/internal/ui/render"
+	"github.com/llehouerou/waves/internal/ui/styles"
+)
+
+// View renders the queue panel.
+func (m Model) View() string {
+	if m.Width() == 0 || m.Height() == 0 {
+		return ""
+	}
+
+	innerWidth := m.list.InnerWidth()
+	listHeight := m.listHeight()
+
+	entries := m.queue.QueueEntries()
+
+	// Header with mode icons on the right
+	header := m.renderHeader(innerWidth, entries)
+
+	// Separator
+	separator := render.Separator(innerWidth)
+
+	// Track list
+	trackList := m.renderTrackList(entries, innerWidth, listHeight)
+
+	content := header + "\n" + separator + "\n" + trackList
+
+	return styles.PanelStyle(m.IsFocused()).
+		Width(innerWidth).
+		Render(content)
+}
+
+// renderHeader renders the queue header with track count and mode icons.
+func (m Model) renderHeader(innerWidth int, entries []core.QueueEntry) string {
+	var headerLeftText string
+	var headerStyle lipgloss.Style
+	if marked := len(m.markedRows(entries)); marked > 0 {
+		headerLeftText = fmt.Sprintf("Queue [%d selected]", marked)
+		headerStyle = multiSelectHeaderStyle()
+	} else {
+		currentIdx := m.queue.QueueCurrentIndex() + 1
+		if currentIdx < 1 {
+			currentIdx = 0
+		}
+		headerLeftText = fmt.Sprintf("Queue (%d/%d)", currentIdx, len(entries))
+		headerStyle = defaultHeaderStyle()
+	}
+
+	// Mode icons on the right
+	modeIcons, modeIconsWidth := m.renderModeIcons()
+
+	// Calculate available width for header text (truncate/pad raw text, then style)
+	headerLeftWidth := innerWidth - modeIconsWidth
+	headerLeftText = render.TruncateAndPad(headerLeftText, headerLeftWidth)
+
+	return headerStyle.Render(headerLeftText) + modeIcons
+}
+
+// renderModeIcons returns the styled mode icons and their display width.
+func (m Model) renderModeIcons() (styled string, width int) {
+	var styledParts []string
+	var rawParts []string
+
+	if m.queue.Shuffle() {
+		icon := icons.Shuffle()
+		styledParts = append(styledParts, modeIconStyle().Render(icon))
+		rawParts = append(rawParts, icon)
+	}
+
+	switch m.queue.RepeatMode() {
+	case core.RepeatOff:
+		// No icon for repeat off
+	case core.RepeatAll:
+		icon := icons.RepeatAll()
+		styledParts = append(styledParts, modeIconStyle().Render(icon))
+		rawParts = append(rawParts, icon)
+	case core.RepeatOne:
+		icon := icons.RepeatOne()
+		styledParts = append(styledParts, modeIconStyle().Render(icon))
+		rawParts = append(rawParts, icon)
+	case core.RepeatRadio:
+		icon := icons.Radio()
+		styledParts = append(styledParts, radioIconStyle().Render(icon))
+		rawParts = append(rawParts, icon)
+	}
+
+	if len(styledParts) == 0 {
+		return "", 0
+	}
+
+	// Join with double space for better separation
+	raw := strings.Join(rawParts, "  ")
+	// Calculate actual width: icon widths + spaces between + trailing space
+	width = lipgloss.Width(raw) + 1
+	styled = strings.Join(styledParts, render.EmptyLine(2)) + render.EmptyLine(1)
+	return styled, width
+}
+
+// renderTrackList renders the list of tracks.
+func (m Model) renderTrackList(entries []core.QueueEntry, innerWidth, listHeight int) string {
+	playingIdx := m.queue.QueueCurrentIndex()
+
+	lines := make([]string, 0, listHeight)
+	for i := range listHeight {
+		idx := i + m.list.Cursor().Offset()
+		if idx >= len(entries) {
+			lines = append(lines, render.EmptyLine(innerWidth))
+			continue
+		}
+
+		entry := entries[idx]
+		line := m.renderTrackLine(entry.Track, m.selected[entry.ID], idx, playingIdx, innerWidth)
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderTrackLine renders a single track line with prefix, title, artist, and suffix.
+func (m Model) renderTrackLine(track core.Track, marked bool, idx, playingIdx, width int) string {
+	// Prefix: "▶ " for playing, "  " otherwise
+	prefix := "  "
+	if idx == playingIdx {
+		prefix = playingSymbol + " "
+	}
+
+	// Favorite icon (before selection marker)
+	favIcon := icons.Favorite()
+	favIconWidth := lipgloss.Width(favIcon)
+	favoriteIcon := strings.Repeat(" ", favIconWidth)
+	if m.isFavorite(track) {
+		favoriteIcon = favIcon
+	}
+
+	// Always reserve space for selection marker
+	suffixWidth := 2 // " ●"
+	suffix := "  "
+	if marked {
+		suffix = " " + selectedSymbol
+	}
+
+	// Calculate available width for content
+	prefixWidth := 2
+	titleArtistPadding := 1 // Space between title and artist
+	favoritePadding := 1    // Space between artist and favorite icon
+	contentWidth := width - prefixWidth - favoritePadding - favIconWidth - suffixWidth - titleArtistPadding
+
+	// Two-column layout: title on left (half), artist on right (half)
+	title := track.Title
+	artist := track.Artist
+
+	colWidth := contentWidth / 2
+	titleWidth := colWidth
+	artistWidth := contentWidth - titleWidth
+
+	title = render.TruncateAndPad(title, titleWidth)
+	artist = render.TruncateAndPad(artist, artistWidth)
+
+	line := prefix + title + " " + artist + " " + favoriteIcon + suffix
+
+	// Apply styling based on track state
+	style := m.trackStyle(idx, playingIdx)
+
+	return style.Render(line)
+}
+
+// trackStyle returns the appropriate style for a track based on its state.
+func (m Model) trackStyle(idx, playingIdx int) lipgloss.Style {
+	isCursor := idx == m.list.Cursor().Pos() && m.IsFocused()
+	isPlaying := idx == playingIdx
+	isPlayed := idx < playingIdx
+
+	switch {
+	case isCursor && isPlaying:
+		return cursorStyle().Inherit(playingStyle())
+	case isCursor && isPlayed:
+		return cursorStyle().Inherit(dimmedStyle())
+	case isCursor:
+		return cursorStyle()
+	case isPlaying:
+		return playingStyle()
+	case isPlayed:
+		return dimmedStyle()
+	default:
+		return trackStyle()
+	}
+}

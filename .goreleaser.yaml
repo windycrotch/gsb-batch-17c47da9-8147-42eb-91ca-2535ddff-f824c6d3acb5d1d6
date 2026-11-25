@@ -1,0 +1,72 @@
+version: 2
+
+builds:
+  # Linux build (needs CGO for ALSA)
+  - id: linux
+    main: .
+    binary: waves
+    goos:
+      - linux
+    goarch:
+      - amd64
+    ldflags:
+      - -s -w
+      - -X github.com/llehouerou/waves/internal/version.Version={{.Version}}
+
+  # macOS build (pure Go via purego)
+  - id: darwin
+    main: .
+    binary: waves
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/llehouerou/waves/internal/version.Version={{.Version}}
+
+  # Windows build (pure Go via purego)
+  - id: windows
+    main: .
+    binary: waves
+    goos:
+      - windows
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X github.com/llehouerou/waves/internal/version.Version={{.Version}}
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+nfpms:
+  - id: linux-packages
+    package_name: waves
+    maintainer: Laurent Le Houerou <laurent@lehouerou.net>
+    vendor: llehouerou
+    homepage: https://github.com/llehouerou/waves
+    description: Keyboard-driven terminal music player with Soulseek integration, Last.fm scrobbling, and radio mode
+    license: GPL-3.0
+    formats:
+      - deb
+      - rpm
+    dependencies:
+      - libasound2
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  # Release notes are passed via --release-notes flag in the workflow

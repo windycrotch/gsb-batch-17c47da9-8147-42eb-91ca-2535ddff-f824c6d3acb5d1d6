@@ -1,0 +1,55 @@
+package downloads
+
+import (
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/ui/action"
+)
+
+// DeleteDownload requests deletion of a download.
+type DeleteDownload struct {
+	ID int64
+}
+
+// ActionType implements action.Action.
+func (a DeleteDownload) ActionType() string { return "downloads.delete" }
+
+// ClearCompleted requests clearing all completed downloads.
+type ClearCompleted struct{}
+
+// ActionType implements action.Action.
+func (a ClearCompleted) ActionType() string { return "downloads.clear_completed" }
+
+// RefreshRequest requests refreshing download status from slskd.
+type RefreshRequest struct{}
+
+// ActionType implements action.Action.
+func (a RefreshRequest) ActionType() string { return "downloads.refresh" }
+
+// RetryFailed requests re-queuing the failed files of a download on slskd.
+type RetryFailed struct {
+	ID int64
+}
+
+// ActionType implements action.Action.
+func (a RetryFailed) ActionType() string { return "downloads.retry_failed" }
+
+// OpenImport requests opening the import popup for a download.
+type OpenImport struct {
+	Download *core.Download
+}
+
+// ActionType implements action.Action.
+func (a OpenImport) ActionType() string { return "downloads.open_import" }
+
+// ImportNotReady indicates import is not possible with a reason.
+type ImportNotReady struct {
+	Reason string
+}
+
+// ActionType implements action.Action.
+func (a ImportNotReady) ActionType() string { return "downloads.import_not_ready" }
+
+// ActionMsg creates an action.Msg for a downloads view action.
+func ActionMsg(a action.Action) action.Msg {
+	return action.Msg{Source: "downloads", Action: a}
+}

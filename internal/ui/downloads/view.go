@@ -1,0 +1,423 @@
+package downloads
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/ui"
+	"github.com/llehouerou/waves/internal/ui/render"
+	"github.com/llehouerou/waves/internal/ui/styles"
+)
+
+// Symbols for status indicators
+const (
+	expandedSymbol  = "\u25BC" // ▼
+	collapsedSymbol = "\u25B6" // ▶
+	completedSymbol = "\u2713" // ✓
+	verifiedSymbol  = "\u2714" // ✔ (heavy check - verified on disk)
+	failedSymbol    = "\u2717" // ✗
+	downloadingIcon = "\u21E9" // ⇩
+	pendingIcon     = "\u25CB" // ○
+)
+
+// Separators matching the renamer style
+const (
+	sepBullet = " • " // U+2022 Bullet - between major elements
+	sepDot    = " · " // U+00B7 Middle Dot - between track number and title
+)
+
+func headerStyle() lipgloss.Style {
+	return styles.T().S().Title
+}
+
+func downloadStyle() lipgloss.Style {
+	return styles.T().S().Base
+}
+
+func cursorStyle() lipgloss.Style {
+	return styles.T().S().Cursor
+}
+
+func completedStyle() lipgloss.Style {
+	return styles.T().S().Success
+}
+
+func downloadingStyle() lipgloss.Style {
+	return styles.T().S().Playing
+}
+
+func failedStyle() lipgloss.Style {
+	return styles.T().S().Error
+}
+
+func pendingStyle() lipgloss.Style {
+	return styles.T().S().Subtle
+}
+
+func emptyStyle() lipgloss.Style {
+	return styles.T().S().Subtle.Italic(true)
+}
+
+func mbTrackStyle() lipgloss.Style {
+	return styles.T().S().Playing
+}
+
+// View renders the downloads view.
+func (m Model) View() string {
+	if m.Width() == 0 || m.Height() == 0 {
+		return ""
+	}
+
+	innerWidth := m.list.InnerWidth()
+	innerHeight := max(m.Height()-ui.BorderHeight, 0) // Account for top/bottom border
+	listHeight := m.listHeight()
+
+	// Header
+	header := m.renderHeader(innerWidth)
+
+	// Separator
+	separator := render.Separator(innerWidth)
+
+	// Show config message if slskd not configured
+	var downloadList string
+	if !m.configured {
+		downloadList = m.renderNotConfigured(innerWidth, listHeight)
+	} else {
+		downloadList = m.renderDownloadList(innerWidth, listHeight)
+	}
+
+	content := header + "\n" + separator + "\n" + downloadList
+
+	return styles.PanelStyle(m.IsFocused()).
+		Width(innerWidth).
+		Height(innerHeight).
+		Render(content)
+}
+
+// renderHeader renders the downloads header.
+func (m Model) renderHeader(innerWidth int) string {
+	headerText := m.buildHeaderText()
+	headerText = render.TruncateAndPad(headerText, innerWidth)
+	return headerStyle().Render(headerText)
+}
+
+// buildHeaderText constructs the header text with status counts.
+func (m Model) buildHeaderText() string {
+	items := m.list.Items()
+	if len(items) == 0 {
+		return "Downloads"
+	}
+
+	// Count by status
+	var pending, downloading, completed, failed int
+	for i := range items {
+		switch items[i].Status {
+		case core.DownloadPending:
+			pending++
+		case core.DownloadDownloading:
+			downloading++
+		case core.DownloadCompleted:
+			completed++
+		case core.DownloadFailed:
+			failed++
+		}
+	}
+
+	var parts []string
+	if downloading > 0 {
+		parts = append(parts, fmt.Sprintf("%d active", downloading))
+	}
+	if pending > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending", pending))
+	}
+	if completed > 0 {
+		parts = append(parts, fmt.Sprintf("%d done", completed))
+	}
+	if failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", failed))
+	}
+
+	if len(parts) > 0 {
+		return fmt.Sprintf("Downloads (%s)", strings.Join(parts, ", "))
+	}
+	return fmt.Sprintf("Downloads (%d)", m.list.Len())
+}
+
+// renderDownloadList renders the list of downloads.
+func (m Model) renderDownloadList(innerWidth, listHeight int) string {
+	items := m.list.Items()
+	if len(items) == 0 {
+		return m.renderEmptyState(innerWidth, listHeight)
+	}
+
+	lines := make([]string, 0, listHeight)
+	lineIdx := 0
+
+	offset := m.list.Cursor().Offset()
+	for i := range items {
+		if lineIdx >= offset+listHeight {
+			break
+		}
+
+		d := &items[i]
+
+		// Render download header line
+		if lineIdx >= offset {
+			line := m.renderDownloadLine(d, i, innerWidth)
+			lines = append(lines, line)
+		}
+		lineIdx++
+
+		// Render expanded files if applicable
+		if m.isExpanded(d.ID) {
+			for fileIdx, f := range d.Files {
+				if lineIdx >= offset+listHeight {
+					break
+				}
+				if lineIdx >= offset {
+					line := m.renderFileLine(d, &f, fileIdx, innerWidth)
+					lines = append(lines, line)
+				}
+				lineIdx++
+			}
+		}
+	}
+
+	// Fill remaining lines
+	for len(lines) < listHeight {
+		lines = append(lines, render.EmptyLine(innerWidth))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderEmptyState renders the empty download list view.
+func (m Model) renderEmptyState(innerWidth, listHeight int) string {
+	emptyMsg := "No downloads"
+	centerLine := listHeight / 2
+	lines := make([]string, listHeight)
+
+	for i := range lines {
+		if i == centerLine {
+			centered := styles.T().BaseStyle().Width(innerWidth).Align(lipgloss.Center).Render(emptyMsg)
+			lines[i] = emptyStyle().Render(centered)
+		} else {
+			lines[i] = render.EmptyLine(innerWidth)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderNotConfigured renders configuration instructions.
+func (m Model) renderNotConfigured(innerWidth, listHeight int) string {
+	configLines := []string{
+		"slskd integration not configured",
+		"",
+		"Add to ~/.config/waves/config.toml:",
+		"",
+		"  [slskd]",
+		"  url = \"http://localhost:5030\"",
+		"  apikey = \"your-api-key\"",
+		"  completed_path = \"/path/to/completed\"",
+	}
+
+	lines := make([]string, listHeight)
+	startLine := (listHeight - len(configLines)) / 2
+
+	for i := range lines {
+		lineIdx := i - startLine
+		if lineIdx >= 0 && lineIdx < len(configLines) {
+			text := configLines[lineIdx]
+			centered := styles.T().BaseStyle().Width(innerWidth).Align(lipgloss.Center).Render(text)
+			lines[i] = emptyStyle().Render(centered)
+		} else {
+			lines[i] = render.EmptyLine(innerWidth)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderDownloadLine renders a single download entry.
+func (m Model) renderDownloadLine(d *core.Download, idx, width int) string {
+	isCursor := idx == m.list.Cursor().Pos() && m.IsFocused()
+
+	// Prefix: ▶ or ▼ based on expanded state
+	prefix := collapsedSymbol + " "
+	if m.isExpanded(d.ID) {
+		prefix = expandedSymbol + " "
+	}
+
+	// Status icon and text
+	completed, total, percent := d.Progress()
+	var statusText string
+	var statusStyle lipgloss.Style
+
+	switch d.Status {
+	case core.DownloadCompleted:
+		statusText = fmt.Sprintf("[%s]", completedSymbol)
+		statusStyle = completedStyle()
+	case core.DownloadDownloading:
+		statusText = fmt.Sprintf("[%s %.0f%%]", downloadingIcon, percent)
+		statusStyle = downloadingStyle()
+	case core.DownloadFailed:
+		failedCount := 0
+		for _, f := range d.Files {
+			if f.Status == core.DownloadFailed {
+				failedCount++
+			}
+		}
+		statusText = fmt.Sprintf("[%s %d]", failedSymbol, failedCount)
+		statusStyle = failedStyle()
+	case core.DownloadPending:
+		statusText = fmt.Sprintf("[%s]", pendingIcon)
+		statusStyle = pendingStyle()
+	}
+
+	// Build content in renamer style: Artist • Year • Album • Tracks
+	var parts []string
+	parts = append(parts, d.MBArtistName)
+
+	// Add year from release details if available, otherwise from release year
+	year := ""
+	switch {
+	case d.MBReleaseDetails != nil && d.MBReleaseDetails.Date != "":
+		year = extractYear(d.MBReleaseDetails.Date)
+	case d.MBReleaseGroup != nil && d.MBReleaseGroup.FirstRelease != "":
+		year = extractYear(d.MBReleaseGroup.FirstRelease)
+	case d.MBReleaseYear != "":
+		year = extractYear(d.MBReleaseYear)
+	}
+	if year != "" {
+		parts = append(parts, year)
+	}
+
+	parts = append(parts, d.MBAlbumTitle)
+
+	// Track count info
+	trackInfo := fmt.Sprintf("%d/%d", completed, total)
+	if d.MBReleaseDetails != nil && len(d.MBReleaseDetails.Tracks) > 0 {
+		trackInfo = fmt.Sprintf("%d/%d tracks", completed, len(d.MBReleaseDetails.Tracks))
+	}
+	parts = append(parts, trackInfo)
+
+	albumInfo := strings.Join(parts, sepBullet)
+
+	// Calculate available width
+	prefixWidth := 2 // "▶ "
+	statusWidth := lipgloss.Width(statusText)
+	contentWidth := width - prefixWidth - statusWidth - 1 // -1 for space before status
+
+	// Truncate album info to fit
+	albumInfo = render.Truncate(albumInfo, contentWidth)
+	albumInfo = render.Pad(albumInfo, contentWidth)
+
+	line := prefix + albumInfo + render.EmptyLine(1) + statusStyle.Render(statusText)
+
+	// Apply cursor style if selected
+	if isCursor {
+		return cursorStyle().Width(width).Render(line)
+	}
+	return downloadStyle().Render(line)
+}
+
+// extractYear returns the first 4 characters of a date string (YYYY).
+func extractYear(date string) string {
+	if len(date) >= 4 {
+		return date[:4]
+	}
+	return date
+}
+
+// renderFileLine renders a single file entry within an expanded download.
+func (m Model) renderFileLine(d *core.Download, f *core.DownloadFile, fileIdx, width int) string {
+	// Indent for file entries
+	indent := "    "
+
+	// Status icon
+	var icon string
+	var style lipgloss.Style
+	switch f.Status {
+	case core.DownloadCompleted:
+		if f.VerifiedOnDisk {
+			icon = verifiedSymbol // ✔ heavy check for verified on disk
+		} else {
+			icon = completedSymbol // ✓ regular check for slskd completed
+		}
+		style = completedStyle()
+	case core.DownloadDownloading:
+		icon = downloadingIcon
+		style = downloadingStyle()
+	case core.DownloadFailed:
+		icon = failedSymbol
+		style = failedStyle()
+	default:
+		icon = pendingIcon
+		style = pendingStyle()
+	}
+
+	// Try to match with MusicBrainz track
+	var trackInfo string
+	if d.MBReleaseDetails != nil && fileIdx < len(d.MBReleaseDetails.Tracks) {
+		track := d.MBReleaseDetails.Tracks[fileIdx]
+		// Format: 01 · Track Title
+		trackInfo = fmt.Sprintf("%02d%s%s", track.Position, sepDot, track.Title)
+	}
+
+	// File name (just the base name)
+	filename := filepath.Base(f.Filename)
+
+	// Trailing detail: progress for downloading files, reason for failed ones
+	progress := ""
+	switch {
+	case f.Status == core.DownloadDownloading && f.Size > 0:
+		progress = fmt.Sprintf(" %.0f%%", float64(f.BytesRead)/float64(f.Size)*100)
+	case f.Status == core.DownloadFailed && f.FailReason() != "":
+		progress = " " + f.FailReason()
+	}
+
+	// Build the line content
+	var content string
+	if trackInfo != "" {
+		// Show: filename → 01 · Track Title
+		arrow := " → "
+		// Calculate available widths
+		indentWidth := lipgloss.Width(indent)
+		iconWidth := 2 // icon + space
+		arrowWidth := lipgloss.Width(arrow)
+		progressWidth := lipgloss.Width(progress)
+		availableWidth := width - indentWidth - iconWidth - progressWidth
+
+		// Split available width: ~40% for filename, ~60% for track info
+		filenameWidth := availableWidth * 2 / 5
+		trackWidth := availableWidth - filenameWidth - arrowWidth
+
+		filename = render.Truncate(filename, filenameWidth)
+		filename = render.Pad(filename, filenameWidth)
+
+		trackInfo = render.Truncate(trackInfo, trackWidth)
+		trackInfo = render.Pad(trackInfo, trackWidth)
+
+		content = filename + arrow + mbTrackStyle().Render(trackInfo) + progress
+	} else {
+		// No MB data - just show filename
+		indentWidth := lipgloss.Width(indent)
+		iconWidth := 2 // icon + space
+		progressWidth := lipgloss.Width(progress)
+		filenameWidth := width - indentWidth - iconWidth - progressWidth
+
+		filename = render.Truncate(filename, filenameWidth)
+		filename = render.Pad(filename, filenameWidth)
+
+		content = filename + progress
+	}
+
+	line := indent + icon + " " + content
+
+	return style.Render(line)
+}

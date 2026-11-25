@@ -1,0 +1,202 @@
+package library
+
+import (
+	"fmt"
+
+	"github.com/llehouerou/waves/internal/tags"
+)
+
+const numWorkers = 8
+
+// ScanProgress reports the progress of a library scan.
+type ScanProgress struct {
+	Phase       string // "scanning", "processing", "cleaning", "done"
+	Current     int
+	Total       int
+	CurrentFile string
+	Stats       *ScanStats // Only populated when Phase == "done"
+}
+
+// ScanStats holds statistics for a completed scan.
+type ScanStats struct {
+	BySource map[string]*SourceStats // keyed by source path
+}
+
+// SourceStats holds per-source scan statistics.
+type SourceStats struct {
+	Added   []string // relative paths of added tracks
+	Removed []string // relative paths of removed tracks
+	Updated []string // relative paths of updated tracks (mtime changed)
+	// Unread holds the relative paths the scan could not read, SourceRoot
+	// for the source itself: it kept the tracks at and under them. It also
+	// holds the files it read and got no track from (tags it cannot read, no
+	// artist or no album) while the library has a track for them:
+	// it kept those tracks as they were, in no particular order.
+	Unread []string
+}
+
+// SourceRoot stands for the source itself in SourceStats.Unread.
+const SourceRoot = "."
+
+// fileInfo holds information about a discovered music file.
+type fileInfo struct {
+	path   string
+	mtime  int64
+	source string // source path this file belongs to
+}
+
+// trackResult holds the result of processing a music file.
+type trackResult struct {
+	path    string
+	mtime   int64
+	info    *tags.Tag
+	noTrack bool   // the file gives no track: nothing to write, list it in Unread
+	source  string // source path this file belongs to
+	isNew   bool   // true if new track, false if updated
+}
+
+// Refresh performs an incremental scan of the given source directories.
+//
+// It adds or updates the track of a file only when a source of the library
+// holds the file's path at that moment, as RemoveSource decides it: a source
+// removed while the scan runs has no track left when it ends, and a directory
+// that is not a source gets no track. ScanStats keeps an entry for each of
+// sources, and lists in it only the tracks the scan wrote or removed itself.
+//
+// stop, when not nil, is asked before each file whether to end there: the
+// scan reads no new file, stops walking the sources and removes no track,
+// since it no longer knows every file. The next scan does what it left.
+//
+// A track is removed only when its file is known to be gone: the scan keeps
+// the tracks at and under a path it could not read (a missing or unlistable
+// root or folder, a file it could not stat, the root of a source in which it
+// finds no music file while the library has tracks for it) and reports those
+// paths in SourceStats.Unread. It also keeps, untouched, the track of a file
+// it reads and gets no track from (tags it cannot read, no artist or no
+// album) and reports the file there: it leaves the track's modification time
+// alone, so each scan reads and reports the file again until it gives a
+// track. A new file that gives no track gets none and is not reported.
+//
+// It leaves out the hidden entries of a source, as the Files view does: a
+// path one of whose names below the root of its innermost source of the
+// library starts with a dot (linkfs.Hidden), the root taken whatever its
+// name and the names of the folders above it. A hidden file, or
+// a file in a hidden folder, gives no track and is not reported as added,
+// updated or unread; a hidden folder is not walked, unless it holds the root
+// of a source of the library, which is not hidden. A track at a hidden path
+// is removed as a track whose file is gone is, its file there or not, and
+// reported in SourceStats.Removed; it is kept if a source of the library
+// added since the walk makes its path no longer hidden. A hidden music file
+// still counts for its source when the scan looks for an unmounted mount
+// point: a source whose only music files are hidden is not unread.
+//
+// The first database write that fails ends the scan, which returns its error
+// and sends no stats: it removes no track after a failed add or update, and
+// keeps what it wrote before. The next scan does what it left.
+func (l *Library) Refresh(sources []string, progress chan<- ScanProgress, stop func() bool) error {
+	return l.refresh(sources, progress, stop, false)
+}
+
+// FullRefresh rescans all files, ignoring modification times.
+// Use this to pick up metadata changes (like disc numbers) without file modifications.
+// stop, and a database write that fails, are as for Refresh.
+func (l *Library) FullRefresh(sources []string, progress chan<- ScanProgress, stop func() bool) error {
+	return l.refresh(sources, progress, stop, true)
+}
+
+// RefreshSource scans a single source path. Used when adding a new source.
+// stop, and a database write that fails, are as for Refresh.
+func (l *Library) RefreshSource(source string, progress chan<- ScanProgress, stop func() bool) error {
+	return l.refresh([]string{source}, progress, stop, false)
+}
+
+func (l *Library) refresh(sources []string, progress chan<- ScanProgress, stop func() bool, forceRescan bool) error {
+	defer close(progress)
+	if stop == nil {
+		stop = func() bool { return false }
+	}
+
+	// Initialize stats
+	stats := &ScanStats{
+		BySource: make(map[string]*SourceStats),
+	}
+	for _, src := range sources {
+		stats.BySource[src] = &SourceStats{}
+	}
+
+	// Phase 1: Scan directories for music files
+	progress <- ScanProgress{Phase: "scanning", Current: 0, Total: 0}
+	// The sources of the library, for the hidden rule: a source inside a
+	// hidden folder is no hidden entry, scanned or not.
+	librarySources, err := l.Sources()
+	if err != nil {
+		return err
+	}
+	found := discoverFiles(sources, librarySources, progress, stop)
+	files := found.files
+
+	// Phase 2: Get existing tracks from DB (only from sources being scanned)
+	existingTracks, err := l.getExistingTracks(sources)
+	if err != nil {
+		return err
+	}
+
+	found.markSourcesWithoutMusic(existingTracks, stop)
+	for src, paths := range found.unread {
+		for _, path := range paths {
+			stats.BySource[src].Unread = append(stats.BySource[src].Unread, relativePath(src, path))
+		}
+	}
+
+	// Filter to only new/modified files (or all files if forceRescan)
+	// Also track which are new vs updated
+	filesToProcess := make([]fileInfo, 0, len(files))
+	fileIsNew := make(map[string]bool) // track if file is new or updated
+	for _, f := range files {
+		if !forceRescan {
+			if existing, ok := existingTracks[f.path]; ok && existing == f.mtime {
+				continue // unchanged, skip
+			}
+		}
+		_, existed := existingTracks[f.path]
+		fileIsNew[f.path] = !existed
+		filesToProcess = append(filesToProcess, f)
+	}
+
+	// Phase 3: Process new/modified files in parallel
+	if len(filesToProcess) > 0 {
+		if err := l.processFiles(filesToProcess, fileIsNew, stats, progress, stop); err != nil {
+			return err
+		}
+	}
+
+	// A walk or a read cut short leaves files undiscovered: their tracks
+	// would be taken for gone.
+	if stop() {
+		return nil
+	}
+
+	// Phase 4: Clean up deleted files
+	progress <- ScanProgress{Phase: "cleaning", Current: 0, Total: 0}
+
+	for path := range existingTracks {
+		if !found.isGone(path) {
+			continue
+		}
+		remove := l.deleteTrackByPath
+		if found.isHidden(path) {
+			remove = l.deleteHiddenTrack
+		}
+		deleted, err := remove(path)
+		if err != nil {
+			return fmt.Errorf("remove track %s: %w", path, err)
+		}
+
+		if src, ok := sourceOf(path, sources); ok && deleted {
+			stats.BySource[src].Removed = append(stats.BySource[src].Removed, relativePath(src, path))
+		}
+	}
+
+	progress <- ScanProgress{Phase: "done", Current: len(files), Total: len(files), Stats: stats}
+	return nil
+}

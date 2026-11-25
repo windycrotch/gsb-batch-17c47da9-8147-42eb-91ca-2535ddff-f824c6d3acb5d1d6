@@ -1,0 +1,1163 @@
+package rename
+
+import (
+	"path/filepath"
+	"testing"
+)
+
+// Test basic text transformations
+
+func TestRemoveQuestionMarks(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"What Kind of Fool Am I?", "What Kind of Fool Am I"},
+		{"Why?", "Why"},
+		{"¿Qué Pasa?", "Qué Pasa"},
+		{"No question", "No question"},
+		{"Multiple??? questions", "Multiple questions"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := removeQuestionMarks(tt.input)
+			if got != tt.expected {
+				t.Errorf("removeQuestionMarks(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReplaceQuoteMarks(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{`Say "Hello"`, `Say 'Hello'`},
+		{`"Quotes"`, `'Quotes'`},
+		{`'Already single'`, `'Already single'`},
+		{`"Double" and 'single'`, `'Double' and 'single'`},
+		{`"Fancy quotes"`, `'Fancy quotes'`},
+		{`'Fancy single'`, `'Fancy single'`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := replaceQuoteMarks(tt.input)
+			if got != tt.expected {
+				t.Errorf("replaceQuoteMarks(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReplaceIllegalFileChars(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Some Band: Greatest Hits", "Some Band - Greatest Hits"},
+		{"AC/DC", "AC - DC"},
+		{"File\\Name", "File - Name"},
+		{"Bigger > Than", "Bigger - Than"},
+		{"Less < Than", "Less - Than"},
+		{"Star*Power", "Star - Power"},
+		{"Pipe|Line", "Pipe - Line"},
+		{"Under_score", "Under - score"},
+		{"Multiple:  spaces", "Multiple - spaces"},
+		{"No illegal chars", "No illegal chars"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := replaceIllegalFileChars(tt.input)
+			if got != tt.expected {
+				t.Errorf("replaceIllegalFileChars(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRemoveEndPeriod(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Mr.", "Mr"},
+		{"Album Name.", "Album Name"},
+		{"No period", "No period"},
+		{"Period. in middle", "Period. in middle"},
+		{"Jr.", "Jr"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := removeEndPeriod(tt.input)
+			if got != tt.expected {
+				t.Errorf("removeEndPeriod(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizeSpaces(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Multiple   spaces", "Multiple spaces"},
+		{"Tab\there", "Tab here"},
+		{"Mix  of\t spaces", "Mix of spaces"},
+		{"Single space", "Single space"},
+		{"  Leading", "Leading"},
+		{"Trailing  ", "Trailing"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := normalizeSpaces(tt.input)
+			if got != tt.expected {
+				t.Errorf("normalizeSpaces(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRemoveFeatPatterns(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Song feat. Artist", "Song"},
+		{"Song feat Artist", "Song"},
+		{"Song ft. Artist", "Song"},
+		{"Song ft Artist", "Song"},
+		{"Song (feat. Artist)", "Song"},
+		{"Song (feat Artist)", "Song"},
+		{"Song [feat. Artist]", "Song"},
+		{"Song {feat. Artist}", "Song"},
+		{"Song (ft. Someone)", "Song"},
+		{"Song Featuring Artist", "Song Featuring Artist"}, // "featuring" not matched
+		{"Featured", "Featured"},                           // word starts with feat
+		{"Defeat", "Defeat"},                               // "feat" not preceded by space
+		{"Song (Remix feat. X)", "Song"},                   // credit after other words in a bracket
+		{"Song (feat. X) (Live)", "Song"},
+		{"Song feat.", "Song"},
+		{"Song (ft)", "Song"},
+		{"Song (Left Behind) (feat. X)", "Song (Left Behind)"},
+		{"Song (Live) feat. X", "Song (Live)"},
+		// "ft" or "feat" inside a word is not a credit
+		{"Song (Left Behind)", "Song (Left Behind)"},
+		{"Song (Gift Wrapped)", "Song (Gift Wrapped)"},
+		{"Song [Soft Mix]", "Song [Soft Mix]"},
+		{"Song {Soft Mix}", "Song {Soft Mix}"},
+		{"Song (Draft)", "Song (Draft)"},
+		{"Song (Aftermath)", "Song (Aftermath)"},
+		{"Song (Daft Punk Remix)", "Song (Daft Punk Remix)"},
+		{"Song (Live at Croft Hall) [2011 Remaster]", "Song (Live at Croft Hall) [2011 Remaster]"},
+		{"Song (Höft)", "Song (Höft)"},
+		// a word that starts with "ft" or "feat" is not a credit
+		{"Light as a feather", "Light as a feather"},
+		{"Double feature", "Double feature"},
+		{"Song featuring X", "Song featuring X"},
+		{"Song (featuring X)", "Song (featuring X)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := removeFeatPatterns(tt.input)
+			if got != tt.expected {
+				t.Errorf("removeFeatPatterns(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReplace3DotsWithEllipsis(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Wait...", "Wait…"},
+		{"What... is this...", "What… is this…"},
+		{"No dots", "No dots"},
+		{"One.", "One."},
+		{"Two..", "Two.."},
+		{"Four....", "Four…."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := replace3DotsWithEllipsis(tt.input)
+			if got != tt.expected {
+				t.Errorf("replace3DotsWithEllipsis(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReplaceAndWithAmpersand(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"Rock and Roll", "Rock & Roll"},
+		{"Simon and Garfunkel", "Simon & Garfunkel"},
+		{"Guns and Roses", "Guns & Roses"},
+		{"Band", "Band"},                     // "and" not standalone
+		{"Anderson", "Anderson"},             // "and" not standalone
+		{"Andrew", "Andrew"},                 // "and" not standalone
+		{"Salt AND Pepper", "Salt & Pepper"}, // case insensitive
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := replaceAndWithAmpersand(tt.input)
+			if got != tt.expected {
+				t.Errorf("replaceAndWithAmpersand(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// Test full path generation
+
+func TestGeneratePath(t *testing.T) {
+	tests := []struct {
+		name     string
+		meta     TrackMetadata
+		expected string
+	}{
+		{
+			name: "basic track",
+			meta: TrackMetadata{
+				Artist:      "Pink Floyd",
+				AlbumArtist: "Pink Floyd",
+				Album:       "The Dark Side of the Moon",
+				Title:       "Time",
+				TrackNumber: 4,
+				Date:        "1973",
+			},
+			// Track filename: Artist • Album • TrackNum · Title
+			expected: filepath.Join("Pink Floyd", "1973 • The Dark Side of the Moon", "Pink Floyd • The Dark Side of the Moon • 04 · Time"),
+		},
+		{
+			name: "various artists",
+			meta: TrackMetadata{
+				Artist:      "Queen",
+				AlbumArtist: "Various Artists",
+				Album:       "Greatest Movie Hits",
+				Title:       "Bohemian Rhapsody",
+				TrackNumber: 1,
+				Date:        "2001",
+			},
+			// VA folder is bracketed, track artist is Queen
+			expected: filepath.Join("[Various Artists]", "2001 • Greatest Movie Hits", "Queen • Greatest Movie Hits • 01 · Bohemian Rhapsody"),
+		},
+		{
+			name: "with illegal chars",
+			meta: TrackMetadata{
+				Artist:      "AC/DC",
+				AlbumArtist: "AC/DC",
+				Album:       "Back in Black",
+				Title:       "You Shook Me All Night Long",
+				TrackNumber: 6,
+				Date:        "1980",
+			},
+			expected: filepath.Join("AC - DC", "1980 • Back in Black", "AC - DC • Back in Black • 06 · You Shook Me All Night Long"),
+		},
+		{
+			name: "with feat pattern",
+			meta: TrackMetadata{
+				Artist:      "Drake feat. Rihanna",
+				AlbumArtist: "Drake",
+				Album:       "Take Care",
+				Title:       "Take Care (feat. Rihanna)",
+				TrackNumber: 5,
+				Date:        "2011",
+			},
+			// feat patterns removed from artist and title
+			expected: filepath.Join("Drake", "2011 • Take Care", "Drake • Take Care • 05 · Take Care"),
+		},
+		{
+			name: "title with a bracket holding ft inside a word",
+			meta: TrackMetadata{
+				Artist:      "A",
+				AlbumArtist: "A",
+				Album:       "B",
+				Title:       "Song (Left Behind)",
+				TrackNumber: 3,
+				Date:        "2000",
+			},
+			expected: filepath.Join("A", "2000 • B", "A • B • 03 · Song (Left Behind)"),
+		},
+		{
+			name: "album starting with a bracket holding ft inside a word",
+			meta: TrackMetadata{
+				Artist:      "A",
+				AlbumArtist: "A",
+				Album:       "(Left Behind) Sessions",
+				Title:       "One",
+				TrackNumber: 1,
+				Date:        "2000",
+			},
+			expected: filepath.Join("A", "2000 • (Left Behind) Sessions", "A • (Left Behind) Sessions • 01 · One"),
+		},
+		{
+			name: "live album",
+			meta: TrackMetadata{
+				Artist:               "Nirvana",
+				AlbumArtist:          "Nirvana",
+				Album:                "MTV Unplugged in New York",
+				Title:                "About a Girl",
+				TrackNumber:          1,
+				Date:                 "1994",
+				SecondaryReleaseType: "live",
+			},
+			// live is a track note, goes on title not album folder
+			expected: filepath.Join("Nirvana", "1994 • MTV Unplugged in New York", "Nirvana • MTV Unplugged in New York • 01 · About a Girl [live]"),
+		},
+		{
+			name: "soundtrack",
+			meta: TrackMetadata{
+				Artist:               "Hans Zimmer",
+				AlbumArtist:          "Hans Zimmer",
+				Album:                "Inception: Music from the Motion Picture",
+				Title:                "Time",
+				TrackNumber:          12,
+				Date:                 "2010",
+				SecondaryReleaseType: "soundtrack",
+			},
+			// soundtrack is an album note
+			expected: filepath.Join("Hans Zimmer", "2010 • Inception - Music from the Motion Picture [soundtrack]", "Hans Zimmer • Inception - Music from the Motion Picture [soundtrack] • 12 · Time"),
+		},
+		{
+			name: "multi-disc",
+			meta: TrackMetadata{
+				Artist:      "The Beatles",
+				AlbumArtist: "The Beatles",
+				Album:       "The White Album",
+				Title:       "Back in the U.S.S.R.",
+				TrackNumber: 1,
+				DiscNumber:  1,
+				TotalDiscs:  2,
+				Date:        "1968",
+			},
+			expected: filepath.Join("The Beatles", "1968 • The White Album", "The Beatles • The White Album • 01.01 · Back in the U.S.S.R."),
+		},
+		{
+			name: "reissue with different date",
+			meta: TrackMetadata{
+				Artist:       "Joy Division",
+				AlbumArtist:  "Joy Division",
+				Album:        "Unknown Pleasures",
+				Title:        "Disorder",
+				TrackNumber:  1,
+				Date:         "2007",
+				OriginalDate: "1979",
+			},
+			// Reissue note appears in both folder AND track filename (per Picard behavior)
+			expected: filepath.Join("Joy Division", "1979 • Unknown Pleasures [2007 reissue]", "Joy Division • Unknown Pleasures [2007 reissue] • 01 · Disorder"),
+		},
+		{
+			name: "EP release",
+			meta: TrackMetadata{
+				Artist:      "Radiohead",
+				AlbumArtist: "Radiohead",
+				Album:       "My Iron Lung",
+				Title:       "My Iron Lung",
+				TrackNumber: 1,
+				Date:        "1994",
+				ReleaseType: "ep",
+			},
+			// EP is an album note
+			expected: filepath.Join("Radiohead", "1994 • My Iron Lung [ep]", "Radiohead • My Iron Lung [ep] • 01 · My Iron Lung"),
+		},
+		{
+			name: "single track",
+			meta: TrackMetadata{
+				Artist:      "Daft Punk",
+				AlbumArtist: "Daft Punk",
+				Album:       "[singles]",
+				Title:       "Get Lucky",
+				TrackNumber: 1,
+				Date:        "2013",
+				ReleaseType: "single",
+			},
+			// Singles: no album in track name, no track number
+			expected: filepath.Join("Daft Punk", "2013 • [singles]", "Daft Punk • Get Lucky"),
+		},
+		{
+			name: "unknown artist",
+			meta: TrackMetadata{
+				Album:       "Mystery Album",
+				Title:       "Unknown Song",
+				TrackNumber: 1,
+				Date:        "2020",
+			},
+			expected: filepath.Join("[unknown artist]", "2020 • Mystery Album", "unknown artist • Mystery Album • 01 · Unknown Song"),
+		},
+		{
+			name: "question marks and quotes",
+			meta: TrackMetadata{
+				Artist:      "The Who",
+				AlbumArtist: "The Who",
+				Album:       "Who Are You",
+				Title:       "Who Are You?",
+				TrackNumber: 9,
+				Date:        "1978",
+			},
+			expected: filepath.Join("The Who", "1978 • Who Are You", "The Who • Who Are You • 09 · Who Are You"),
+		},
+		{
+			name: "and replaced with ampersand",
+			meta: TrackMetadata{
+				Artist:      "Simon and Garfunkel",
+				AlbumArtist: "Simon and Garfunkel",
+				Album:       "Bridge over Troubled Water",
+				Title:       "The Boxer",
+				TrackNumber: 2,
+				Date:        "1970",
+			},
+			expected: filepath.Join("Simon & Garfunkel", "1970 • Bridge over Troubled Water", "Simon & Garfunkel • Bridge over Troubled Water • 02 · The Boxer"),
+		},
+		{
+			name: "no date",
+			meta: TrackMetadata{
+				Artist:      "Unknown Band",
+				AlbumArtist: "Unknown Band",
+				Album:       "Mystery Album",
+				Title:       "Mystery Song",
+				TrackNumber: 1,
+			},
+			// No year prefix when no date
+			expected: filepath.Join("Unknown Band", "Mystery Album", "Unknown Band • Mystery Album • 01 · Mystery Song"),
+		},
+		{
+			name: "ellipsis replacement",
+			meta: TrackMetadata{
+				Artist:      "The Band",
+				AlbumArtist: "The Band",
+				Album:       "Wait...",
+				Title:       "Song...",
+				TrackNumber: 1,
+				Date:        "2000",
+			},
+			expected: filepath.Join("The Band", "2000 • Wait…", "The Band • Wait… • 01 · Song…"),
+		},
+		{
+			name: "multiple notes - soundtrack and live",
+			meta: TrackMetadata{
+				Artist:               "John Williams",
+				AlbumArtist:          "John Williams",
+				Album:                "Star Wars Concert",
+				Title:                "Imperial March",
+				TrackNumber:          5,
+				Date:                 "1999",
+				SecondaryReleaseType: "soundtrack; live",
+			},
+			// soundtrack is album note, live is track note
+			expected: filepath.Join("John Williams", "1999 • Star Wars Concert [soundtrack]", "John Williams • Star Wars Concert [soundtrack] • 05 · Imperial March [live]"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GeneratePath(tt.meta)
+			if got != tt.expected {
+				t.Errorf("GeneratePath() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// Test release type extraction
+
+func TestExtractReleaseNotes(t *testing.T) {
+	tests := []struct {
+		name               string
+		releaseType        string
+		secondaryType      string
+		isVariousArtists   bool
+		expectedAlbumNotes string
+		expectedTrackNotes string
+	}{
+		{
+			name:               "soundtrack",
+			secondaryType:      "soundtrack",
+			expectedAlbumNotes: "soundtrack",
+		},
+		{
+			name:               "audiobook",
+			secondaryType:      "audiobook",
+			expectedAlbumNotes: "audiobook",
+		},
+		{
+			name:               "mixtape/street",
+			secondaryType:      "mixtape/street",
+			expectedAlbumNotes: "mixtape/street",
+		},
+		{
+			name:               "compilation non-VA",
+			secondaryType:      "compilation",
+			isVariousArtists:   false,
+			expectedAlbumNotes: "compilation",
+		},
+		{
+			name:               "compilation VA - no note",
+			secondaryType:      "compilation",
+			isVariousArtists:   true,
+			expectedAlbumNotes: "",
+		},
+		{
+			name:               "ep",
+			releaseType:        "ep",
+			expectedAlbumNotes: "ep",
+		},
+		{
+			name:               "live",
+			secondaryType:      "live",
+			expectedTrackNotes: "live",
+		},
+		{
+			name:               "broadcast",
+			releaseType:        "broadcast",
+			expectedTrackNotes: "broadcast",
+		},
+		{
+			name:               "spokenword",
+			secondaryType:      "spokenword",
+			expectedTrackNotes: "spokenword",
+		},
+		{
+			name:               "interview",
+			secondaryType:      "interview",
+			expectedTrackNotes: "interview",
+		},
+		{
+			name:               "remix",
+			secondaryType:      "remix",
+			expectedTrackNotes: "remix",
+		},
+		{
+			name:               "dj-mix",
+			secondaryType:      "dj-mix",
+			expectedTrackNotes: "dj-mix",
+		},
+		{
+			name:               "multiple types",
+			secondaryType:      "soundtrack; live",
+			expectedAlbumNotes: "soundtrack",
+			expectedTrackNotes: "live",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			albumNotes, trackNotes := extractReleaseNotes(tt.releaseType, tt.secondaryType, tt.isVariousArtists)
+			if albumNotes != tt.expectedAlbumNotes {
+				t.Errorf("albumNotes = %q, want %q", albumNotes, tt.expectedAlbumNotes)
+			}
+			if trackNotes != tt.expectedTrackNotes {
+				t.Errorf("trackNotes = %q, want %q", trackNotes, tt.expectedTrackNotes)
+			}
+		})
+	}
+}
+
+func TestDefaultConfig(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// Check templates match current hardcoded behavior
+	if cfg.Folder == "" {
+		t.Error("Folder template should not be empty")
+	}
+	if cfg.Filename == "" {
+		t.Error("Filename template should not be empty")
+	}
+
+	// Check all toggles default to true
+	if !cfg.ReissueNotation {
+		t.Error("ReissueNotation should default to true")
+	}
+	if !cfg.VABrackets {
+		t.Error("VABrackets should default to true")
+	}
+	if !cfg.SinglesHandling {
+		t.Error("SinglesHandling should default to true")
+	}
+	if !cfg.ReleaseTypeNotes {
+		t.Error("ReleaseTypeNotes should default to true")
+	}
+	if !cfg.AndToAmpersand {
+		t.Error("AndToAmpersand should default to true")
+	}
+	if !cfg.RemoveFeat {
+		t.Error("RemoveFeat should default to true")
+	}
+	if !cfg.EllipsisNormalize {
+		t.Error("EllipsisNormalize should default to true")
+	}
+}
+
+func TestGeneratePathWithConfig(t *testing.T) {
+	meta := TrackMetadata{
+		Artist:      "Pink Floyd",
+		AlbumArtist: "Pink Floyd",
+		Album:       "The Dark Side of the Moon",
+		Title:       "Time",
+		TrackNumber: 4,
+		Date:        "1973",
+	}
+
+	// Custom simple template
+	cfg := Config{
+		Folder:            "{albumartist}/{album}",
+		Filename:          "{tracknumber} - {title}",
+		ReissueNotation:   true,
+		VABrackets:        true,
+		SinglesHandling:   true,
+		ReleaseTypeNotes:  true,
+		AndToAmpersand:    true,
+		RemoveFeat:        true,
+		EllipsisNormalize: true,
+	}
+
+	got := GeneratePathWithConfig(meta, cfg)
+	want := filepath.Join("Pink Floyd", "The Dark Side of the Moon", "04 - Time")
+
+	if got != want {
+		t.Errorf("GeneratePathWithConfig() = %q, want %q", got, want)
+	}
+}
+
+func TestGeneratePathWithConfig_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name     string
+		meta     TrackMetadata
+		cfg      Config
+		expected string
+	}{
+		{
+			name: "empty album uses unknown album",
+			meta: TrackMetadata{
+				Artist:      "Test Artist",
+				AlbumArtist: "Test Artist",
+				Album:       "",
+				Title:       "Test Song",
+				TrackNumber: 1,
+				Date:        "2020",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("Test Artist", "2020 • [unknown album]", "Test Artist • [unknown album] • 01 · Test Song"),
+		},
+		{
+			name: "empty title uses unknown title",
+			meta: TrackMetadata{
+				Artist:      "Test Artist",
+				AlbumArtist: "Test Artist",
+				Album:       "Test Album",
+				Title:       "",
+				TrackNumber: 1,
+				Date:        "2020",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("Test Artist", "2020 • Test Album", "Test Artist • Test Album • 01 · unknown title"),
+		},
+		{
+			name: "zero track number uses 00",
+			meta: TrackMetadata{
+				Artist:      "Test Artist",
+				AlbumArtist: "Test Artist",
+				Album:       "Test Album",
+				Title:       "Test Song",
+				TrackNumber: 0,
+				Date:        "2020",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("Test Artist", "2020 • Test Album", "Test Artist • Test Album • 00 · Test Song"),
+		},
+		{
+			name: "negative track number uses 00",
+			meta: TrackMetadata{
+				Artist:      "Test Artist",
+				AlbumArtist: "Test Artist",
+				Album:       "Test Album",
+				Title:       "Test Song",
+				TrackNumber: -1,
+				Date:        "2020",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("Test Artist", "2020 • Test Album", "Test Artist • Test Album • 00 · Test Song"),
+		},
+		{
+			name: "zero disc number uses default",
+			meta: TrackMetadata{
+				Artist:      "Test Artist",
+				AlbumArtist: "Test Artist",
+				Album:       "Test Album",
+				Title:       "Test Song",
+				TrackNumber: 1,
+				DiscNumber:  0,
+				Date:        "2020",
+			},
+			cfg: Config{
+				Folder:   "{albumartist}",
+				Filename: "{discnumber}-{tracknumber} {title}",
+			},
+			expected: filepath.Join("Test Artist", "1-01 Test Song"),
+		},
+		{
+			name: "negative disc number uses default",
+			meta: TrackMetadata{
+				Artist:      "Test Artist",
+				AlbumArtist: "Test Artist",
+				Album:       "Test Album",
+				Title:       "Test Song",
+				TrackNumber: 1,
+				DiscNumber:  -1,
+				Date:        "2020",
+			},
+			cfg: Config{
+				Folder:   "{albumartist}",
+				Filename: "{discnumber}-{tracknumber} {title}",
+			},
+			expected: filepath.Join("Test Artist", "1-01 Test Song"),
+		},
+		{
+			name: "all empty metadata uses defaults",
+			meta: TrackMetadata{},
+			cfg:  DefaultConfig(),
+			// Empty everything: unknown artist, no year, unknown album, unknown title
+			expected: filepath.Join("[unknown artist]", "[unknown album]", "unknown artist • [unknown album] • 00 · unknown title"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GeneratePathWithConfig(tt.meta, tt.cfg)
+			if got != tt.expected {
+				t.Errorf("GeneratePathWithConfig() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// No name of a generated path starts with a dot: a hidden folder or file is
+// out of sight in waves, so its leading dot becomes "_", as Picard writes it.
+func TestGeneratePathNeverHidesAName(t *testing.T) {
+	flat := func(folder, filename string) Config {
+		cfg := DefaultConfig()
+		cfg.Folder = folder
+		cfg.Filename = filename
+		return cfg
+	}
+	tests := []struct {
+		name     string
+		meta     TrackMetadata
+		cfg      Config
+		expected string
+	}{
+		{
+			name: "artist starting with a dot",
+			meta: TrackMetadata{
+				Artist:      ".38 Special",
+				AlbumArtist: ".38 Special",
+				Album:       "Wild-Eyed Southern Boys",
+				Title:       "Hold On Loosely",
+				TrackNumber: 1,
+				Date:        "1981",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("_38 Special", "1981 • Wild-Eyed Southern Boys", "_38 Special • Wild-Eyed Southern Boys • 01 · Hold On Loosely"),
+		},
+		{
+			name: "album starting with a dot and no year",
+			meta: TrackMetadata{
+				Artist:      "Metallica",
+				AlbumArtist: "Metallica",
+				Album:       ".hack",
+				Title:       "One",
+				TrackNumber: 1,
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("Metallica", "_hack", "Metallica • .hack • 01 · One"),
+		},
+		{
+			name:     "album and title starting with a dot",
+			meta:     TrackMetadata{Album: ".hack", Title: ".title", TrackNumber: 1},
+			cfg:      flat("{album}", "{title}"),
+			expected: filepath.Join("_hack", "_title"),
+		},
+		{
+			name: "dot uncovered by the cleaning",
+			meta: TrackMetadata{
+				Artist:      "?.hack",
+				AlbumArtist: "?.hack",
+				Album:       "Album",
+				Title:       "Song",
+				TrackNumber: 1,
+				Date:        "2000",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("_hack", "2000 • Album", "_hack • Album • 01 · Song"),
+		},
+		{
+			name:     "dot in the fixed text of a template",
+			meta:     TrackMetadata{Album: "Album", Title: "Title", TrackNumber: 1},
+			cfg:      flat("{album}", ".{title}"),
+			expected: filepath.Join("Album", "_Title"),
+		},
+		{
+			name:     "only the first of two dots",
+			meta:     TrackMetadata{Album: "..Foo", Title: "..Foo", TrackNumber: 1},
+			cfg:      flat("{album}", "{title}"),
+			expected: filepath.Join("_.Foo", "_.Foo"),
+		},
+		{
+			name: "three leading dots stay an ellipsis",
+			meta: TrackMetadata{
+				Artist:      "...And You Will Know Us by the Trail of Dead",
+				AlbumArtist: "...And You Will Know Us by the Trail of Dead",
+				Album:       "Source Tags & Codes",
+				Title:       "Invocation",
+				TrackNumber: 1,
+				Date:        "2002",
+			},
+			cfg: DefaultConfig(),
+			expected: filepath.Join(
+				"…And You Will Know Us by the Trail of Dead",
+				"2002 • Source Tags & Codes",
+				"…And You Will Know Us by the Trail of Dead • Source Tags & Codes • 01 · Invocation",
+			),
+		},
+		{
+			name: "dots inside or at the end of a name",
+			meta: TrackMetadata{
+				Artist:      "R.E.M.",
+				AlbumArtist: "R.E.M.",
+				Album:       "Mr. Bungle",
+				Title:       "Song.",
+				TrackNumber: 1,
+				Date:        "1991",
+			},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("R.E.M", "1991 • Mr. Bungle", "R.E.M. • Mr. Bungle • 01 · Song."),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GeneratePathWithConfig(tt.meta, tt.cfg)
+			if got != tt.expected {
+				t.Errorf("GeneratePathWithConfig() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// The text options of the config decide alone what becomes of a name: set to
+// false, a name keeps its "and", its "feat." and its three dots. The cleaning
+// that makes a name safe stays.
+func TestGeneratePathKeepsWhatTheOptionsTurnOff(t *testing.T) {
+	without := func(change func(*Config)) Config {
+		cfg := DefaultConfig()
+		change(&cfg)
+		return cfg
+	}
+	tests := []struct {
+		name     string
+		meta     TrackMetadata
+		cfg      Config
+		expected string
+	}{
+		{
+			name: "\"and\" and \"feat.\" kept",
+			meta: TrackMetadata{
+				Artist:      "Simon and Garfunkel",
+				AlbumArtist: "Simon and Garfunkel",
+				Album:       "Bookends",
+				Title:       "America (feat. X)",
+				TrackNumber: 1,
+				Date:        "1968",
+			},
+			cfg: without(func(c *Config) { c.AndToAmpersand, c.RemoveFeat = false, false }),
+			expected: filepath.Join(
+				"Simon and Garfunkel",
+				"1968 • Bookends",
+				"Simon and Garfunkel • Bookends • 01 · America (feat. X)",
+			),
+		},
+		{
+			name: "three dots kept, the leading one unhidden",
+			meta: TrackMetadata{
+				Artist:      "...And You Will Know Us by the Trail of Dead",
+				AlbumArtist: "...And You Will Know Us by the Trail of Dead",
+				Album:       "Madonna",
+				Title:       "Mark David Chapman",
+				TrackNumber: 1,
+				Date:        "1999",
+			},
+			cfg: without(func(c *Config) { c.EllipsisNormalize = false }),
+			expected: filepath.Join(
+				"_..And You Will Know Us by the Trail of Dead",
+				"1999 • Madonna",
+				"_..And You Will Know Us by the Trail of Dead • Madonna • 01 · Mark David Chapman",
+			),
+		},
+		{
+			name: "defaults unchanged for a name starting with And",
+			meta: TrackMetadata{
+				Artist:      "Genesis",
+				AlbumArtist: "Genesis",
+				Album:       "And Then There Were Three",
+				Title:       "And I Love Her",
+				TrackNumber: 1,
+				Date:        "1978",
+			},
+			cfg: DefaultConfig(),
+			expected: filepath.Join(
+				"Genesis",
+				"1978 • & Then There Were Three",
+				"Genesis • & Then There Were Three • 01 · & I Love Her",
+			),
+		},
+		{
+			name: "And kept when its option is off",
+			meta: TrackMetadata{
+				Artist:      "Genesis",
+				AlbumArtist: "Genesis",
+				Album:       "And Then There Were Three",
+				Title:       "And I Love Her",
+				TrackNumber: 1,
+				Date:        "1978",
+			},
+			cfg: without(func(c *Config) { c.AndToAmpersand = false }),
+			expected: filepath.Join(
+				"Genesis",
+				"1978 • And Then There Were Three",
+				"Genesis • And Then There Were Three • 01 · And I Love Her",
+			),
+		},
+		{
+			name: "safe cleaning still applied",
+			meta: TrackMetadata{
+				Artist:      "AC/DC and \"Friends\"",
+				AlbumArtist: "AC/DC and \"Friends\"",
+				Album:       "Why?",
+				Title:       "Song",
+				TrackNumber: 1,
+				Date:        "2000",
+			},
+			cfg: without(func(c *Config) { c.AndToAmpersand = false }),
+			expected: filepath.Join(
+				"AC - DC and 'Friends'",
+				"2000 • Why",
+				"AC - DC and 'Friends' • Why • 01 · Song",
+			),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GeneratePathWithConfig(tt.meta, tt.cfg)
+			if got != tt.expected {
+				t.Errorf("GeneratePathWithConfig() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// Every "/" of the folder template separates two folders, whatever stands next
+// to it; a "/" that comes from a tag stays inside its name.
+func TestGeneratePathFolderTemplateSlashes(t *testing.T) {
+	meta := TrackMetadata{
+		Artist:      "Pink Floyd",
+		AlbumArtist: "Pink Floyd",
+		Album:       "Animals",
+		Title:       "Dogs",
+		TrackNumber: 2,
+		DiscNumber:  1,
+		Date:        "1977",
+	}
+	tests := []struct {
+		folder   string
+		meta     TrackMetadata
+		expected string
+	}{
+		{"{albumartist}/Albums/{album}", meta, filepath.Join("Pink Floyd", "Albums", "Animals", "02 Dogs")},
+		{"Music/{albumartist}/{album}", meta, filepath.Join("Music", "Pink Floyd", "Animals", "02 Dogs")},
+		{"{albumartist}/CD{discnumber}", meta, filepath.Join("Pink Floyd", "CD1", "02 Dogs")},
+		{"{albumartist}/ {album}", meta, filepath.Join("Pink Floyd", "Animals", "02 Dogs")},
+		{"{albumartist}/{year}/{album}", meta, filepath.Join("Pink Floyd", "1977", "Animals", "02 Dogs")},
+		{"/{albumartist}//{album}/", meta, filepath.Join("Pink Floyd", "Animals", "02 Dogs")},
+		{
+			"{albumartist}/Albums/{album}",
+			TrackMetadata{AlbumArtist: "AC/DC", Album: "Back in Black", Title: "Hells Bells", TrackNumber: 1},
+			filepath.Join("AC - DC", "Albums", "Back in Black", "01 Hells Bells"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.folder, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Folder = tt.folder
+			cfg.Filename = "{tracknumber} {title}"
+			got := GeneratePathWithConfig(tt.meta, cfg)
+			if got != tt.expected {
+				t.Errorf("GeneratePathWithConfig() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+// A folder or file name that the cleaning leaves empty is named "_", as a
+// leading dot is replaced: no folder level the template gives text for is
+// dropped, and the file always has a name. A level the template gives nothing
+// for stays dropped.
+func TestGeneratePathNamesAnEmptiedName(t *testing.T) {
+	with := func(folder, filename string) Config {
+		cfg := DefaultConfig()
+		cfg.Folder = folder
+		cfg.Filename = filename
+		return cfg
+	}
+	floyd := TrackMetadata{
+		Artist:      "Pink Floyd",
+		AlbumArtist: "Pink Floyd",
+		Album:       "Animals",
+		Title:       "Dogs",
+		TrackNumber: 2,
+	}
+	tests := []struct {
+		name     string
+		meta     TrackMetadata
+		cfg      Config
+		expected string
+	}{
+		{
+			name:     "artist ?",
+			meta:     TrackMetadata{Artist: "?", AlbumArtist: "?", Album: "Animals", Title: "?", TrackNumber: 2, Date: "1977"},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("_", "1977 • Animals", "• Animals • 02 ·"),
+		},
+		{
+			name:     "artist .",
+			meta:     TrackMetadata{Artist: ".", AlbumArtist: ".", Album: "A", Title: "T", TrackNumber: 1, Date: "1999"},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("_", "1999 • A", "_ • A • 01 · T"),
+		},
+		{
+			name:     "artist ¿?",
+			meta:     TrackMetadata{Artist: "¿?", AlbumArtist: "¿?", Album: "B", Title: "T", TrackNumber: 3, Date: "1977"},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("_", "1977 • B", "• B • 03 · T"),
+		},
+		{
+			name:     "album ? with no date",
+			meta:     TrackMetadata{Artist: "A", AlbumArtist: "A", Album: "?", Title: "T", TrackNumber: 2},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("A", "_", "A • • 02 · T"),
+		},
+		{
+			name:     "album ? with a year, partly emptied",
+			meta:     TrackMetadata{Artist: "A", AlbumArtist: "A", Album: "?", Title: "T", TrackNumber: 2, Date: "1977"},
+			cfg:      DefaultConfig(),
+			expected: filepath.Join("A", "1977 •", "A • • 02 · T"),
+		},
+		{
+			name:     "title ?",
+			meta:     TrackMetadata{Artist: "A", AlbumArtist: "A", Album: "B", Title: "?", TrackNumber: 1, Date: "1977"},
+			cfg:      with(DefaultFolderTemplate, "{title}"),
+			expected: filepath.Join("A", "1977 • B", "_"),
+		},
+		{
+			name:     "title ???",
+			meta:     TrackMetadata{Artist: "A", AlbumArtist: "A", Album: "B", Title: "???", TrackNumber: 1, Date: "1977"},
+			cfg:      with(DefaultFolderTemplate, "{title}"),
+			expected: filepath.Join("A", "1977 • B", "_"),
+		},
+		{
+			name:     "artist and title ?",
+			meta:     TrackMetadata{Artist: "?", AlbumArtist: "?", Album: "Animals", Title: "?", TrackNumber: 1},
+			cfg:      with("{albumartist}/{album}", "{title}"),
+			expected: filepath.Join("_", "Animals", "_"),
+		},
+		{
+			name:     "artist .., album ?., title .",
+			meta:     TrackMetadata{Artist: "..", AlbumArtist: "..", Album: "?.", Title: ".", TrackNumber: 1},
+			cfg:      with("{albumartist}/{album}", "{title}"),
+			expected: filepath.Join("_", "_", "_"),
+		},
+		{
+			name:     "title emptied by the feat. removal",
+			meta:     TrackMetadata{Artist: "A", AlbumArtist: "A", Album: "B", Title: "? (feat. X)", TrackNumber: 1},
+			cfg:      with("{albumartist}/{album}", "{title}"),
+			expected: filepath.Join("A", "B", "_"),
+		},
+		{
+			name:     "title of spaces",
+			meta:     TrackMetadata{Artist: "A", AlbumArtist: "A", Album: "B", Title: "   ", TrackNumber: 1},
+			cfg:      with("{albumartist}/{album}", "{title}"),
+			expected: filepath.Join("A", "B", "_"),
+		},
+		{
+			name:     "file of a date the release does not have",
+			meta:     floyd,
+			cfg:      with("{albumartist}/{album}", "{date}"),
+			expected: filepath.Join("Pink Floyd", "Animals", "_"),
+		},
+		{
+			name:     "empty file template",
+			meta:     floyd,
+			cfg:      with("{albumartist}/{album}", ""),
+			expected: filepath.Join("Pink Floyd", "Animals", "_"),
+		},
+		{
+			name:     "fixed text that cleans to nothing",
+			meta:     floyd,
+			cfg:      with("{albumartist}/?/{album}", "{title}"),
+			expected: filepath.Join("Pink Floyd", "_", "Animals", "Dogs"),
+		},
+		{
+			name:     "empty levels of the template",
+			meta:     floyd,
+			cfg:      with("/{albumartist}//{album}/", "{title}"),
+			expected: filepath.Join("Pink Floyd", "Animals", "Dogs"),
+		},
+		{
+			name:     "level of spaces",
+			meta:     floyd,
+			cfg:      with("{albumartist}/ /{album}", "{title}"),
+			expected: filepath.Join("Pink Floyd", "Animals", "Dogs"),
+		},
+		{
+			name:     "level of a year the release does not have",
+			meta:     floyd,
+			cfg:      with("{albumartist}/{year}/{album}", "{title}"),
+			expected: filepath.Join("Pink Floyd", "Animals", "Dogs"),
+		},
+		{
+			name:     "level of a date the release does not have",
+			meta:     floyd,
+			cfg:      with("{albumartist}/{date}/{album}", "{title}"),
+			expected: filepath.Join("Pink Floyd", "Animals", "Dogs"),
+		},
+		{
+			name:     "level of an original year the release does not have",
+			meta:     floyd,
+			cfg:      with("{albumartist}/{originalyear}/{album}", "{title}"),
+			expected: filepath.Join("Pink Floyd", "Animals", "Dogs"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GeneratePathWithConfig(tt.meta, tt.cfg)
+			if got != tt.expected {
+				t.Errorf("GeneratePathWithConfig() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}

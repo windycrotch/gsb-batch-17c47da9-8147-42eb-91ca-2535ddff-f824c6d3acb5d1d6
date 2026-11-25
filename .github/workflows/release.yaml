@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Check
+        run: nix develop --command make check
+
+      - name: Generate AI Release Notes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Get commits since last tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREVIOUS_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s" "$PREVIOUS_TAG"..HEAD)
+          else
+            COMMITS=$(git log --pretty=format:"- %s")
+          fi
+
+          # Build the JSON payload
+          SYSTEM_PROMPT="You are a release notes writer for Waves, a terminal music player.
+
+          Given git commits, write brief release notes:
+
+          1. One sentence intro (what's the main theme of this release)
+
+          2. Bullet list grouped by category (only include categories that apply):
+             **New Features**
+             **Improvements**
+             **Bug Fixes**
+
+          Rules:
+          - No title or header - start directly with the intro sentence
+          - Merge related commits aggressively: one feature = one bullet, even if it took 20 commits
+          - Aim for 1-3 bullets total. Less is better.
+          - Max 10 words per bullet, no elaboration
+          - Skip entirely: refactors, tests, docs, CI, nix, devShell, build system, wiring, plumbing, internal/dev changes - these are NOT user-facing
+          - Be factual, don't invent features"
+
+          PAYLOAD=$(jq -n \
+            --arg model "claude-sonnet-5" \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg commits "$COMMITS" \
+            '{
+              model: $model,
+              max_tokens: 1024,
+              system: $system,
+              messages: [{ role: "user", content: $commits }]
+            }')
+
+          # Call Claude API
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$PAYLOAD")
+
+          # Extract release notes, falling back to the commit list. Without this,
+          # an API error writes "null" into the published release notes.
+          NOTES=$(echo "$RESPONSE" | jq -r '[.content[]? | select(.type == "text") | .text] | join("\n") // empty')
+          if [ -z "$NOTES" ]; then
+            echo "::warning::Release notes generation failed, using the commit list"
+            echo "$RESPONSE" | head -c 500
+            printf '%s\n' "$COMMITS" > release-notes.md
+          else
+            printf '%s\n' "$NOTES" > release-notes.md
+          fi
+
+          echo "Generated release notes:"
+          cat release-notes.md
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean --release-notes=release-notes.md --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify go install works
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "Testing go install for tag: $TAG"
+          GOPROXY=direct go install github.com/llehouerou/waves@$TAG
+          which waves
+          waves --version

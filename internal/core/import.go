@@ -1,0 +1,220 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/llehouerou/waves/internal/downloads"
+	"github.com/llehouerou/waves/internal/errmsg"
+	"github.com/llehouerou/waves/internal/importer"
+	"github.com/llehouerou/waves/internal/tags"
+)
+
+// What an import and a retag hand a client, so that it imports the core only.
+type (
+	// ImportPlan is what importing a download will do: PrepareImport makes
+	// it, a client shows it, Import carries it out.
+	ImportPlan = importer.Plan
+	ImportFile = importer.PlannedFile
+
+	// FileTags are the tags of an audio file.
+	FileTags = tags.Tag
+
+	// FileProgress is one file of an import or of a retag, and where it is.
+	FileProgress = importer.FileProgress
+	FileState    = importer.FileState
+)
+
+// Where a file of an import or of a retag is.
+const (
+	FilePending         = importer.FilePending         // not reached yet
+	FileWorking         = importer.FileWorking         // being tagged, and moved for an import
+	FileDone            = importer.FileDone            // tagged, and moved for an import
+	FileAlreadyImported = importer.FileAlreadyImported // moved by an earlier import: a success
+	FileFailed          = importer.FileFailed
+)
+
+// ErrImportRunning is returned by Import while another import runs.
+var ErrImportRunning = errors.New("another import is running")
+
+// ErrDownloadImporting is returned by Delete, and by ClearCompleted, for the
+// download the core is importing: it is left alone until its import is over.
+var ErrDownloadImporting = errors.New("the download is being imported")
+
+// What Import says of a download Delete or ClearCompleted is working on.
+var (
+	errDownloadDeleting = errors.New("the download is being deleted")
+	errClearing         = errors.New("completed downloads are being cleared")
+)
+
+// BuildGenreString is the genre an import or a retag writes for a release:
+// its own genres, or its release group's when it has none.
+func BuildGenreString(releaseGenres, releaseGroupGenres []string) string {
+	return importer.BuildGenreString(releaseGenres, releaseGroupGenres)
+}
+
+// BuildReleaseType is the release type an import or a retag writes for a
+// release group, in lower case ("album; live"); empty for no group.
+func BuildReleaseType(group *MBReleaseGroup) string {
+	return importer.BuildReleaseType(group)
+}
+
+// TrackArtist is the artist an import or a retag writes on a track of a
+// release: its own, or the release's when it has none.
+func TrackArtist(release *MBReleaseDetails, track *MBTrack) string {
+	return importer.TrackArtist(release, track)
+}
+
+// TrackArtistID is the MusicBrainz artist ID an import or a retag writes on a
+// track of a release: the IDs of the artists it credits ("idA; idB"), or the
+// release's when it credits none.
+func TrackArtistID(release *MBReleaseDetails, track *MBTrack) string {
+	return importer.TrackArtistID(release, track)
+}
+
+// ParseTrackNumber reads the track number a file name starts with, 0 when it
+// has none.
+func ParseTrackNumber(filename string) int {
+	return downloads.ParseTrackNumber(filename)
+}
+
+// AllDone reports whether every file of an import or of a retag made it:
+// none failed, none was left out.
+func AllDone(files []FileProgress) bool {
+	for i := range files {
+		if files[i].State != FileDone && files[i].State != FileAlreadyImported {
+			return false
+		}
+	}
+	return len(files) > 0
+}
+
+// PrepareImport plans the import of a download: it reads the tags of its
+// files, settles the release they are imported as (their own when their tags
+// name another than the one queued) and its release group, fetches its cover
+// and matches each file to a track. Nothing is written.
+//
+// It waits for the disk and for MusicBrainz: a client calls it off its UI
+// goroutine.
+func (d *Downloads) PrepareImport(id int64) (ImportPlan, error) {
+	dl, err := d.mgr.Get(id)
+	if err != nil {
+		return ImportPlan{}, err
+	}
+	return importer.Prepare(dl, d.completedPath, d.core.musicbrainz, d.rename)
+}
+
+// Import starts importing a plan into the library source and returns at once.
+// The core tags and moves each file, writes the cover, adds the tracks to the
+// library and, when every file made it, finishes the import of the download.
+// ImportProgressed follows it and ImportFinished ends it.
+//
+// The source is checked when the import starts. A RemoveSource of it while
+// the import runs does not cut it short: every file is moved into the folder,
+// but none is added to the library, which no longer holds them. The import
+// has not made it: ImportFinished carries an error, and the download is kept,
+// to be imported again once the folder is a library source again.
+//
+// One import runs at a time: a second one is refused with ErrImportRunning.
+// Until it is over, Delete and ClearCompleted leave its download alone; a
+// download they are still working on is not imported.
+func (d *Downloads) Import(plan ImportPlan, source string) error {
+	if plan.Release == nil {
+		return importer.ErrNoRelease
+	}
+	lib := d.core.library.lib
+	isSource, err := lib.SourceExists(source)
+	if err != nil {
+		return err
+	}
+	if !isSource {
+		return fmt.Errorf("%s is not a library source", source)
+	}
+	if err := d.startImport(plan.DownloadID); err != nil {
+		return err
+	}
+
+	d.core.work.Go(func() {
+		files := importer.Run(plan, source, d.rename, throttled(func(files []FileProgress) {
+			d.core.emit(ImportProgressed{DownloadID: plan.DownloadID, Files: files})
+		}), d.core.stopping)
+
+		// Whatever was moved is in the library folder: the library must know,
+		// even when the import failed on other files or Close cut it short.
+		// It adds no file the sources no longer hold: the source was removed
+		// meanwhile, and the import has not made it.
+		var moved []string
+		for i := range files {
+			if files[i].Dest != "" {
+				moved = append(moved, files[i].Dest)
+			}
+		}
+		outside, err := lib.AddTracks(moved)
+		if err == nil && len(outside) > 0 {
+			err = fmt.Errorf("%s is no longer a library source", source)
+		}
+		if err == nil && AllDone(files) {
+			if err := d.mgr.FinishImport(plan.DownloadID); err != nil && !d.core.stopping() {
+				// The tracks are in the library: the import itself succeeded.
+				d.core.emit(Failed{Op: errmsg.OpDownloadCleanup, Err: err})
+			}
+		}
+
+		d.endImport()
+		if d.core.stopping() {
+			return // cut short by Close: not an import that failed
+		}
+		if err == nil && AllDone(files) {
+			d.core.notifications.imported(plan.Release.Artist, plan.Release.Title)
+		}
+		d.core.emit(ImportFinished{
+			DownloadID: plan.DownloadID,
+			Artist:     plan.Release.Artist,
+			Album:      plan.Release.Title,
+			Files:      files,
+			Err:        err,
+		})
+	})
+	return nil
+}
+
+// startImport records that the core imports download id. It refuses while
+// an import runs, and while a Delete of id or a ClearCompleted, which could
+// drop id, is still at work.
+func (d *Downloads) startImport(id int64) error {
+	d.busyMu.Lock()
+	defer d.busyMu.Unlock()
+	switch {
+	case d.importing != 0:
+		return ErrImportRunning
+	case d.deleting[id] > 0:
+		return errDownloadDeleting
+	case d.clearing > 0:
+		return errClearing
+	}
+	d.importing = id
+	return nil
+}
+
+// endImport records that the import is over: its download can be deleted or
+// cleared again.
+func (d *Downloads) endImport() {
+	d.busyMu.Lock()
+	defer d.busyMu.Unlock()
+	d.importing = 0
+}
+
+// throttled returns report limited to one call per progressEvery; the first
+// goes through. What it is given must be a whole state rather than a step, so
+// that a call left out loses nothing.
+func throttled[T any](report func(T)) func(T) {
+	var last time.Time
+	return func(state T) {
+		if time.Since(last) < progressEvery {
+			return
+		}
+		last = time.Now()
+		report(state)
+	}
+}

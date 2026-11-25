@@ -1,0 +1,389 @@
+// internal/app/view.go
+package app
+
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/llehouerou/waves/internal/app/navctl"
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/keymap"
+	"github.com/llehouerou/waves/internal/ui"
+	"github.com/llehouerou/waves/internal/ui/headerbar"
+	"github.com/llehouerou/waves/internal/ui/jobbar"
+	"github.com/llehouerou/waves/internal/ui/playerbar"
+	"github.com/llehouerou/waves/internal/ui/popup"
+	"github.com/llehouerou/waves/internal/ui/render"
+	"github.com/llehouerou/waves/internal/ui/styles"
+)
+
+// View renders the application UI: the screen the quit key left while the
+// core closes.
+func (m Model) View() string {
+	if m.closing {
+		return m.closingView
+	}
+	return m.view()
+}
+
+// closingScreen is the screen while the core closes: what it showed, with the
+// line that says waves finishes its background work. Once loaded, that line is
+// in the notification bar; before, the loading screen has no bar for it.
+func (m Model) closingScreen() string {
+	screen := m.view()
+	if m.loadingState == loadingDone {
+		return screen
+	}
+	if screen == "" {
+		return closingMessage
+	}
+	return screen + "\n" + closingMessage
+}
+
+// view renders the application UI.
+func (m Model) view() string {
+	// During loading, show appropriate screen
+	switch m.loadingState {
+	case loadingWaiting:
+		// Brief blank screen while waiting to see if we need to show loading
+		return ""
+	case loadingShowing:
+		return m.renderLoading()
+	case loadingDone:
+		// Continue to normal rendering below
+	}
+
+	view := m.panels
+
+	// Add player bar if playing
+	if !m.Core.Playback().IsStopped() {
+		view += "\n" + m.renderPlayerBar()
+	}
+
+	// Add job bar if there are active jobs
+	if m.HasActiveJobs() {
+		var jobs []jobbar.Job
+		if m.LibraryScanJob != nil {
+			jobs = append(jobs, *m.LibraryScanJob)
+		}
+		jobs = append(jobs, m.exportJobs()...)
+		jobState := jobbar.State{Jobs: jobs}
+		view += "\n" + jobbar.Render(jobState, m.Layout.Width())
+	}
+
+	// Add notification bar if there are notifications
+	if len(m.Notifications) > 0 {
+		view += "\n" + m.renderNotifications()
+	}
+
+	// Overlay search popup if active
+	if m.Input.IsSearchActive() {
+		searchView := m.Input.SearchView()
+		view = popup.Compose(view, searchView, m.Layout.Width(), m.Layout.Height())
+	}
+
+	// Overlay all popups
+	view = m.Popups.RenderOverlay(view)
+
+	// Ensure view is exactly terminal height (pad or truncate if needed)
+	view = enforceHeight(view, m.Layout.Width(), m.Layout.Height())
+
+	// Prepend album art transmission if pending (sent once per track)
+	if m.albumArtPendingTransmit != "" {
+		view = m.albumArtPendingTransmit + view
+	}
+
+	// Append album art placement command (Kitty graphics protocol)
+	view += m.getAlbumArtPlacement()
+
+	return view
+}
+
+// renderPanels renders the header, the active navigator and the queue panel:
+// everything above the player bar. Update calls it for every message except
+// the playback tick and stores the result in m.panels (issue #54), so nothing
+// in here may depend on playback position or wall-clock time.
+func (m Model) renderPanels() string {
+	var libSubMode headerbar.LibrarySubMode
+	switch m.Navigation.LibrarySubMode() {
+	case navctl.LibraryModeMiller:
+		libSubMode = headerbar.LibraryModeMiller
+	case navctl.LibraryModeAlbum:
+		libSubMode = headerbar.LibraryModeAlbum
+	case navctl.LibraryModeBrowser:
+		libSubMode = headerbar.LibraryModeBrowser
+	}
+	header := headerbar.Render(string(m.Navigation.ViewMode()), m.Layout.Width(), m.Core.Downloads().Configured(), libSubMode)
+
+	// Render active navigator (special case for empty library and downloads)
+	var navView string
+	switch m.Navigation.ViewMode() {
+	case navctl.ViewLibrary:
+		if !m.HasLibrarySources {
+			navView = m.renderEmptyLibrary()
+		} else {
+			navView = m.Navigation.RenderActiveNavigator()
+		}
+	case navctl.ViewFileBrowser, navctl.ViewPlaylists:
+		navView = m.Navigation.RenderActiveNavigator()
+	case navctl.ViewDownloads:
+		navView = m.DownloadsView.View()
+	}
+
+	// Combine navigator and queue panel if visible
+	var view string
+	if m.Layout.IsQueueVisible() {
+		if m.Layout.IsNarrowMode() {
+			// Stack vertically in narrow mode
+			view = navView + "\n" + m.Layout.RenderQueuePanel()
+		} else {
+			// Side by side in normal mode
+			view = joinColumnsView(navView, m.Layout.RenderQueuePanel())
+		}
+	} else {
+		view = navView
+	}
+
+	return header + "\n" + view
+}
+
+// getAlbumArtPlacement returns the graphics commands for album art: the
+// removal of the covers replaced since, and the placement of the current one
+// when the expanded player bar shows it.
+func (m Model) getAlbumArtPlacement() string {
+	if m.AlbumArt == nil {
+		return ""
+	}
+
+	// Row 0 places nothing. The removals go out whatever is on screen: a
+	// track with no cover has nothing to place, and still a cover to remove.
+	imageRow := 0
+	if playerRow := m.PlayerBarRow(); playerRow > 0 && m.Layout.PlayerDisplayMode() == playerbar.ModeExpanded {
+		imageRow = playerRow + 1 // just after the top border, no vertical padding
+	}
+	imageCol := 4 // left border (1) + horizontal padding (2) + 1
+
+	return m.AlbumArt.GetPlacementCmd(imageRow, imageCol)
+}
+
+// enforceHeight ensures the view has exactly the specified number of lines.
+// When the theme has an explicit background, each line is padded to the full
+// terminal width and rendered with the background color.
+func enforceHeight(view string, targetWidth, targetHeight int) string {
+	lines := splitLines(view)
+	currentHeight := len(lines)
+
+	if currentHeight < targetHeight {
+		for i := currentHeight; i < targetHeight; i++ {
+			lines = append(lines, "")
+		}
+	} else if currentHeight > targetHeight {
+		lines = lines[:targetHeight]
+	}
+
+	// Apply explicit background if set
+	t := styles.T()
+	if t.HasExplicitBackground {
+		bgStyle := lipgloss.NewStyle().
+			Background(t.BgBase).
+			Foreground(t.FgBase)
+		for i, line := range lines {
+			lineWidth := lipgloss.Width(line)
+			if lineWidth < targetWidth {
+				line += strings.Repeat(" ", targetWidth-lineWidth)
+			}
+			lines[i] = bgStyle.Render(line)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderLoading() string {
+	// Can't render before we know terminal size
+	if m.Layout.Width() == 0 || m.Layout.Height() == 0 {
+		return ""
+	}
+
+	logo := `
+     ██╗    ██╗ █████╗ ██╗   ██╗███████╗███████╗
+     ██║    ██║██╔══██╗██║   ██║██╔════╝██╔════╝
+     ██║ █╗ ██║███████║██║   ██║█████╗  ███████╗
+     ██║███╗██║██╔══██║╚██╗ ██╔╝██╔══╝  ╚════██║
+     ╚███╔███╔╝██║  ██║ ╚████╔╝ ███████╗███████║
+      ╚══╝╚══╝ ╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚══════╝
+`
+
+	// Animated wave - 2 lines, centered under logo
+	waveChars := []rune{'~', '∿', '≈', '∼', '≈', '∿'}
+	waveWidth := 36
+
+	buildWaveLine := func(offset int) string {
+		var sb strings.Builder
+		for i := range waveWidth {
+			charIdx := (i + offset) % len(waveChars)
+			sb.WriteRune(waveChars[charIdx])
+		}
+		return sb.String()
+	}
+	waveLine0 := buildWaveLine(m.LoadingFrame)
+	waveLine1 := buildWaveLine(m.LoadingFrame + 2)
+
+	t := styles.T()
+	titleStyle := t.BaseStyle().
+		Foreground(t.Primary).
+		Bold(true)
+
+	waveStyle := t.BaseStyle().
+		Foreground(t.Secondary)
+
+	statusStyle := t.S().Muted.Italic(true)
+
+	// Center everything
+	logoWidth := 53 // Width of the logo
+	wavePad := strings.Repeat(" ", (logoWidth-waveWidth)/2)
+	statusPad := strings.Repeat(" ", (logoWidth-len(m.LoadingStatus))/2)
+
+	content := titleStyle.Render(logo) + "\n" +
+		waveStyle.Render(wavePad+waveLine0) + "\n" +
+		waveStyle.Render(wavePad+waveLine1) + "\n\n" +
+		statusStyle.Render(statusPad+m.LoadingStatus)
+
+	return popup.Center(content, m.Layout.Width(), m.Layout.Height())
+}
+
+// splitLines splits a string into lines without using strings.Split.
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i := range len(s) {
+		if s[i] == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
+}
+
+// joinColumnsView joins two column views side by side.
+func joinColumnsView(left, right string) string {
+	leftLines := splitLines(left)
+	rightLines := splitLines(right)
+
+	lineCount := max(len(leftLines), len(rightLines))
+
+	var sb strings.Builder
+	for i := range lineCount {
+		if i < len(leftLines) {
+			sb.WriteString(leftLines[i])
+		}
+		if i < len(rightLines) {
+			sb.WriteString(rightLines[i])
+		}
+		if i < lineCount-1 {
+			sb.WriteByte('\n')
+		}
+	}
+	return sb.String()
+}
+
+// renderPlayerBar renders the player bar with radio state.
+func (m Model) renderPlayerBar() string {
+	state := playerbar.NewState(m.Core.Playback(), m.Layout.PlayerDisplayMode())
+	state.RadioEnabled = m.Core.Playback().RepeatMode() == core.RepeatRadio
+
+	// Set up album art placeholder for expanded mode
+	if state.DisplayMode == playerbar.ModeExpanded && state.TrackPath != "" && m.AlbumArt != nil {
+		state.HasAlbumArt = m.AlbumArt.HasImage()
+		if state.HasAlbumArt {
+			state.AlbumArtPlaceholder = m.AlbumArt.GetPlaceholder()
+		}
+	}
+
+	return playerbar.Render(state, m.Layout.Width())
+}
+
+// renderEmptyLibrary renders a helpful message when no library sources are configured.
+func (m Model) renderEmptyLibrary() string {
+	// Use same dimensions as navigator panel
+	innerWidth := max(m.Layout.NavigatorWidth()-ui.BorderHeight, 0)
+	listHeight := max(m.NavigatorHeight()-ui.PanelOverhead, 0)
+
+	// Header and separator (like navigator)
+	header := render.TruncateAndPad("Library", innerWidth)
+	separator := render.Separator(innerWidth)
+
+	t := styles.T()
+	messageStyle := t.S().Muted
+
+	hintStyle := t.BaseStyle().
+		Foreground(t.Primary).
+		Bold(true)
+
+	// Build the message, its key taken from the binding and styled in place
+	key := m.Keys.KeysFor(keymap.ActionLibrarySources)[0]
+	msgLines := []string{
+		"No library sources configured.",
+		"",
+		"Press  " + hintStyle.Render(key) + "  to open the library sources manager",
+		"and add a music folder to get started.",
+	}
+	styledLines := make([]string, len(msgLines))
+	for i, line := range msgLines {
+		styledLines[i] = messageStyle.Render(line)
+	}
+
+	// Build content area that fills the full height with centered message
+	contentLines := make([]string, listHeight)
+	msgHeight := len(styledLines)
+	startLine := max(0, (listHeight-msgHeight)/2)
+
+	for i := range listHeight {
+		msgIdx := i - startLine
+		if msgIdx >= 0 && msgIdx < msgHeight {
+			// Center the message line horizontally
+			line := styledLines[msgIdx]
+			lineWidth := lipgloss.Width(line)
+			padLeft := max(0, (innerWidth-lineWidth)/2)
+			contentLines[i] = render.EmptyLine(padLeft) + line
+		} else {
+			contentLines[i] = ""
+		}
+		// Pad to full width
+		contentLines[i] = render.Pad(contentLines[i], innerWidth)
+	}
+
+	content := header + "\n" + separator + "\n" + strings.Join(contentLines, "\n")
+
+	// Wrap with panel style (focused since navigator has focus in library view)
+	focused := m.Navigation.IsNavigatorFocused()
+	return styles.PanelStyle(focused).Width(innerWidth).Render(content)
+}
+
+// renderNotifications renders all notification messages.
+func (m Model) renderNotifications() string {
+	if len(m.Notifications) == 0 {
+		return ""
+	}
+
+	t := styles.T()
+	innerWidth := m.Layout.Width() - 2 // Account for borders
+
+	// Style: checkmark + message
+	checkStyle := t.BaseStyle().Foreground(t.Primary)
+	msgStyle := t.BaseStyle().Foreground(t.FgBase)
+
+	lines := make([]string, 0, len(m.Notifications))
+	for _, n := range m.Notifications {
+		line := checkStyle.Render("✓") + " " + msgStyle.Render(n.Message)
+		line = render.TruncateAndPad(line, innerWidth)
+		lines = append(lines, line)
+	}
+
+	content := strings.Join(lines, "\n")
+	return styles.PanelStyle(false).Width(innerWidth).Render(content)
+}

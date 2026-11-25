@@ -1,0 +1,76 @@
+package tags
+
+import "go.senan.xyz/taglib"
+
+// readOggWithTaglib reads Ogg metadata using TagLib as fallback when dhowden/tag fails.
+func readOggWithTaglib(path string) (*Tag, error) {
+	rawTags, err := taglib.ReadTags(path)
+	if err != nil {
+		return nil, err
+	}
+	tags := tagValues(rawTags)
+
+	t := &Tag{
+		Path:        path,
+		Title:       tags.get(taglib.Title),
+		Artist:      tags.get(taglib.Artist),
+		AlbumArtist: tags.get(taglib.AlbumArtist),
+		Album:       tags.get(taglib.Album),
+		Genre:       tags.get(taglib.Genre),
+		TrackNumber: tags.getInt(taglib.TrackNumber),
+		TotalTracks: tags.getInt("TOTALTRACKS"),
+		DiscNumber:  tags.getInt(taglib.DiscNumber),
+		TotalDiscs:  tags.getInt("TOTALDISCS"),
+	}
+
+	// Read extended tags
+	readOggExtendedTags(path, t)
+
+	t.applyFallbacks()
+	t.Sanitize()
+	return t, nil
+}
+
+// readOggExtendedTags reads extended Vorbis comments from an Ogg file using TagLib.
+func readOggExtendedTags(path string, t *Tag) {
+	rawTags, err := taglib.ReadTags(path)
+	if err != nil {
+		return
+	}
+	tags := tagValues(rawTags)
+
+	t.joinBasicIfSeveral(tags.basicValues)
+
+	// Read extended tags
+	t.Date = tags.get(taglib.Date)
+	t.OriginalDate = tags.get(taglib.OriginalDate)
+	if t.OriginalDate == "" {
+		t.OriginalDate = tags.get("ORIGINALYEAR")
+	}
+
+	t.ArtistSortName = tags.get(taglib.ArtistSort)
+	t.Label = tags.get(taglib.Label)
+	t.CatalogNumber = tags.get(taglib.CatalogNumber)
+	t.Barcode = tags.get(taglib.Barcode)
+	t.Media = tags.get(taglib.Media)
+	t.ReleaseStatus = tags.get(taglib.ReleaseStatus)
+	t.ReleaseType = tags.get(taglib.ReleaseType)
+	t.Script = tags.get(taglib.Script)
+	t.Country = tags.get(taglib.ReleaseCountry)
+	t.ISRC = tags.get(taglib.ISRC)
+
+	// MusicBrainz IDs
+	t.MBArtistID = tags.get(taglib.MusicBrainzArtistID)
+	t.MBReleaseID = tags.get(taglib.MusicBrainzAlbumID)
+	t.MBReleaseGroupID = tags.get(taglib.MusicBrainzReleaseGroupID)
+	t.MBRecordingID = tags.get(taglib.MusicBrainzTrackID) // Recording ID uses MUSICBRAINZ_TRACKID
+	t.MBTrackID = tags.get(taglib.MusicBrainzReleaseTrackID)
+
+	// Track/disc totals (dhowden/tag may not return these)
+	if t.TotalTracks == 0 {
+		t.TotalTracks = tags.getInt("TOTALTRACKS")
+	}
+	if t.TotalDiscs == 0 {
+		t.TotalDiscs = tags.getInt("TOTALDISCS")
+	}
+}

@@ -1,0 +1,1062 @@
+// internal/playback/service_impl.go
+package playback
+
+import (
+	"errors"
+	"sync"
+	"time"
+
+	"github.com/llehouerou/waves/internal/player"
+	"github.com/llehouerou/waves/internal/playlist"
+	"github.com/llehouerou/waves/internal/tags"
+)
+
+// Errors returned by playback service methods.
+var (
+	ErrEmptyQueue   = errors.New("queue is empty")
+	ErrInvalidIndex = errors.New("invalid queue index")
+)
+
+// Verify serviceImpl implements Service at compile time.
+var _ Service = (*serviceImpl)(nil)
+
+type serviceImpl struct {
+	mu sync.RWMutex
+
+	player player.Interface
+	queue  *playlist.PlayingQueue
+
+	// lastPlayedIndex tracks the queue index when Play() was last called.
+	// Used to detect track changes and emit TrackChange events.
+	lastPlayedIndex int
+	// lastPlayedPath tracks the path of the last played track.
+	// Used alongside lastPlayedIndex to detect actual track changes.
+	lastPlayedPath string
+	// lastPlayedEntry is the queue entry last played. An undo or a redo moves
+	// lastPlayedIndex to where the list it restores holds that entry.
+	lastPlayedEntry playlist.EntryID
+	// playPathMu serialises player commands that open a file, so they stay
+	// ordered over the window where startPlayback releases s.mu.
+	playPathMu sync.Mutex
+
+	// liveFrom is the first player start whose finish this service still acts
+	// on. Starting a track, or stopping the player, moves it past every start so
+	// far: the finish of a track a command replaced or stopped is stale, even when
+	// it arrives while the command's own open is still running (issue #120).
+	liveFrom uint64
+
+	// ranOut is set when the queue ran out: a track finished, or Next was
+	// asked while the player was active, with nothing to move to, and not
+	// because the track that played was removed. A track start, Stop, a move
+	// of the queue position or the removal of the current track (by an edit,
+	// an undo or a redo) clears it.
+	// ResumeAfterRunOut acts on it.
+	ranOut bool
+
+	// currentRemoved is set when RemoveTracks removed the current track, or an
+	// undo or a redo took it out of a queue it left with tracks. While the
+	// queue has no current track, playback stops on purpose when the track the
+	// player is on ends (#166). A track start, ClearQueue, or an undo or a redo
+	// that leaves a current track or an empty queue clears it.
+	currentRemoved bool
+
+	subs   []*Subscription
+	subsMu sync.RWMutex
+
+	done   chan struct{}
+	closed bool
+}
+
+// New creates a new playback service.
+func New(p player.Interface, q *playlist.PlayingQueue) Service {
+	s := &serviceImpl{
+		player:          p,
+		queue:           q,
+		lastPlayedIndex: -1, // No track played yet
+		done:            make(chan struct{}),
+	}
+	p.SetPreloadFunc(s.nextTrackPath)
+	go s.watchTrackFinished()
+	return s
+}
+
+// nextTrackPath tells the player which track to preload for gapless playback,
+// or "" when the next track cannot be known in advance.
+func (s *serviceImpl) nextTrackPath() string {
+	if next := s.QueuePeekNext(); next != nil {
+		return next.Path
+	}
+	return ""
+}
+
+// State returns the current playback state.
+func (s *serviceImpl) State() State {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.playerStateToState(s.player.State())
+}
+
+func (s *serviceImpl) playerStateToState(ps player.State) State {
+	switch ps {
+	case player.Playing:
+		return StatePlaying
+	case player.Paused:
+		return StatePaused
+	case player.Stopped:
+		return StateStopped
+	default:
+		return StateStopped
+	}
+}
+
+// IsPlaying returns true if currently playing.
+func (s *serviceImpl) IsPlaying() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.player.State() == player.Playing
+}
+
+// IsStopped returns true if currently stopped.
+func (s *serviceImpl) IsStopped() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.player.State() == player.Stopped
+}
+
+// IsPaused returns true if currently paused.
+func (s *serviceImpl) IsPaused() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.player.State() == player.Paused
+}
+
+// Position returns the current playback position.
+func (s *serviceImpl) Position() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.player.Position()
+}
+
+// Duration returns the current track duration.
+func (s *serviceImpl) Duration() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.player.Duration()
+}
+
+// CurrentTrack returns the current track, or nil if none.
+func (s *serviceImpl) CurrentTrack() *Track {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.currentTrackLocked()
+}
+
+func (s *serviceImpl) currentTrackLocked() *Track {
+	t := s.queue.Current()
+	if t == nil {
+		return nil
+	}
+	track := TrackFromPlaylist(*t)
+	return &track
+}
+
+// TrackInfo returns metadata about the currently playing track.
+func (s *serviceImpl) TrackInfo() *tags.FileInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.player.TrackInfo()
+}
+
+// QueueTracks returns a copy of all tracks in the queue.
+func (s *serviceImpl) QueueTracks() []Track {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return TracksFromPlaylist(s.queue.Tracks())
+}
+
+// QueueEntries returns the entries of the queue, in its order.
+func (s *serviceImpl) QueueEntries() []QueueEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	tracks := s.queue.Tracks()
+	entries := make([]QueueEntry, len(tracks))
+	for i, t := range tracks {
+		entries[i] = QueueEntry{ID: EntryID(s.queue.EntryAt(i)), Track: TrackFromPlaylist(t)}
+	}
+	return entries
+}
+
+// QueueCurrentIndex returns the current queue index (-1 if none).
+func (s *serviceImpl) QueueCurrentIndex() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queue.CurrentIndex()
+}
+
+// QueueLen returns the number of tracks in the queue.
+func (s *serviceImpl) QueueLen() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queue.Len()
+}
+
+// QueueIsEmpty returns true if the queue is empty.
+func (s *serviceImpl) QueueIsEmpty() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queue.IsEmpty()
+}
+
+// QueueHasNext returns true if there is a next track in the queue.
+func (s *serviceImpl) QueueHasNext() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queue.HasNext()
+}
+
+// QueuePeekNext returns the next track without advancing the queue.
+// Returns nil if there is no next track.
+func (s *serviceImpl) QueuePeekNext() *Track {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	queueTrack := s.queue.PeekNext()
+	if queueTrack == nil {
+		return nil
+	}
+	track := TrackFromPlaylist(*queueTrack)
+	return &track
+}
+
+// AddTracks adds tracks to the end of the queue.
+func (s *serviceImpl) AddTracks(tracks ...Track) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	playlistTracks := TracksToPlaylist(tracks)
+	s.queue.Add(playlistTracks...)
+	s.queueChanged()
+}
+
+// ReplaceTracks replaces all tracks in the queue.
+// Returns the track at index 0 or nil if empty.
+func (s *serviceImpl) ReplaceTracks(tracks ...Track) *Track {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	playlistTracks := TracksToPlaylist(tracks)
+	first := s.queue.Replace(playlistTracks...)
+	s.ranOut = false
+	s.queueChanged()
+	if first == nil {
+		return nil
+	}
+	result := TrackFromPlaylist(*first)
+	return &result
+}
+
+// ClearQueue removes all tracks from the queue.
+func (s *serviceImpl) ClearQueue() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queue.Clear()
+	s.ranOut = false
+	s.currentRemoved = false
+	s.queueChanged()
+}
+
+// RestoreQueue puts back a queue saved by an earlier run.
+func (s *serviceImpl) RestoreQueue(saved SavedQueue) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queue.Restore(TracksToPlaylist(saved.Tracks), saved.Index)
+	s.queue.SetRepeatMode(playlist.RepeatMode(saved.RepeatMode))
+	s.queue.SetShuffle(saved.Shuffle)
+	s.lastPlayedIndex = -1
+	s.lastPlayedPath = ""
+	s.lastPlayedEntry = 0
+}
+
+// LibraryTrackIDs returns the IDs of the library tracks the queue and its
+// history hold.
+func (s *serviceImpl) LibraryTrackIDs() []int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queue.LibraryTrackIDs()
+}
+
+// RefreshLibraryTracks gives the queue entries holding the library tracks of
+// tracks what tracks has for them.
+func (s *serviceImpl) RefreshLibraryTracks(tracks map[int64]Track) {
+	byID := make(map[int64]playlist.Track, len(tracks))
+	for id, t := range tracks {
+		byID[id] = t.ToPlaylist()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queue.RefreshTracks(byID) {
+		s.queueChanged()
+	}
+}
+
+// RemoveTracks removes the tracks at the given queue indices.
+func (s *serviceImpl) RemoveTracks(indices []int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hadCurrent := s.queue.CurrentIndex() >= 0
+	if s.queue.RemoveIndices(indices) {
+		if hadCurrent && s.queue.CurrentIndex() < 0 {
+			s.currentRemoved = true
+			s.ranOut = false
+		}
+		s.lastPlayedIndex = playlist.IndexAfterRemove(s.lastPlayedIndex, indices)
+		s.queueChanged()
+	}
+}
+
+// MoveTracks moves the tracks at the given queue indices by delta.
+func (s *serviceImpl) MoveTracks(indices []int, delta int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.queue.MoveIndices(indices, delta) {
+		s.lastPlayedIndex = playlist.IndexAfterMove(s.lastPlayedIndex, indices, delta)
+		s.queueChanged()
+	}
+}
+
+// Undo reverts the last queue modification. The queue position follows the
+// current entry (see playlist.PlayingQueue.Undo), and Last-played follows the
+// entry last played; the player is not touched. An undo that takes the
+// current track out of the queue leaves it as RemoveTracks of that track
+// does, and one that empties the queue leaves it as ClearQueue does.
+func (s *serviceImpl) Undo() bool {
+	return s.walkHistory(s.queue.Undo)
+}
+
+// Redo reapplies the last undone queue modification, the position and
+// Last-played following their entries as for Undo.
+func (s *serviceImpl) Redo() bool {
+	return s.walkHistory(s.queue.Redo)
+}
+
+// walkHistory performs walk, an undo or a redo of the queue, and settles what
+// the service keeps about the queue on the list it restored.
+func (s *serviceImpl) walkHistory(walk func() bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hadCurrent := s.queue.CurrentIndex() >= 0
+	if !walk() {
+		return false
+	}
+	switch {
+	case s.queue.CurrentIndex() >= 0:
+		s.currentRemoved = false
+	case s.queue.IsEmpty():
+		// An emptied queue is a cleared one, whichever edit took the current
+		// track out of it.
+		s.ranOut = false
+		s.currentRemoved = false
+	case hadCurrent:
+		s.ranOut = false
+		s.currentRemoved = true
+	}
+	if index := s.queue.IndexOf(s.lastPlayedEntry); index >= 0 {
+		s.lastPlayedIndex = index
+	}
+	s.queueChanged()
+	return true
+}
+
+// QueueAdvance advances the queue position (respecting repeat/shuffle modes)
+// without starting playback. Returns the track at the new position, or nil.
+// Emits QueueChange; TrackChange waits until Play() is called.
+func (s *serviceImpl) QueueAdvance() *Track {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t := s.queue.Next()
+	if t == nil {
+		return nil
+	}
+	s.ranOut = false
+	s.queueChanged()
+	track := TrackFromPlaylist(*t)
+	return &track
+}
+
+// QueueMoveTo moves the queue position to the specified index
+// without starting playback. Returns the track at that position, or nil.
+// Emits QueueChange; TrackChange waits until Play() is called.
+func (s *serviceImpl) QueueMoveTo(index int) *Track {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	t := s.queue.JumpTo(index)
+	if t == nil {
+		return nil
+	}
+	s.ranOut = false
+	s.queueChanged()
+	track := TrackFromPlaylist(*t)
+	return &track
+}
+
+// RepeatMode returns the current repeat mode.
+func (s *serviceImpl) RepeatMode() RepeatMode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return RepeatMode(s.queue.RepeatMode())
+}
+
+// Shuffle returns whether shuffle is enabled.
+func (s *serviceImpl) Shuffle() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.queue.Shuffle()
+}
+
+// Subscribe creates a new event subscription.
+func (s *serviceImpl) Subscribe() *Subscription {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	sub := newSubscription()
+	s.subs = append(s.subs, sub)
+	return sub
+}
+
+// Close shuts down the service.
+func (s *serviceImpl) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	close(s.done)
+	s.mu.Unlock()
+
+	s.subsMu.Lock()
+	for _, sub := range s.subs {
+		sub.close()
+	}
+	s.subs = nil
+	s.subsMu.Unlock()
+
+	return nil
+}
+
+// watchTrackFinished listens for track finished signals and auto-advances.
+func (s *serviceImpl) watchTrackFinished() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case start := <-s.player.FinishedChan():
+			s.handleTrackFinished(start)
+		}
+	}
+}
+
+// startPlayback plays a track and reports the start once it succeeded. From the
+// moment it begins, the finish of any track started before is stale.
+//
+// Must be called with s.mu held, and returns with it held. It releases the lock
+// while the player opens the file: that is blocking I/O, seconds on a cold
+// network mount and unbounded on an unreachable one, and the renderer reads the
+// same lock on every frame (issue #45). playPathMu keeps player commands
+// serialised over the window where s.mu is not held, and is never held while
+// waiting for s.mu, so the two cannot deadlock.
+//
+// The caller's captured state can go stale across that window; the cost is a
+// possibly inaccurate event under concurrent commands, against a guaranteed UI
+// freeze otherwise.
+func (s *serviceImpl) startPlayback(track playlist.Track, index int) error {
+	s.liveFrom = s.player.TrackStarts() + 1
+	s.ranOut = false
+	s.currentRemoved = false
+	s.mu.Unlock()
+	s.playPathMu.Lock()
+	err := s.player.Play(track.Path)
+	s.playPathMu.Unlock()
+	s.mu.Lock()
+
+	if err != nil {
+		return err
+	}
+	s.emitTrackStart(track, index)
+	return nil
+}
+
+// transition describes one queue move and everything that must follow it.
+type transition struct {
+	// move advances the queue position and returns the track now current, or
+	// nil when the queue is exhausted.
+	move func() *playlist.Track
+	// shouldStart reports whether the player must be told to play the track
+	// moved to. It runs after the move, before TrackChange is emitted.
+	shouldStart func() bool
+	// onExhausted runs when move returns nil. Optional.
+	onExhausted func()
+	// fromPlaying reports a failed start as a stop from Playing, whatever the
+	// player's state: a track finishing was playing, even when a seek past the
+	// end stopped the player before it signalled the finish.
+	fromPlaying bool
+}
+
+// applyTransition performs one queue transition: it captures the track being
+// left, moves the queue, records what was played, starts the new track when the
+// transition asks for it, and reports the change, the state's included. A
+// failed start stops the player and emits StateChange, from the state before the
+// start, ErrorEvent and, the queue having moved, TrackChange before the error
+// is returned.
+//
+// Must be called with s.mu held. The start step releases and reacquires s.mu
+// while the player opens the file (issue #45), so state captured before a
+// transition can be stale after it.
+func (s *serviceImpl) applyTransition(t transition) error {
+	prevTrack := s.currentTrackLocked()
+	prevIndex := s.queue.CurrentIndex()
+
+	next := t.move()
+	if next == nil {
+		if t.onExhausted != nil {
+			t.onExhausted()
+		}
+		return nil
+	}
+
+	s.ranOut = false
+	index := s.queue.CurrentIndex()
+	s.lastPlayedIndex = index
+	s.lastPlayedPath = next.Path
+	s.lastPlayedEntry = s.queue.EntryAt(index)
+
+	if t.shouldStart() {
+		prevState := s.playerStateToState(s.player.State())
+		// A track that will not open leaves the queue already moved, so the
+		// player must not be left running on a track nobody is on. Stop it and
+		// report, whoever asked for the transition. The player stops before it
+		// opens the file, so the stop is reported from the state before the
+		// start, not the one the failed start left.
+		if err := s.startPlayback(*next, index); err != nil {
+			if t.fromPlaying {
+				prevState = StatePlaying
+			}
+			s.stopAndEmitLocked(prevState)
+			s.emitError("play_next", next.Path, err)
+			// The queue is on the track that failed: say so, now that the
+			// player is stopped, the state a subscriber reading it will see.
+			s.emitTrackChange(prevTrack, prevIndex)
+			return err
+		}
+		// Starting from pause, or from a stop on a seek past the end, changes
+		// the state: the core's clock and MPRIS follow it (issue #123).
+		s.emitStateChange(prevState, s.playerStateToState(s.player.State()))
+	}
+
+	// Only now, with the track it moved to playing: seeking past the end stops
+	// the player before signalling finished (issue #38), and a subscriber that
+	// reads the live state on TrackChange would otherwise see Stopped and keep
+	// that stale view until the next state change.
+	s.emitTrackChange(prevTrack, prevIndex)
+	return nil
+}
+
+// isActiveLocked reports whether the player is playing or paused, which is what
+// makes a user-initiated transition start the track it moves to.
+// Must be called while holding mu.
+func (s *serviceImpl) isActiveLocked() bool {
+	state := s.player.State()
+	return state == player.Playing || state == player.Paused
+}
+
+// stopAndEmitLocked stops the player and reports the stop as coming from
+// prev, the state subscribers were last told. The finish of the track it
+// stopped is stale from now on.
+// Must be called while holding mu.
+func (s *serviceImpl) stopAndEmitLocked(prev State) {
+	s.liveFrom = s.player.TrackStarts() + 1
+	s.player.Stop()
+	s.emitStateChange(prev, s.playerStateToState(s.player.State()))
+}
+
+// currentRemovedLocked reports whether the queue has no current track because
+// RemoveTracks removed it. Playback that ends then stops on purpose: it did not
+// run the queue out (#166).
+// Must be called while holding mu.
+func (s *serviceImpl) currentRemovedLocked() bool {
+	return s.currentRemoved && s.queue.CurrentIndex() < 0
+}
+
+// moveToFollowingLocked moves the queue to the track that follows the one the
+// player is on, and returns it, or nil when there is none. A queue with no
+// current track that was cleared, not stripped of its current track, follows
+// on with its first track: the one a fill brought.
+// Must be called while holding mu.
+func (s *serviceImpl) moveToFollowingLocked() *playlist.Track {
+	if s.queue.CurrentIndex() < 0 && !s.currentRemoved {
+		return s.queue.JumpTo(0)
+	}
+	return s.queue.Next()
+}
+
+// handleTrackFinished advances to the next track when the track the player
+// started as start ends, unless that finish is stale.
+func (s *serviceImpl) handleTrackFinished(start uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if start < s.liveFrom {
+		return
+	}
+
+	_ = s.applyTransition(transition{
+		move: s.moveToFollowingLocked,
+		// The player performs gapless transitions itself, so it may already
+		// have started the track the queue just moved to. Neither the state nor
+		// the track path can tell: it is Playing in both cases, and repeat-one
+		// or a duplicated queue entry start the same path again. The start
+		// counter can — it only moves when the player begins a track.
+		//
+		// The track it started is the one it preloaded, from what the queue
+		// said then: a change that took the lock since may have made another
+		// track follow. The self-start is the start of the queue's track only
+		// when the player is on that track's file; otherwise the queue's track
+		// is started, as for a finish the player did not follow (issue #250).
+		shouldStart: func() bool {
+			current := *s.queue.Current()
+			if s.player.TrackStarts() > start && s.playerOnLocked(current.Path) {
+				s.emitTrackStart(current, s.queue.CurrentIndex())
+				return false
+			}
+			return true
+		},
+		onExhausted: func() {
+			// A track finishing was playing, even when a seek past the end
+			// stopped the player before it signalled the finish.
+			s.stopAndEmitLocked(StatePlaying)
+			s.ranOut = !s.currentRemovedLocked()
+		},
+		fromPlaying: true,
+	}) //nolint:errcheck // nothing to return it to: this runs on the watcher goroutine, and applyTransition already reported it
+}
+
+// playerOnLocked reports whether the track the player is on is the file at path.
+// Must be called while holding mu.
+func (s *serviceImpl) playerOnLocked(path string) bool {
+	info := s.player.TrackInfo()
+	return info != nil && info.Path == path
+}
+
+// emitStateChange notifies all subscribers of a state change.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) emitStateChange(prev, curr State) {
+	if prev == curr {
+		return
+	}
+	e := StateChange{Previous: prev, Current: curr}
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendState(e)
+	}
+	s.subsMu.RUnlock()
+}
+
+// emitTrackChange notifies all subscribers of a track change.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) emitTrackChange(prevTrack *Track, prevIndex int) {
+	curr := s.currentTrackLocked()
+	currIndex := s.queue.CurrentIndex()
+
+	// Check both index AND path - queue may have been replaced entirely
+	prevPath := ""
+	if prevTrack != nil {
+		prevPath = prevTrack.Path
+	}
+	currPath := ""
+	if curr != nil {
+		currPath = curr.Path
+	}
+	if prevIndex == currIndex && prevPath == currPath {
+		return // Only emit if actually changed
+	}
+
+	e := TrackChange{
+		Previous:      prevTrack,
+		Current:       curr,
+		PreviousIndex: prevIndex,
+		Index:         currIndex,
+	}
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendTrack(e)
+	}
+	s.subsMu.RUnlock()
+}
+
+// emitTrackStart notifies all subscribers that a track began playing.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) emitTrackStart(track playlist.Track, index int) {
+	e := TrackStart{Track: TrackFromPlaylist(track), Index: index}
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendStart(e)
+	}
+	s.subsMu.RUnlock()
+}
+
+// emitPositionChange notifies all subscribers of a position change.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) emitPositionChange() {
+	pos := s.player.Position()
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendPosition(pos)
+	}
+	s.subsMu.RUnlock()
+}
+
+// modeChanged drops the preloaded track, since repeat and shuffle decide which
+// track comes next, and notifies all subscribers of the mode change.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) modeChanged() {
+	s.player.ClearPreload()
+	e := ModeChange{
+		RepeatMode: RepeatMode(s.queue.RepeatMode()),
+		Shuffle:    s.queue.Shuffle(),
+	}
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendMode(e)
+	}
+	s.subsMu.RUnlock()
+}
+
+// queueChanged drops the preloaded track, which a queue edit or a move of the
+// queue position may have made stale, and notifies all subscribers.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) queueChanged() {
+	s.player.ClearPreload()
+	tracks := make([]Track, 0, len(s.queue.Tracks()))
+	for _, t := range s.queue.Tracks() {
+		tracks = append(tracks, TrackFromPlaylist(t))
+	}
+	e := QueueChange{
+		Tracks: tracks,
+		Index:  s.queue.CurrentIndex(),
+	}
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendQueue(e)
+	}
+	s.subsMu.RUnlock()
+}
+
+// emitError notifies all subscribers of an error.
+// Must be called while holding mu. Acquires subsMu internally.
+func (s *serviceImpl) emitError(operation, path string, err error) {
+	e := ErrorEvent{
+		Operation: operation,
+		Path:      path,
+		Err:       err,
+	}
+	s.subsMu.RLock()
+	for _, sub := range s.subs {
+		sub.sendError(e)
+	}
+	s.subsMu.RUnlock()
+}
+
+// Play starts playback of the current track in the queue, or of its first
+// track when it has none (see startFirstLocked, which reports that move as a
+// TrackChange). With a current track, it emits TrackChange if the track being
+// played is different from the last played track, but only if we were already
+// playing something (not on first play).
+func (s *serviceImpl) Play() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.playLocked()
+}
+
+// playLocked is Play, with s.mu held.
+func (s *serviceImpl) playLocked() error {
+	if len(s.queue.Tracks()) == 0 {
+		return ErrEmptyQueue
+	}
+
+	track := s.queue.Current()
+	if track == nil {
+		return s.startFirstLocked()
+	}
+
+	currentIndex := s.queue.CurrentIndex()
+	currentPath := track.Path
+	currentEntry := s.queue.EntryAt(currentIndex)
+
+	// Check if we're playing a different track than before
+	// Only emit TrackChange if we already played something (lastPlayedIndex >= 0)
+	wasPlaying := s.lastPlayedIndex >= 0
+	trackChanged := wasPlaying && (s.lastPlayedIndex != currentIndex || s.lastPlayedPath != currentPath)
+
+	// Capture previous track info for TrackChange event
+	var prevTrack *Track
+	prevIndex := s.lastPlayedIndex
+	if trackChanged {
+		// Build previous track from what we remember
+		prevTrack = &Track{Path: s.lastPlayedPath}
+	}
+
+	prevState := s.playerStateToState(s.player.State())
+	if err := s.startPlayback(*track, currentIndex); err != nil {
+		// The player stopped what it played before it failed to open this one.
+		s.emitStateChange(prevState, s.playerStateToState(s.player.State()))
+		return err
+	}
+
+	// Update last played tracking
+	s.lastPlayedIndex = currentIndex
+	s.lastPlayedPath = currentPath
+	s.lastPlayedEntry = currentEntry
+
+	currState := s.playerStateToState(s.player.State())
+	s.emitStateChange(prevState, currState)
+
+	// Emit TrackChange after state change if track actually changed
+	if trackChanged {
+		s.emitTrackChange(prevTrack, prevIndex)
+	}
+
+	return nil
+}
+
+// startFirstLocked starts the first track of a queue that has tracks and no
+// current one (tracks added to an empty queue, the current track removed, such
+// a queue restored), whatever the shuffle and repeat modes. The queue moves to
+// it and the move is reported as a TrackChange, once the player plays it or,
+// when it fails to open, once the player is stopped. The start is recorded as
+// the last played. A failed open is returned, not emitted as an ErrorEvent:
+// the caller has it.
+// Must be called with s.mu held and the queue not empty.
+func (s *serviceImpl) startFirstLocked() error {
+	prevState := s.playerStateToState(s.player.State())
+	prevIndex := s.queue.CurrentIndex()
+	// A copy: startPlayback lets go of the queue while the file opens, and an
+	// edit meanwhile would change what a pointer into it reads.
+	track := *s.queue.JumpTo(0)
+	entry := s.queue.EntryAt(0)
+	err := s.startPlayback(track, 0)
+	if err == nil {
+		s.lastPlayedIndex = 0
+		s.lastPlayedPath = track.Path
+		s.lastPlayedEntry = entry
+	}
+	s.emitStateChange(prevState, s.playerStateToState(s.player.State()))
+	s.emitTrackChange(nil, prevIndex)
+	return err
+}
+
+// Pause pauses playback if currently playing.
+func (s *serviceImpl) Pause() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.player.State() != player.Playing {
+		return nil // no-op
+	}
+
+	prevState := s.playerStateToState(s.player.State())
+	s.player.Pause()
+	currState := s.playerStateToState(s.player.State())
+	s.emitStateChange(prevState, currState)
+	return nil
+}
+
+// Resume resumes playback if paused.
+func (s *serviceImpl) Resume() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.player.State() != player.Paused {
+		return nil // no-op
+	}
+
+	prevState := s.playerStateToState(s.player.State())
+	s.player.Resume()
+	currState := s.playerStateToState(s.player.State())
+	s.emitStateChange(prevState, currState)
+	return nil
+}
+
+// Stop stops playback. On a player already stopped it still counts: the
+// queue that ran out is no longer to be resumed, and a finish not handled yet
+// (a seek past the end stops the player before signalling it) is stale.
+func (s *serviceImpl) Stop() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ranOut = false
+	if s.player.State() == player.Stopped {
+		s.liveFrom = s.player.TrackStarts() + 1
+		return nil
+	}
+
+	s.stopAndEmitLocked(s.playerStateToState(s.player.State()))
+	return nil
+}
+
+// Toggle toggles between play and pause states. From stopped, it does what
+// Play does.
+func (s *serviceImpl) Toggle() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prevState := s.playerStateToState(s.player.State())
+
+	switch s.player.State() {
+	case player.Playing:
+		s.player.Pause()
+	case player.Paused:
+		s.player.Resume()
+	case player.Stopped:
+		return s.playLocked()
+	}
+
+	currState := s.playerStateToState(s.player.State())
+	s.emitStateChange(prevState, currState)
+	return nil
+}
+
+// Next advances to the next track in the queue.
+// If the player was active (playing or paused), it starts playing the new track.
+// With nothing to move to (the end of the queue with repeat off or radio, or no
+// current track), it stops an active player and emits StateChange; that runs
+// the queue out unless the current track was removed.
+func (s *serviceImpl) Next() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	wasActive := s.isActiveLocked()
+	err := s.applyTransition(transition{
+		move:        s.queue.Next,
+		shouldStart: func() bool { return wasActive },
+		onExhausted: func() {
+			if wasActive {
+				s.stopAndEmitLocked(s.playerStateToState(s.player.State()))
+				s.ranOut = !s.currentRemovedLocked()
+			}
+		},
+	})
+	return err
+}
+
+// ResumeAfterRunOut starts the track that follows the one the queue ran out
+// on, when the queue is in radio mode and nothing started, stopped or moved
+// playback since it ran out. Otherwise it does nothing. The player is stopped
+// while ranOut holds: every start goes through startPlayback, which clears it.
+func (s *serviceImpl) ResumeAfterRunOut() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.ranOut || s.queue.RepeatMode() != playlist.RepeatRadio {
+		return nil
+	}
+	// A queue cleared while its last track played has no current track when
+	// the fill lands: the track that ran out went away with the rest, so the
+	// one that follows it is the first track of the fill. A queue whose current
+	// track was removed never gets here: the removal clears ranOut, and a finish
+	// or a Next after it does not set it.
+	return s.applyTransition(transition{
+		move:        s.moveToFollowingLocked,
+		shouldStart: func() bool { return true },
+	})
+}
+
+// Previous goes back to the previous track in the queue.
+// If already at the start (index 0 or less), does nothing.
+// If the player was active, starts playing the new track.
+func (s *serviceImpl) Previous() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	currentIndex := s.queue.CurrentIndex()
+	if currentIndex <= 0 {
+		return nil // At start, no-op
+	}
+
+	wasActive := s.isActiveLocked()
+	err := s.applyTransition(transition{
+		move:        func() *playlist.Track { return s.queue.JumpTo(currentIndex - 1) },
+		shouldStart: func() bool { return wasActive },
+	})
+	return err
+}
+
+// Seek adjusts the playback position by the given delta.
+func (s *serviceImpl) Seek(delta time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.player.Seek(delta)
+	s.emitPositionChange()
+	return nil
+}
+
+// SeekTo seeks to an absolute position.
+func (s *serviceImpl) SeekTo(position time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.player.Position()
+	delta := position - current
+	s.player.Seek(delta)
+	s.emitPositionChange()
+	return nil
+}
+
+// JumpTo jumps to the specified index in the queue.
+// Returns ErrInvalidIndex if the index is out of bounds.
+// If the player was active, starts playing the new track.
+func (s *serviceImpl) JumpTo(index int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if index < 0 || index >= len(s.queue.Tracks()) {
+		return ErrInvalidIndex
+	}
+
+	wasActive := s.isActiveLocked()
+	err := s.applyTransition(transition{
+		move:        func() *playlist.Track { return s.queue.JumpTo(index) },
+		shouldStart: func() bool { return wasActive },
+	})
+	return err
+}
+
+// SetRepeatMode sets the repeat mode.
+func (s *serviceImpl) SetRepeatMode(mode RepeatMode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queue.SetRepeatMode(playlist.RepeatMode(mode))
+	s.modeChanged()
+}
+
+// CycleRepeatMode cycles through repeat modes and returns the new mode.
+func (s *serviceImpl) CycleRepeatMode() RepeatMode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	newMode := s.queue.CycleRepeatMode()
+	s.modeChanged()
+	return RepeatMode(newMode)
+}
+
+// SetShuffle sets the shuffle state.
+func (s *serviceImpl) SetShuffle(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queue.SetShuffle(enabled)
+	s.modeChanged()
+}
+
+// ToggleShuffle toggles shuffle and returns the new state.
+func (s *serviceImpl) ToggleShuffle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	newState := s.queue.ToggleShuffle()
+	s.modeChanged()
+	return newState
+}

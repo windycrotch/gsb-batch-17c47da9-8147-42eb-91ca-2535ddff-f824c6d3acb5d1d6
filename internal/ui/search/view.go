@@ -1,0 +1,164 @@
+package search
+
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/llehouerou/waves/internal/ui/popup"
+	"github.com/llehouerou/waves/internal/ui/render"
+	"github.com/llehouerou/waves/internal/ui/styles"
+)
+
+const maxVisibleResults = 20
+
+func popupStyle() lipgloss.Style {
+	t := styles.T()
+	s := t.BaseStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Border)
+	if t.HasExplicitBackground {
+		s = s.BorderBackground(t.BgBase)
+	}
+	return s
+}
+
+func inputStyle() lipgloss.Style {
+	return styles.T().S().Base
+}
+
+func selectedStyle() lipgloss.Style {
+	return styles.T().S().Playing
+}
+
+func normalStyle() lipgloss.Style {
+	return styles.T().S().Base
+}
+
+func dimStyle() lipgloss.Style {
+	return styles.T().S().Subtle
+}
+
+func (m Model) popupWidth() int {
+	w := m.width * 60 / 100
+	if w < 40 {
+		w = min(40, m.width-4)
+	}
+	return w
+}
+
+func (m Model) popupHeight() int {
+	h := m.height * 50 / 100
+	if h < 10 {
+		h = min(10, m.height-2)
+	}
+	return h
+}
+
+func (m Model) visibleHeight() int {
+	// Account for border (2) + input line (1) + separator (1)
+	h := max(m.popupHeight()-4, 1)
+	return min(h, maxVisibleResults)
+}
+
+func (m Model) emptyMessage() string {
+	switch {
+	case m.loading:
+		return "Scanning..."
+	case m.query != "":
+		return "No matches"
+	default:
+		return "Type to search..."
+	}
+}
+
+func (m Model) formatResultLine(item Item, innerW int, isCursor bool) string {
+	prefix := "  "
+	if isCursor {
+		prefix = "> "
+	}
+
+	// Check if item supports two-column display
+	twoCol, ok := item.(TwoColumnItem)
+	if !ok {
+		// Fallback to single column display
+		return prefix + render.Cut(item.DisplayText(), innerW-4)
+	}
+
+	left := twoCol.LeftColumn()
+	right := twoCol.RightColumn()
+	availW := innerW - 4 // account for prefix and padding
+
+	if right == "" {
+		// No right column, just show left
+		return prefix + render.Cut(left, availW)
+	}
+
+	// Truncate left column if needed, leaving space for right
+	rightW := lipgloss.Width(right)
+	left = render.Cut(left, availW-rightW-2) // 2 for gap
+
+	// Build line with left-aligned name and right-aligned path
+	gap := max(1, availW-lipgloss.Width(left)-rightW)
+	return prefix + left + render.EmptyLine(gap) + dimStyle().Render(right)
+}
+
+// View implements tea.Model.
+func (m Model) View() string {
+	if m.width == 0 || m.height == 0 {
+		return ""
+	}
+
+	popupW := m.popupWidth()
+	innerW := popupW - 2 // account for border
+
+	// Input line
+	prompt := "> "
+	input := inputStyle().Render(prompt + m.query)
+
+	// Separator
+	separator := render.Separator(innerW)
+
+	// Results
+	visible := m.visibleHeight()
+	var resultLines []string
+
+	if len(m.matches) == 0 {
+		resultLines = append(resultLines, dimStyle().Render(m.emptyMessage()))
+	} else {
+		end := min(m.offset+visible, len(m.matches))
+		for i := m.offset; i < end; i++ {
+			match := m.matches[i]
+			item := m.items[match.Index]
+			isCursor := i == m.cursor
+			line := m.formatResultLine(item, innerW, isCursor)
+
+			if isCursor {
+				resultLines = append(resultLines, selectedStyle().Render(line))
+			} else {
+				resultLines = append(resultLines, normalStyle().Render(line))
+			}
+		}
+	}
+
+	// Loading indicator in input line
+	inputLine := input
+	if m.loading {
+		spinnerChar := "◐" // simple spinner
+		inputLine = input + dimStyle().Render(" "+spinnerChar)
+	}
+
+	// Pad result lines to fill popup height
+	for len(resultLines) < visible {
+		resultLines = append(resultLines, "")
+	}
+
+	// Build popup content
+	content := inputLine + "\n" + separator + "\n" + strings.Join(resultLines, "\n")
+
+	// Style the popup with border
+	box := popupStyle().Width(innerW).Render(content)
+
+	// Center in terminal
+	return popup.Center(box, m.width, m.height)
+}

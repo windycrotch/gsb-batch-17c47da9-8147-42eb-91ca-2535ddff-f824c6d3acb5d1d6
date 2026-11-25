@@ -1,0 +1,31 @@
+#!/bin/sh
+# Pre-commit hook: format and lint before committing
+
+# git puts its exec-path first on PATH in hooks, and go test keys its cache on PATH (tests look up ffmpeg)
+PATH=${PATH#"$GIT_EXEC_PATH:"}
+
+# Save list of staged files before formatting
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+echo "Running make fmt check..."
+make fmt check || exit 1
+
+# Re-add only files that were originally staged (in case formatting modified them)
+if [ -n "$STAGED_FILES" ]; then
+    echo "$STAGED_FILES" | xargs -r git add
+fi
+
+# Run go mod tidy if go.mod or go.sum are staged
+if echo "$STAGED_FILES" | grep -qE '^(go\.mod|go\.sum)$'; then
+    # Check for unstaged changes in go.mod/go.sum
+    if ! git diff --quiet go.mod go.sum 2>/dev/null; then
+        echo "Error: go.mod or go.sum have unstaged changes. Please stage or stash them first." >&2
+        exit 1
+    fi
+    echo "Running go mod tidy..."
+    go mod tidy || exit 1
+    git add go.mod go.sum
+    echo "Updating vendorHash..."
+    ./scripts/update-vendor-hash.sh || exit 1
+    git add default.nix
+fi

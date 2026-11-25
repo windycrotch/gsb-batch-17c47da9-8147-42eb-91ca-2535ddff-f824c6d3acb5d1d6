@@ -1,0 +1,236 @@
+package releases
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	lastfmapi "github.com/shkh/lastfm-go/lastfm"
+
+	"github.com/llehouerou/waves/internal/lastfm"
+	"github.com/llehouerou/waves/internal/radio"
+)
+
+// fakeFetcher answers every seed with the same result, recording what it was asked.
+type fakeFetcher struct {
+	mu    sync.Mutex
+	asked []string
+	err   error
+	none  bool   // answers no similar artist
+	onAsk func() // called on every request, when set
+}
+
+func (f *fakeFetcher) GetSimilarArtists(_ context.Context, artist string, _ int) ([]lastfm.SimilarArtist, error) {
+	f.mu.Lock()
+	f.asked = append(f.asked, artist)
+	f.mu.Unlock()
+	if f.onAsk != nil {
+		f.onAsk()
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.none {
+		return []lastfm.SimilarArtist{}, nil
+	}
+	return []lastfm.SimilarArtist{{Name: "Similar Of " + artist, MatchScore: 0.9}}, nil
+}
+
+func (f *fakeFetcher) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.asked)
+}
+
+func runWarmup(t *testing.T, db *sql.DB, client SimilarFetcher) WarmupProgress {
+	t.Helper()
+	progress, err := Warmup(context.Background(), WarmupParams{DB: db, Client: client, TTLDays: 7})
+	if err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+	return progress
+}
+
+// manyArtists builds n distinct library artist names.
+func manyArtists(n int) []string {
+	artists := make([]string, n)
+	for i := range artists {
+		artists[i] = fmt.Sprintf("Artist %03d", i)
+	}
+	return artists
+}
+
+func seedLibrary(t *testing.T, db *sql.DB, artists ...string) {
+	t.Helper()
+	for _, a := range artists {
+		if _, err := db.Exec(`INSERT INTO library_tracks (album_artist) VALUES (?)`, a); err != nil {
+			t.Fatalf("insert library artist: %v", err)
+		}
+	}
+}
+
+func TestWarmup_FetchesStaleSeedsOnly(t *testing.T) {
+	db := setupTestDB(t)
+	seedLibrary(t, db, "Mogwai", "Portishead", "Portishead")
+	// Portishead already has a fresh cache row.
+	_, err := db.Exec(
+		`INSERT INTO lastfm_similar_artists (artist, similar_artist, match_score, fetched_at) VALUES (?, ?, ?, ?)`,
+		"Portishead", "Massive Attack", 0.9, time.Now().Unix(),
+	)
+	if err != nil {
+		t.Fatalf("insert fresh cache row: %v", err)
+	}
+
+	client := &fakeFetcher{}
+	progress := runWarmup(t, db, client)
+
+	if client.count() != 1 || client.asked[0] != "Mogwai" {
+		t.Fatalf("asked %v, want only Mogwai", client.asked)
+	}
+	if progress.Current != 1 || progress.Total != 1 || progress.Failed != 0 {
+		t.Errorf("progress = %+v, want 1/1 with no failure", progress)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM lastfm_similar_artists WHERE artist = 'Mogwai'`); n != 1 {
+		t.Errorf("Mogwai similar rows = %d, want 1", n)
+	}
+}
+
+// Issue #242: the warm-up and radio share the cache: an artist the warm-up
+// was answered no similar artist for is one radio does not ask about.
+func TestWarmup_RemembersAnEmptyAnswerAndRunsOnIt(t *testing.T) {
+	db := setupTestDB(t)
+	seedLibrary(t, db, "Low")
+	cache := radio.NewCache(db, 7)
+
+	if progress := runWarmup(t, db, &fakeFetcher{none: true}); progress.Failed != 0 {
+		t.Fatalf("progress = %+v, want no failure", progress)
+	}
+	if similar, ok, err := cache.GetSimilarArtists("Low"); err != nil || !ok || len(similar) != 0 {
+		t.Fatalf("similar artists of Low = %v, %v, %v, want an empty answer remembered", similar, ok, err)
+	}
+
+	// The next pass still asks about Low, and its answer replaces the empty one.
+	client := &fakeFetcher{}
+	if progress := runWarmup(t, db, client); progress.Total != 1 || progress.Failed != 0 {
+		t.Fatalf("progress = %+v, want Low asked again with no failure", progress)
+	}
+	if similar, ok, err := cache.GetSimilarArtists("Low"); err != nil || !ok || len(similar) != 1 {
+		t.Errorf("similar artists of Low = %v, %v, %v, want the answer of the second pass", similar, ok, err)
+	}
+}
+
+func TestWarmup_LastfmStopCodesCancelTheJob(t *testing.T) {
+	for _, code := range []int{codeSuspendedKey, codeRateLimit} {
+		db := setupTestDB(t)
+		seedLibrary(t, db, manyArtists(200)...)
+
+		client := &fakeFetcher{err: &lastfmapi.LastfmError{Code: code, Message: "stop"}}
+		progress := runWarmup(t, db, client)
+
+		if !progress.Canceled {
+			t.Errorf("code %d: job not canceled", code)
+		}
+		if client.count() >= 200 {
+			t.Errorf("code %d: kept pushing seeds (%d asked of 200)", code, client.count())
+		}
+	}
+}
+
+func TestWarmup_OtherErrorsOnlySkipTheSeed(t *testing.T) {
+	db := setupTestDB(t)
+	seedLibrary(t, db, manyArtists(20)...)
+
+	// Code 6: unknown artist. The seed writes no row and is retried next pass.
+	client := &fakeFetcher{err: &lastfmapi.LastfmError{Code: 6, Message: "artist not found"}}
+	progress := runWarmup(t, db, client)
+
+	if progress.Canceled {
+		t.Error("unknown-artist error canceled the job")
+	}
+	if client.count() != 20 || progress.Failed != 20 {
+		t.Errorf("asked %d seeds, %d failed, want 20/20", client.count(), progress.Failed)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM lastfm_similar_artists`); n != 0 {
+		t.Errorf("failing seeds wrote %d rows, want 0", n)
+	}
+}
+
+func TestWarmup_NoClientIsANoop(t *testing.T) {
+	db := setupTestDB(t)
+	seedLibrary(t, db, "Mogwai")
+	if got := runWarmup(t, db, nil); got != (WarmupProgress{}) {
+		t.Errorf("progress = %+v, want zero without a Last.fm key", got)
+	}
+}
+
+// Quitting the app must not wait for every artist of the library.
+func TestWarmup_StopsWhenItsContextEnds(t *testing.T) {
+	db := setupTestDB(t)
+	seedLibrary(t, db, manyArtists(200)...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &fakeFetcher{onAsk: cancel}
+	progress, err := Warmup(ctx, WarmupParams{DB: db, Client: client, TTLDays: 7})
+	if err != nil {
+		t.Fatalf("Warmup: %v", err)
+	}
+
+	if client.count() >= 200 || progress.Current >= 200 {
+		t.Errorf("asked %d seeds and counted %d of 200 after its context ended", client.count(), progress.Current)
+	}
+}
+
+// heldFetcher is a Last.fm that answers nothing until it is released, and
+// whose requests ignore the end of their context.
+type heldFetcher struct {
+	asked chan struct{}
+	held  chan struct{}
+}
+
+func (f *heldFetcher) GetSimilarArtists(context.Context, string, int) ([]lastfm.SimilarArtist, error) {
+	select {
+	case f.asked <- struct{}{}:
+	default:
+	}
+	<-f.held
+	return []lastfm.SimilarArtist{{Name: "Bedhead", MatchScore: 0.9}}, nil
+}
+
+// Quitting must not wait for Last.fm to answer what it was asked, nor write
+// what it answers afterwards.
+func TestWarmup_ReturnsWhenItsContextEndsWithoutWaitingForTheRequestsInFlight(t *testing.T) {
+	db := setupTestDB(t)
+	seedLibrary(t, db, manyArtists(20)...)
+	client := &heldFetcher{asked: make(chan struct{}, 1), held: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = Warmup(ctx, WarmupParams{DB: db, Client: client, TTLDays: 7}) //nolint:errcheck // what it returns is not the point
+		close(done)
+	}()
+	<-client.asked
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(client.held)
+		t.Fatal("Warmup waits for the requests in flight")
+	}
+
+	close(client.held)
+	time.Sleep(50 * time.Millisecond) // for the answers to come back
+	if n := count(t, db, `SELECT COUNT(*) FROM lastfm_similar_artists`); n != 0 {
+		t.Errorf("%d rows written after Warmup returned, want none", n)
+	}
+}
+
+func TestStopsJob_IgnoresPlainErrors(t *testing.T) {
+	if stopsJob(errors.New("connection refused")) {
+		t.Error("a transport error should not cancel the job")
+	}
+}

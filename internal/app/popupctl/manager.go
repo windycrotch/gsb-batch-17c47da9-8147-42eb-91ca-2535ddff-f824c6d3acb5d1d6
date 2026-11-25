@@ -1,0 +1,437 @@
+// internal/app/popupctl/manager.go
+package popupctl
+
+import (
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/waves/internal/albumpreset"
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/errmsg"
+	"github.com/llehouerou/waves/internal/keymap"
+	"github.com/llehouerou/waves/internal/ui/albumview"
+	"github.com/llehouerou/waves/internal/ui/confirm"
+	"github.com/llehouerou/waves/internal/ui/download"
+	exportui "github.com/llehouerou/waves/internal/ui/export"
+	"github.com/llehouerou/waves/internal/ui/helpbindings"
+	"github.com/llehouerou/waves/internal/ui/importpopup"
+	"github.com/llehouerou/waves/internal/ui/lastfmauth"
+	"github.com/llehouerou/waves/internal/ui/librarysources"
+	lyricsui "github.com/llehouerou/waves/internal/ui/lyrics"
+	"github.com/llehouerou/waves/internal/ui/popup"
+	"github.com/llehouerou/waves/internal/ui/retag"
+	"github.com/llehouerou/waves/internal/ui/scanreport"
+	"github.com/llehouerou/waves/internal/ui/similarartists"
+	"github.com/llehouerou/waves/internal/ui/textinput"
+)
+
+// Manager manages all modal popups and overlays.
+type Manager struct {
+	popups       map[Type]popup.Popup
+	sizes        map[Type]popup.SizeConfig
+	inputMode    InputMode
+	errorMsg     string
+	width        int
+	height       int
+	bottomMargin int // Space reserved at bottom (e.g., for player bar)
+}
+
+// New creates a new Manager with initialized components.
+func New() *Manager {
+	return &Manager{
+		popups: make(map[Type]popup.Popup),
+		sizes: map[Type]popup.SizeConfig{
+			Download: popup.SizeLarge,
+			Import:   popup.SizeLarge,
+			Retag:    popup.SizeLarge,
+			// All others default to SizeAuto
+		},
+	}
+}
+
+// SetSize updates the dimensions for popup rendering.
+func (p *Manager) SetSize(width, height int) {
+	p.width = width
+	p.height = height
+	p.resizeOpenPopups()
+}
+
+// SetBottomMargin sets the space reserved at the bottom (e.g., for player bar).
+func (p *Manager) SetBottomMargin(margin int) {
+	p.bottomMargin = margin
+	p.resizeOpenPopups()
+}
+
+// resizeOpenPopups updates the size of all currently open popups.
+func (p *Manager) resizeOpenPopups() {
+	for t, pop := range p.popups {
+		if pop != nil {
+			p.resize(t, pop)
+		}
+	}
+}
+
+// resize sizes a popup of type t, and tells one that may grow the tallest
+// box it may be: the rows above the player bar, where the overlay is drawn.
+func (p *Manager) resize(t Type, pop popup.Popup) {
+	w, h := p.contentSize(p.sizes[t])
+	pop.SetSize(w, h)
+	if g, ok := pop.(popup.Growing); ok {
+		g.SetMaxHeight(p.height - p.bottomMargin)
+	}
+}
+
+// IsVisible returns true if the specified popup type is visible.
+func (p *Manager) IsVisible(t Type) bool {
+	switch t {
+	case None:
+		return false
+	case Error:
+		return p.errorMsg != ""
+	case TextInput:
+		return p.inputMode != InputNone && p.popups[t] != nil
+	case Help, Confirm, LibrarySources, ScanReport, Download, Import,
+		Retag, AlbumGrouping, AlbumSorting, AlbumPresets, LastfmAuth, Export, Lyrics, SimilarArtists:
+		return p.popups[t] != nil
+	}
+	return false
+}
+
+// ActivePopup returns which popup is currently active (highest priority).
+func (p *Manager) ActivePopup() Type {
+	for _, t := range Priority {
+		if p.IsVisible(t) {
+			return t
+		}
+	}
+	return None
+}
+
+// Show displays a popup of the given type.
+func (p *Manager) Show(t Type, pop popup.Popup) tea.Cmd {
+	p.resize(t, pop)
+	p.popups[t] = pop
+	return pop.Init()
+}
+
+// Hide hides the specified popup type.
+func (p *Manager) Hide(t Type) {
+	switch t {
+	case None:
+		// Nothing to hide
+	case Error:
+		p.errorMsg = ""
+	case TextInput:
+		p.inputMode = InputNone
+		delete(p.popups, t)
+	case Help, Confirm, LibrarySources, ScanReport, Download, Import,
+		Retag, AlbumGrouping, AlbumSorting, AlbumPresets, LastfmAuth, Export, Lyrics, SimilarArtists:
+		delete(p.popups, t)
+	}
+}
+
+// Get retrieves a popup for type assertion when needed.
+func (p *Manager) Get(t Type) popup.Popup {
+	return p.popups[t]
+}
+
+// contentSize calculates popup content dimensions based on size config.
+// Takes bottomMargin into account for proper popup sizing.
+func (p *Manager) contentSize(size popup.SizeConfig) (width, height int) {
+	availableHeight := p.height - p.bottomMargin
+	if size.WidthPct > 0 {
+		w := p.width * size.WidthPct / 100
+		h := availableHeight * size.HeightPct / 100
+		return w, h
+	}
+	// Auto-fit: give available screen size, popup decides
+	return p.width, availableHeight
+}
+
+// --- Show Methods (convenience wrappers) ---
+
+// ShowHelp displays the help popup with the bindings of the given contexts,
+// less those of the inactive actions.
+func (p *Manager) ShowHelp(contexts []string, inactive []keymap.Action) tea.Cmd {
+	help := helpbindings.New()
+	help.SetContexts(contexts, inactive)
+	return p.Show(Help, &help)
+}
+
+// ShowConfirm displays a confirmation dialog.
+func (p *Manager) ShowConfirm(title, message string, context any) tea.Cmd {
+	c := confirm.New()
+	c.Show(title, message, context, p.width, p.height)
+	return p.Show(Confirm, &c)
+}
+
+// ShowConfirmWithOptions displays a confirmation dialog with custom options.
+func (p *Manager) ShowConfirmWithOptions(title, message string, options []string, context any) tea.Cmd {
+	c := confirm.New()
+	c.ShowWithOptions(title, message, options, context, p.width, p.height)
+	return p.Show(Confirm, &c)
+}
+
+// ShowTextInput displays a text input popup.
+func (p *Manager) ShowTextInput(mode InputMode, title, value string, context any) tea.Cmd {
+	p.inputMode = mode
+	ti := textinput.New()
+	ti.Start(title, value, context, p.width, p.height)
+	return p.Show(TextInput, &ti)
+}
+
+// ShowLibrarySources displays the library sources popup.
+func (p *Manager) ShowLibrarySources(sources []string) tea.Cmd {
+	ls := librarysources.New()
+	ls.SetSources(sources)
+	return p.Show(LibrarySources, &ls)
+}
+
+// ShowScanReport displays the scan report popup.
+func (p *Manager) ShowScanReport(stats *core.ScanStats) tea.Cmd {
+	report := scanreport.New(stats)
+	return p.Show(ScanReport, &report)
+}
+
+// ShowDownload displays the download popup.
+func (p *Manager) ShowDownload(dls download.Downloads, mb *core.MusicBrainz, filters download.FilterConfig, lib download.Library) tea.Cmd {
+	dl := download.New(dls, mb, filters, lib)
+	dl.SetFocused(true)
+	return p.Show(Download, dl)
+}
+
+// ShowError displays an error message popup.
+func (p *Manager) ShowError(msg string) {
+	p.errorMsg = msg
+}
+
+// ShowOpError displays an error popup for a failed operation.
+func (p *Manager) ShowOpError(op errmsg.Op, err error) {
+	if err != nil {
+		p.errorMsg = errmsg.Format(op, err)
+	}
+}
+
+// ShowOpErrorWith displays an error popup for a failed operation with context.
+func (p *Manager) ShowOpErrorWith(op errmsg.Op, context string, err error) {
+	if err != nil {
+		p.errorMsg = errmsg.FormatWith(op, context, err)
+	}
+}
+
+// ShowImport displays the import popup for a completed download: the import
+// itself is imp's, the core's.
+func (p *Manager) ShowImport(dl *core.Download, librarySources []string, imp importpopup.Importer) tea.Cmd {
+	return p.Show(Import, importpopup.New(dl, librarySources, imp))
+}
+
+// ShowRetag displays the retag popup for a library album: the retag itself
+// is lib's, the core's.
+func (p *Manager) ShowRetag(albumArtist, albumName string, mbClient *core.MusicBrainz, lib retag.Library) tea.Cmd {
+	return p.Show(Retag, retag.New(albumArtist, albumName, mbClient, lib))
+}
+
+// ShowAlbumGrouping displays the album grouping popup.
+func (p *Manager) ShowAlbumGrouping(current []albumview.GroupField, sortOrder albumview.SortOrder, dateField albumview.DateFieldType) tea.Cmd {
+	gp := albumview.NewGroupingPopup()
+	gp.Show(current, sortOrder, dateField, p.width, p.height)
+	return p.Show(AlbumGrouping, gp)
+}
+
+// ShowAlbumSorting displays the album sorting popup.
+func (p *Manager) ShowAlbumSorting(current []albumview.SortCriterion) tea.Cmd {
+	sp := albumview.NewSortingPopup()
+	sp.Show(current, p.width, p.height)
+	return p.Show(AlbumSorting, sp)
+}
+
+// ShowAlbumPresets displays the album presets popup.
+func (p *Manager) ShowAlbumPresets(presets []albumview.Preset, current albumpreset.Settings) tea.Cmd {
+	pp := albumview.NewPresetsPopup()
+	pp.Show(presets, current, p.width, p.height)
+	return p.Show(AlbumPresets, pp)
+}
+
+// ShowLastfmAuth displays the Last.fm authentication popup on the account
+// linked, if any.
+func (p *Manager) ShowLastfmAuth(username string, linked bool) tea.Cmd {
+	lfm := lastfmauth.New()
+	lfm.SetAccount(username, linked)
+	return p.Show(LastfmAuth, &lfm)
+}
+
+// ShowExport displays the export popup.
+func (p *Manager) ShowExport(exports exportui.Exports) tea.Cmd {
+	return p.Show(Export, exportui.New(exports))
+}
+
+// Export returns the export popup model for direct access.
+func (p *Manager) Export() *exportui.Model {
+	if pop := p.popups[Export]; pop != nil {
+		if exp, ok := pop.(*exportui.Model); ok {
+			return exp
+		}
+	}
+	return nil
+}
+
+// ShowLyrics displays the lyrics popup for a track.
+func (p *Manager) ShowLyrics(source lyricsui.Lyrics, path, artist, title, album string, duration time.Duration) tea.Cmd {
+	lyr := lyricsui.New(source)
+	cmd := p.Show(Lyrics, lyr)
+	return tea.Batch(cmd, lyr.SetTrack(path, artist, title, album, duration))
+}
+
+// Lyrics returns the lyrics popup model for direct access.
+func (p *Manager) Lyrics() *lyricsui.Model {
+	if pop := p.popups[Lyrics]; pop != nil {
+		if lyr, ok := pop.(*lyricsui.Model); ok {
+			return lyr
+		}
+	}
+	return nil
+}
+
+// ShowSimilarArtists displays the similar artists popup.
+func (p *Manager) ShowSimilarArtists(lfm similarartists.Lastfm, lib similarartists.Library, artistName string) tea.Cmd {
+	sa := similarartists.New(lfm, lib, artistName)
+	return p.Show(SimilarArtists, sa)
+}
+
+// SimilarArtists returns the similar artists popup model for direct access.
+func (p *Manager) SimilarArtists() *similarartists.Model {
+	if pop := p.popups[SimilarArtists]; pop != nil {
+		if sa, ok := pop.(*similarartists.Model); ok {
+			return sa
+		}
+	}
+	return nil
+}
+
+// --- Accessors ---
+
+// InputMode returns the current input mode.
+func (p *Manager) InputMode() InputMode {
+	return p.inputMode
+}
+
+// ErrorMsg returns the current error message.
+func (p *Manager) ErrorMsg() string {
+	return p.errorMsg
+}
+
+// Download returns the download popup model for direct access.
+func (p *Manager) Download() *download.Model {
+	if pop := p.popups[Download]; pop != nil {
+		if dl, ok := pop.(*download.Model); ok {
+			return dl
+		}
+	}
+	return nil
+}
+
+// Import returns the import popup model for direct access.
+func (p *Manager) Import() *importpopup.Model {
+	if pop := p.popups[Import]; pop != nil {
+		if imp, ok := pop.(*importpopup.Model); ok {
+			return imp
+		}
+	}
+	return nil
+}
+
+// Retag returns the retag popup model for direct access.
+func (p *Manager) Retag() *retag.Model {
+	if pop := p.popups[Retag]; pop != nil {
+		if rt, ok := pop.(*retag.Model); ok {
+			return rt
+		}
+	}
+	return nil
+}
+
+// LibrarySources returns the library sources popup model for direct access.
+func (p *Manager) LibrarySources() *librarysources.Model {
+	if pop := p.popups[LibrarySources]; pop != nil {
+		if ls, ok := pop.(*librarysources.Model); ok {
+			return ls
+		}
+	}
+	return nil
+}
+
+// --- Key Handling ---
+
+// HandleKey routes key events to the active popup.
+// Returns (handled, cmd) where handled is true if a popup consumed the key.
+func (p *Manager) HandleKey(msg tea.KeyMsg) (bool, tea.Cmd) {
+	// Error popup: dismiss on any key
+	if p.errorMsg != "" {
+		p.errorMsg = ""
+		return true, nil
+	}
+
+	// Find highest-priority active popup
+	active := p.ActivePopup()
+	if active == None {
+		return false, nil
+	}
+
+	// ScanReport special handling (no Update method with keys)
+	if active == ScanReport {
+		key := msg.String()
+		if key == "enter" || key == "esc" {
+			p.Hide(ScanReport)
+		}
+		return true, nil
+	}
+
+	pop := p.popups[active]
+	if pop == nil {
+		return false, nil
+	}
+
+	// Route to popup's Update
+	updated, cmd := pop.Update(msg)
+	p.popups[active] = updated
+	return true, cmd
+}
+
+// --- Rendering ---
+
+// RenderOverlay renders active popup(s) on top of the base view.
+func (p *Manager) RenderOverlay(base string) string {
+	// Use available height (excluding bottom margin for player bar)
+	availableHeight := p.height - p.bottomMargin
+
+	for _, t := range RenderOrder {
+		if !p.IsVisible(t) {
+			continue
+		}
+
+		if t == Error {
+			base = popup.Compose(base, p.renderError(), p.width, p.height)
+			continue
+		}
+
+		pop := p.popups[t]
+		if pop == nil {
+			continue
+		}
+
+		content := pop.View()
+		size := p.sizes[t]
+		rendered := popup.RenderBordered(content, p.width, availableHeight, size)
+		base = popup.Compose(base, rendered, p.width, p.height)
+	}
+	return base
+}
+
+func (p *Manager) renderError() string {
+	pop := popup.New()
+	pop.Title = "Error"
+	pop.Content = p.errorMsg
+	pop.Footer = "Press any key to dismiss"
+	return pop.Render(p.width, p.height)
+}

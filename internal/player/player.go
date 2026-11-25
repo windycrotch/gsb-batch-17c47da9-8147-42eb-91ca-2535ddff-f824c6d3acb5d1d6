@@ -1,0 +1,188 @@
+package player
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gopxl/beep/v2"
+	"github.com/gopxl/beep/v2/effects"
+
+	"github.com/llehouerou/waves/internal/tags"
+)
+
+// State represents the player's playback state.
+type State int
+
+const (
+	Stopped State = iota
+	Playing
+	Paused
+)
+
+const (
+	extMP3  = ".mp3"
+	extFLAC = ".flac"
+	extOPUS = ".opus"
+	extOGG  = ".ogg"
+	extOGA  = ".oga"
+	extM4A  = ".m4a"
+	extMP4  = ".mp4"
+)
+
+// trackState bundles all resources for a single track.
+type trackState struct {
+	file      *bufferedFile
+	streamer  beep.StreamSeekCloser
+	resampled beep.Streamer // Resampled to speaker rate (may equal streamer)
+	format    beep.Format
+	trackInfo *tags.FileInfo
+}
+
+// Close releases all resources for this track.
+func (t *trackState) Close() {
+	if t.streamer != nil {
+		t.streamer.Close()
+	}
+	if t.file != nil {
+		t.file.Close()
+	}
+}
+
+// Player handles audio playback.
+type Player struct {
+	state  State
+	ctrl   *beep.Ctrl
+	volume *effects.Volume
+
+	volMu       sync.RWMutex // Protects volumeLevel and muted
+	volumeLevel float64      // 0.0 to 1.0
+	muted       bool
+
+	// Dual track state for gapless playback
+	current *trackState
+	next    *trackState
+	gapless *gaplessStreamer
+
+	// starts counts playback starts, so a consumer can tell whether the player
+	// began a track on its own.
+	starts atomic.Uint64
+
+	// Channels
+	done       chan struct{}
+	finishedCh chan uint64
+	onFinished func()
+	seekWake   chan struct{}
+
+	// Seek requests accumulate onto seekTarget so a burst of presses becomes
+	// one jump, and +5s/-5s is exactly neutral. A burst ends after seekBurst,
+	// or when the track changes under it.
+	seekMu     sync.Mutex
+	seekTarget time.Duration
+	lastSeek   time.Time
+	seekTrack  *trackState
+
+	// Pre-loading
+	preloadAt time.Duration // How early to pre-load (default 3s)
+	preloadFn func() string // Callback to get next track path
+
+	// run is what the last Play started, nil once a Stop or a failed Play
+	// ended it. drops counts the ClearPreload calls. A preload lands only on
+	// the run it was started for, and if no ClearPreload came since it began.
+	runMu sync.Mutex
+	run   *run
+	drops uint64
+}
+
+// run is what one Play starts, up to the Stop or the Play that follows it,
+// gapless self-starts included. Its monitor preloads the next track for it.
+type run struct {
+	ended chan struct{} // closed when the run ends
+}
+
+var (
+	speakerInitialized bool
+	speakerSampleRate  beep.SampleRate
+)
+
+// New creates a new Player.
+func New() *Player {
+	p := newPlayer()
+	go p.seekLoop()
+	return p
+}
+
+// newPlayer creates a Player without its seek loop, so tests can observe
+// seek requests without a goroutine consuming them.
+func newPlayer() *Player {
+	return &Player{
+		state:       Stopped,
+		volumeLevel: 1.0, // Full volume by default
+		done:        make(chan struct{}),
+		finishedCh:  make(chan uint64, 1), // buffered to avoid blocking
+		seekWake:    make(chan struct{}, 1),
+		preloadAt:   3 * time.Second,
+	}
+}
+
+// FinishedChan receives the start count of each track that finishes naturally.
+func (p *Player) FinishedChan() <-chan uint64 {
+	return p.finishedCh
+}
+
+// Done returns a channel that is closed when the current track ends (naturally or stopped).
+func (p *Player) Done() <-chan struct{} {
+	return p.done
+}
+
+// State returns the current playback state.
+func (p *Player) State() State { return p.state }
+
+// TrackStarts counts how many times playback of a track has begun, whether
+// from Play or from a gapless transition the player made itself. A consumer
+// that remembers the count can tell whether the player started something on
+// its own, which the state and the track path cannot distinguish: repeat-one
+// and a duplicated queue entry play the same path again.
+func (p *Player) TrackStarts() uint64 { return p.starts.Load() }
+
+// TrackInfo returns metadata about the currently playing track.
+func (p *Player) TrackInfo() *tags.FileInfo {
+	if p.current == nil {
+		return nil
+	}
+	return p.current.trackInfo
+}
+
+// Duration returns the total duration of the current track.
+func (p *Player) Duration() time.Duration {
+	if p.current == nil || p.current.trackInfo == nil {
+		return 0
+	}
+	return p.current.trackInfo.Duration
+}
+
+// OnFinished sets a callback to be called when a track finishes.
+func (p *Player) OnFinished(fn func()) {
+	p.onFinished = fn
+}
+
+// SetPreloadFunc sets the callback to get the next track path for pre-loading.
+func (p *Player) SetPreloadFunc(fn func() string) {
+	p.preloadFn = fn
+}
+
+// SetPreloadDuration sets how early to pre-load the next track.
+func (p *Player) SetPreloadDuration(d time.Duration) {
+	p.preloadAt = d
+}
+
+// clearNextTrack closes and clears the pre-loaded next track.
+func (p *Player) clearNextTrack() {
+	if p.next != nil {
+		go p.next.Close()
+		p.next = nil
+	}
+	if p.gapless != nil {
+		p.gapless.ClearNext()
+	}
+}

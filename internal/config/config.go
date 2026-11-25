@@ -1,0 +1,369 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/knadh/koanf/parsers/toml"
+	"github.com/knadh/koanf/providers/file"
+	"github.com/knadh/koanf/v2"
+
+	"github.com/llehouerou/waves/internal/rename"
+)
+
+type Config struct {
+	DefaultFolder  string   `koanf:"default_folder"`
+	Icons          string   `koanf:"icons"`           // "nerd", "unicode", or "none"
+	LibrarySources []string `koanf:"library_sources"` // paths to scan for music library
+
+	// slskd integration (enables download popup via fd keybinding when configured)
+	Slskd SlskdConfig `koanf:"slskd"`
+
+	// MusicBrainz settings
+	MusicBrainz MusicBrainzConfig `koanf:"musicbrainz"`
+
+	// Last.fm scrobbling (enables scrobbling when configured)
+	Lastfm LastfmConfig `koanf:"lastfm"`
+
+	// Radio mode settings
+	Radio RadioFileConfig `koanf:"radio"`
+
+	// Rename pattern settings
+	Rename RenameConfig `koanf:"rename"`
+
+	// Desktop notifications
+	Notifications NotificationsConfig `koanf:"notifications"`
+
+	// Theme customisation
+	Theme ThemeConfig `koanf:"theme"`
+}
+
+// SlskdConfig holds all slskd-related configuration.
+type SlskdConfig struct {
+	URL           string       `koanf:"url"`            // e.g., "http://localhost:5030"
+	APIKey        string       `koanf:"apikey"`         // API key from slskd settings
+	CompletedPath string       `koanf:"completed_path"` // Path to completed downloads folder
+	Filters       SlskdFilters `koanf:"filters"`        // default search filters
+}
+
+// SlskdFilters defines default filters for slskd search results.
+type SlskdFilters struct {
+	Format     string `koanf:"format"`      // "both", "lossless", "lossy" (default: "both")
+	NoSlot     *bool  `koanf:"no_slot"`     // filter users with no free slot (default: true)
+	TrackCount *bool  `koanf:"track_count"` // filter by track count (default: true)
+}
+
+// MusicBrainzConfig holds MusicBrainz-related configuration.
+type MusicBrainzConfig struct {
+	AlbumsOnly *bool `koanf:"albums_only"` // filter release groups to albums only (default: true)
+}
+
+// LastfmConfig holds Last.fm scrobbling configuration.
+type LastfmConfig struct {
+	APIKey    string `koanf:"api_key"`
+	APISecret string `koanf:"api_secret"`
+}
+
+// RadioFileConfig is the [radio] section as config.toml writes it. A key the
+// file does not set is nil or 0 here; GetRadioConfig applies the defaults and
+// the validity ranges, and returns the RadioConfig the radio reads.
+//
+// The keys that accept 0 are pointers, so that an absent key (nil, the
+// default) is told from a 0 the user wrote. For the others, 0 is the default.
+type RadioFileConfig struct {
+	// Queue behavior
+	BufferSize int `koanf:"buffer_size"` // Tracks to queue ahead (1-20, default: 1)
+
+	// Artist selection
+	SimilarArtistsLimit int `koanf:"similar_artists_limit"` // Similar artists to fetch from API (default: 50)
+	ArtistsPerFill      int `koanf:"artists_per_fill"`      // Artists to use per fill (default: 5)
+	// Fuzzy match threshold 0.0-1.0 (default: 0.8). 0: a similar artist with no
+	// exact match is matched to the closest library artist, unless none is
+	// similar at all (a similarity of 0 to every one).
+	ArtistMatchThreshold *float64 `koanf:"artist_match_threshold"`
+
+	// Variety enforcement
+	MaxArtistRepeat    int `koanf:"max_artist_repeat"`    // Max times same artist in window (default: 2)
+	ArtistRepeatWindow int `koanf:"artist_repeat_window"` // Window size for repeat check (default: 20)
+	// Seeds to remember for A→B→A prevention (default: 3). 0: no seed is
+	// remembered, the prevention is off.
+	RecentSeedsWindow *int `koanf:"recent_seeds_window"`
+
+	// Scoring weights
+	// Boost multiplier for top tracks (default: 3.0). 0: a top track scores
+	// the same as any other.
+	TopTrackBoost *float64 `koanf:"top_track_boost"`
+	UserBoost     float64  `koanf:"user_boost"`     // Multiplier for user-scrobbled tracks (default: 1.3)
+	FavoriteBoost float64  `koanf:"favorite_boost"` // Multiplier for favorite tracks, replaces user_boost (default: 2.0)
+	// Score multiplier for a recently played track, 0.0-1.0 (default: 0.1).
+	// 0: a recently played track scores 0, so other tracks are picked first.
+	DecayFactor *float64 `koanf:"decay_factor"`
+	// Floor for the similarity score, 0.0-1.0 (default: 0.1). 0: no floor.
+	MinSimilarityWeight *float64 `koanf:"min_similarity_weight"`
+
+	// Cache
+	CacheTTLDays int `koanf:"cache_ttl_days"` // Cache TTL in days (default: 7)
+}
+
+// RadioConfig is the Last.fm radio configuration with its defaults applied:
+// what GetRadioConfig returns and the radio reads. RadioFileConfig documents
+// each key, its default and its range.
+type RadioConfig struct {
+	BufferSize           int
+	SimilarArtistsLimit  int
+	ArtistsPerFill       int
+	ArtistMatchThreshold float64
+	MaxArtistRepeat      int
+	ArtistRepeatWindow   int
+	RecentSeedsWindow    int
+	TopTrackBoost        float64
+	UserBoost            float64
+	FavoriteBoost        float64
+	DecayFactor          float64
+	MinSimilarityWeight  float64
+	CacheTTLDays         int
+}
+
+// RenameConfig holds file renaming configuration.
+type RenameConfig struct {
+	Folder   string `koanf:"folder"`   // Template for folder path
+	Filename string `koanf:"filename"` // Template for filename (without extension)
+
+	// Smart features (nil means use default=true)
+	ReissueNotation   *bool `koanf:"reissue_notation"`   // [YYYY reissue] suffix
+	VABrackets        *bool `koanf:"va_brackets"`        // [Various Artists] folder
+	SinglesHandling   *bool `koanf:"singles_handling"`   // [singles] folder, no album in filename
+	ReleaseTypeNotes  *bool `koanf:"release_type_notes"` // (soundtrack), (live), etc.
+	AndToAmpersand    *bool `koanf:"and_to_ampersand"`   // "and" → "&"
+	RemoveFeat        *bool `koanf:"remove_feat"`        // Strip "feat." from titles
+	EllipsisNormalize *bool `koanf:"ellipsis_normalize"` // "..." → "…"
+}
+
+// ThemeConfig holds color customisation settings.
+type ThemeConfig struct {
+	Accent     *string `koanf:"accent"`
+	Secondary  *string `koanf:"secondary"`
+	Text       *string `koanf:"text"`
+	Muted      *string `koanf:"muted"`
+	Background *string `koanf:"background"`
+	Border     *string `koanf:"border"`
+}
+
+// NotificationsConfig holds desktop notification settings.
+type NotificationsConfig struct {
+	Enabled      *bool  `koanf:"enabled"`        // Master toggle (default: false, opt-in)
+	NowPlaying   *bool  `koanf:"now_playing"`    // On track change (default: true)
+	Downloads    *bool  `koanf:"downloads"`      // On download complete (default: true)
+	ShowAlbumArt *bool  `koanf:"show_album_art"` // Include album art (default: true)
+	Timeout      *int32 `koanf:"timeout"`        // ms, 0 = never expire (default: 5000)
+}
+
+// defaultNotificationTimeout is the expire timeout of a notification, in ms,
+// when the config file sets none.
+const defaultNotificationTimeout int32 = 5000
+
+// ExpireTimeout is the expire timeout of a notification, in ms: the one the
+// config file sets, 0 included (never expire), or the default when it sets none.
+func (c NotificationsConfig) ExpireTimeout() int32 {
+	if c.Timeout == nil {
+		return defaultNotificationTimeout
+	}
+	return *c.Timeout
+}
+
+// ToRenameConfig converts the config RenameConfig to a rename.Config,
+// applying defaults for nil values.
+func (c RenameConfig) ToRenameConfig() rename.Config {
+	cfg := rename.DefaultConfig()
+
+	// Override templates if specified
+	if c.Folder != "" {
+		cfg.Folder = c.Folder
+	}
+	if c.Filename != "" {
+		cfg.Filename = c.Filename
+	}
+
+	// Override toggles if explicitly set
+	if c.ReissueNotation != nil {
+		cfg.ReissueNotation = *c.ReissueNotation
+	}
+	if c.VABrackets != nil {
+		cfg.VABrackets = *c.VABrackets
+	}
+	if c.SinglesHandling != nil {
+		cfg.SinglesHandling = *c.SinglesHandling
+	}
+	if c.ReleaseTypeNotes != nil {
+		cfg.ReleaseTypeNotes = *c.ReleaseTypeNotes
+	}
+	if c.AndToAmpersand != nil {
+		cfg.AndToAmpersand = *c.AndToAmpersand
+	}
+	if c.RemoveFeat != nil {
+		cfg.RemoveFeat = *c.RemoveFeat
+	}
+	if c.EllipsisNormalize != nil {
+		cfg.EllipsisNormalize = *c.EllipsisNormalize
+	}
+
+	return cfg
+}
+
+func Load() (*Config, error) {
+	k := koanf.New(".")
+
+	// Try config files in order of priority (last wins)
+	configPaths := getConfigPaths()
+
+	for _, path := range configPaths {
+		if _, err := os.Stat(path); err == nil {
+			if err := k.Load(file.Provider(path), toml.Parser()); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	cfg := &Config{
+		DefaultFolder: "", // empty means use cwd
+	}
+
+	if err := k.Unmarshal("", cfg); err != nil {
+		return nil, err
+	}
+
+	// Expand ~ in default_folder
+	if cfg.DefaultFolder != "" {
+		cfg.DefaultFolder = expandPath(cfg.DefaultFolder)
+	}
+
+	// Expand ~ in library_sources
+	for i, src := range cfg.LibrarySources {
+		cfg.LibrarySources[i] = expandPath(src)
+	}
+
+	// Normalize slskd URL (remove trailing slash)
+	cfg.Slskd.URL = strings.TrimSuffix(cfg.Slskd.URL, "/")
+
+	// Expand ~ in slskd completed_path
+	if cfg.Slskd.CompletedPath != "" {
+		cfg.Slskd.CompletedPath = expandPath(cfg.Slskd.CompletedPath)
+	}
+
+	return cfg, nil
+}
+
+func getConfigPaths() []string {
+	paths := []string{}
+
+	// 1. ~/.config/waves/config.toml
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".config", "waves", "config.toml"))
+	}
+
+	// 2. ./config.toml (pwd, highest priority)
+	paths = append(paths, "config.toml")
+
+	return paths
+}
+
+func expandPath(path string) string {
+	if path != "" && path[0] == '~' {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[1:])
+		}
+	}
+	return path
+}
+
+// HasSlskdConfig returns true if slskd integration is configured.
+func (c *Config) HasSlskdConfig() bool {
+	return c.Slskd.Configured()
+}
+
+// Configured reports whether slskd can be reached: it has a URL and a key.
+func (c SlskdConfig) Configured() bool {
+	return c.URL != "" && c.APIKey != ""
+}
+
+// HasLastfmConfig returns true if Last.fm scrobbling is configured.
+func (c *Config) HasLastfmConfig() bool {
+	return c.Lastfm.APIKey != "" && c.Lastfm.APISecret != ""
+}
+
+// GetRadioConfig returns the radio configuration with defaults applied. A key
+// absent from the file, or set to a value out of its range, gets its default.
+func (c *Config) GetRadioConfig() RadioConfig {
+	f := c.Radio
+	bufferSize := f.BufferSize
+	if bufferSize <= 0 || bufferSize > 20 {
+		bufferSize = 1
+	}
+	return RadioConfig{
+		BufferSize:           bufferSize,
+		SimilarArtistsLimit:  positiveOr(f.SimilarArtistsLimit, 50),
+		ArtistsPerFill:       positiveOr(f.ArtistsPerFill, 5),
+		ArtistMatchThreshold: fractionOr(f.ArtistMatchThreshold, 0.8),
+		MaxArtistRepeat:      positiveOr(f.MaxArtistRepeat, 2),
+		ArtistRepeatWindow:   positiveOr(f.ArtistRepeatWindow, 20),
+		RecentSeedsWindow:    nonNegativeOr(f.RecentSeedsWindow, 3),
+		TopTrackBoost:        nonNegativeOr(f.TopTrackBoost, 3.0),
+		UserBoost:            positiveOr(f.UserBoost, 1.3),
+		FavoriteBoost:        positiveOr(f.FavoriteBoost, 2.0),
+		DecayFactor:          fractionOr(f.DecayFactor, 0.1),
+		MinSimilarityWeight:  fractionOr(f.MinSimilarityWeight, 0.1),
+		CacheTTLDays:         positiveOr(f.CacheTTLDays, 7),
+	}
+}
+
+// positiveOr returns v when it is above 0, def otherwise.
+func positiveOr[T int | float64](v, def T) T {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// nonNegativeOr returns *v when it is set and not negative, def otherwise.
+func nonNegativeOr[T int | float64](v *T, def T) T {
+	if v == nil || *v < 0 {
+		return def
+	}
+	return *v
+}
+
+// fractionOr returns *v when it is set and within 0-1, def otherwise.
+func fractionOr(v *float64, def float64) float64 {
+	if v == nil || *v < 0 || *v > 1 {
+		return def
+	}
+	return *v
+}
+
+// GetNotificationsConfig returns the notification configuration with defaults
+// applied. The timeout is read through ExpireTimeout.
+func (c *Config) GetNotificationsConfig() NotificationsConfig {
+	cfg := c.Notifications
+
+	// Apply defaults for nil pointers
+	// Notifications are opt-in (disabled by default)
+	if cfg.Enabled == nil {
+		f := false
+		cfg.Enabled = &f
+	}
+	if cfg.NowPlaying == nil {
+		t := true
+		cfg.NowPlaying = &t
+	}
+	if cfg.Downloads == nil {
+		t := true
+		cfg.Downloads = &t
+	}
+	if cfg.ShowAlbumArt == nil {
+		t := true
+		cfg.ShowAlbumArt = &t
+	}
+
+	return cfg
+}

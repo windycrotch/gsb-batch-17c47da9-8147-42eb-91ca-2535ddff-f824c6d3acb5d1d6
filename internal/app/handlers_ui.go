@@ -1,0 +1,887 @@
+package app
+
+import (
+	"database/sql"
+	"errors"
+	"os"
+	"strconv"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/waves/internal/app/navctl"
+	"github.com/llehouerou/waves/internal/app/popupctl"
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/errmsg"
+	"github.com/llehouerou/waves/internal/navigator"
+	"github.com/llehouerou/waves/internal/ui/action"
+	"github.com/llehouerou/waves/internal/ui/albumview"
+	"github.com/llehouerou/waves/internal/ui/confirm"
+	"github.com/llehouerou/waves/internal/ui/download"
+	dlview "github.com/llehouerou/waves/internal/ui/downloads"
+	exportui "github.com/llehouerou/waves/internal/ui/export"
+	"github.com/llehouerou/waves/internal/ui/helpbindings"
+	"github.com/llehouerou/waves/internal/ui/importpopup"
+	"github.com/llehouerou/waves/internal/ui/librarybrowser"
+	"github.com/llehouerou/waves/internal/ui/librarynav"
+	"github.com/llehouerou/waves/internal/ui/librarysources"
+	lyricsui "github.com/llehouerou/waves/internal/ui/lyrics"
+	"github.com/llehouerou/waves/internal/ui/playlistnav"
+	"github.com/llehouerou/waves/internal/ui/queuepanel"
+	"github.com/llehouerou/waves/internal/ui/retag"
+	"github.com/llehouerou/waves/internal/ui/search"
+	"github.com/llehouerou/waves/internal/ui/similarartists"
+	"github.com/llehouerou/waves/internal/ui/textinput"
+)
+
+// handleUIAction routes action messages to component-specific handlers.
+func (m Model) handleUIAction(msg action.Msg) (tea.Model, tea.Cmd) {
+	switch msg.Source {
+	case "queuepanel":
+		return m.handleQueuePanelAction(msg.Action)
+	case "albumview":
+		return m.handleAlbumViewAction(msg.Action)
+	case "albumview.grouping":
+		return m.handleAlbumGroupingAction(msg.Action)
+	case "albumview.sorting":
+		return m.handleAlbumSortingAction(msg.Action)
+	case "albumview.presets":
+		return m.handleAlbumPresetsAction(msg.Action)
+	case "navigator":
+		return m.handleNavigatorAction(msg.Action)
+	case "search":
+		return m.handleSearchAction(msg.Action)
+	case "textinput":
+		return m.handleTextInputAction(msg.Action)
+	case "confirm":
+		return m.handleConfirmAction(msg.Action)
+	case "librarysources":
+		return m.handleLibrarySourcesAction(msg.Action)
+	case "helpbindings":
+		return m.handleHelpBindingsAction(msg.Action)
+	case "downloads":
+		return m.handleDownloadsViewAction(msg.Action)
+	case "download":
+		return m.handleDownloadPopupAction(msg.Action)
+	case "import":
+		return m.handleImportPopupAction(msg.Action)
+	case "retag":
+		return m.handleRetagPopupAction(msg.Action)
+	case exportui.Source:
+		return m.handleExportPopupAction(msg.Action)
+	case "lyrics":
+		return m.handleLyricsAction(msg.Action)
+	case "similarartists":
+		return m.handleSimilarArtistsAction(msg.Action)
+	case "librarybrowser":
+		return m.handleLibraryBrowserAction(msg.Action)
+	}
+	return m, nil
+}
+
+// handleQueuePanelAction handles actions from the queue panel.
+func (m Model) handleQueuePanelAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case queuepanel.JumpToTrack:
+		cmd := m.PlayTrackAtIndex(act.Index)
+		return m, cmd
+	case queuepanel.RemoveTracks:
+		m.Core.Playback().RemoveTracks(act.Indices)
+		m.Layout.QueuePanel().QueueChanged()
+		return m, nil
+	case queuepanel.MoveTracks:
+		m.Core.Playback().MoveTracks(act.Indices, act.Delta)
+		m.Layout.QueuePanel().QueueChanged()
+		return m, nil
+	case queuepanel.ToggleFavorite:
+		m.handleToggleFavorite(act.TrackIDs)
+		return m, nil
+	case queuepanel.AddToPlaylist:
+		m.startAddToPlaylist(act.TrackIDs)
+		return m, nil
+	case queuepanel.GoToSource:
+		m.handleGoToSource(act)
+		return m, nil
+	case queuepanel.Leave:
+		m.SetFocus(navctl.FocusNavigator)
+		return m, nil
+	}
+	return m, nil
+}
+
+// goToSourcePlaylists goes to the track's first place in a playlist that
+// holds it, the one the navigator is in or on first; it says nothing of a
+// track in no playlist.
+func (m *Model) goToSourcePlaylists(act queuepanel.GoToSource) bool {
+	nav := m.Navigation.PlaylistNav()
+	preferred := playlistnav.PlaylistInOrOn(nav.Current(), nav.Selected())
+	id, found, err := playlistnav.LocateTrack(m.Core.Playlists(), act.TrackID, preferred)
+	if !m.navigated(found, err) {
+		return false
+	}
+	return m.navigated(nav.FocusByID(id))
+}
+
+// handleGoToSource navigates to the track's source location in the current view.
+func (m *Model) handleGoToSource(act queuepanel.GoToSource) {
+	navigated := false
+	switch m.Navigation.ViewMode() {
+	case navctl.ViewLibrary:
+		navigated = m.goToSourceLibrary(act)
+	case navctl.ViewFileBrowser:
+		if act.Path != "" {
+			navigated = m.navigated(m.Navigation.FileNav().FocusByID(act.Path))
+		}
+	case navctl.ViewPlaylists:
+		navigated = m.goToSourcePlaylists(act)
+	case navctl.ViewDownloads:
+		// Downloads view doesn't have a source location to navigate to
+	}
+	if navigated {
+		m.SetFocus(navctl.FocusNavigator)
+		m.SaveNavigationState()
+	}
+}
+
+// goToSourceLibrary handles go-to-source for library view modes.
+// Returns true if navigation was successful. A track the library does not
+// have goes nowhere; a read that failed goes nowhere either, and the error
+// popup tells it.
+func (m *Model) goToSourceLibrary(act queuepanel.GoToSource) bool {
+	if act.TrackID == 0 {
+		return false
+	}
+
+	switch m.Navigation.LibrarySubMode() { //nolint:exhaustive // default handles Miller mode
+	case navctl.LibraryModeAlbum:
+		// Album view: select the album (need AlbumArtist from library)
+		track := m.libraryTrackToGoTo(act.TrackID)
+		if track == nil {
+			return false
+		}
+		m.Navigation.AlbumView().SelectAlbum(track.AlbumArtist, track.Album)
+		return true
+	case navctl.LibraryModeBrowser:
+		// Browser view: navigate to artist, album, and track
+		track := m.libraryTrackToGoTo(act.TrackID)
+		if track == nil {
+			return false
+		}
+		browser := m.Navigation.LibraryBrowser()
+		browser.SelectArtist(track.AlbumArtist)
+		browser.SelectAlbum(track.Album)
+		browser.SelectTrackByID(track.ID)
+		browser.SetActiveColumn(librarybrowser.ColumnTracks)
+		browser.CenterCursors()
+		return true
+	default:
+		// Miller view: navigate to the track
+		return m.navigated(m.Navigation.LibraryNav().FocusByID(librarynav.TrackNodeID(act.TrackID)))
+	}
+}
+
+// libraryTrackToGoTo reads the library track a gesture goes to: nil for a
+// track the library does not have, and for a read that failed, which the
+// error popup tells.
+func (m *Model) libraryTrackToGoTo(id int64) *core.LibraryTrack {
+	track, err := m.Core.Library().TrackByID(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpNavigate, err)
+		return nil
+	}
+	return track
+}
+
+// navigated takes what a navigator's move to a node (FocusByID, NavigateTo)
+// returned: whether it moved, and the error of a lookup that failed, which
+// the error popup tells.
+func (m *Model) navigated(moved bool, err error) bool {
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpNavigate, err)
+		return false
+	}
+	return moved
+}
+
+// handleAlbumViewAction handles actions from the album view.
+func (m Model) handleAlbumViewAction(a action.Action) (tea.Model, tea.Cmd) {
+	if act, ok := a.(albumview.QueueAlbum); ok {
+		return m.handleAlbumViewQueueAction(act)
+	}
+	return m, nil
+}
+
+// handleAlbumViewQueueAction handles queueing albums.
+func (m Model) handleAlbumViewQueueAction(act albumview.QueueAlbum) (tea.Model, tea.Cmd) {
+	tracks, err := m.collectAlbumTracks(act.AlbumArtist, act.Album)
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpQueueAdd, err)
+		return m, nil
+	}
+	if len(tracks) == 0 {
+		return m, nil
+	}
+
+	if act.Replace {
+		m.Core.Playback().ReplaceTracks(tracks...)
+	} else {
+		m.Core.Playback().AddTracks(tracks...)
+	}
+	m.queueEdited()
+
+	if act.Replace {
+		cmd := m.PlayTrackAtIndex(0)
+		return m, cmd
+	}
+
+	return m, nil
+}
+
+// handleAlbumGroupingAction handles actions from the album grouping popup.
+func (m Model) handleAlbumGroupingAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case albumview.GroupingApplied:
+		m.Popups.Hide(popupctl.AlbumGrouping)
+		av := m.Navigation.AlbumView()
+		settings := av.Settings()
+		settings.GroupFields = act.Fields
+		settings.GroupSortOrder = act.SortOrder
+		settings.GroupDateField = act.DateField
+		settings.PresetName = "" // Clear preset when manually changed
+		av.SetSettings(settings)
+		_ = av.Refresh()
+		m.SaveNavigationState()
+		return m, nil
+	case albumview.GroupingCanceled:
+		m.Popups.Hide(popupctl.AlbumGrouping)
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleAlbumSortingAction handles actions from the album sorting popup.
+func (m Model) handleAlbumSortingAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case albumview.SortingApplied:
+		m.Popups.Hide(popupctl.AlbumSorting)
+		av := m.Navigation.AlbumView()
+		settings := av.Settings()
+		settings.SortCriteria = act.Criteria
+		settings.PresetName = "" // Clear preset when manually changed
+		av.SetSettings(settings)
+		_ = av.Refresh()
+		m.SaveNavigationState()
+		return m, nil
+	case albumview.SortingCanceled:
+		m.Popups.Hide(popupctl.AlbumSorting)
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleAlbumPresetsAction handles actions from the album presets popup.
+func (m Model) handleAlbumPresetsAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case albumview.PresetLoaded:
+		m.Popups.Hide(popupctl.AlbumPresets)
+		av := m.Navigation.AlbumView()
+		av.SetSettings(act.Settings)
+		_ = av.Refresh()
+		m.SaveNavigationState()
+		return m, nil
+	case albumview.PresetSaved:
+		_, err := m.Core.ClientState().SaveAlbumPreset(act.Name, act.Settings)
+		if err != nil {
+			m.Popups.ShowOpError(errmsg.OpPresetSave, err)
+			return m, nil
+		}
+		m.Popups.Hide(popupctl.AlbumPresets)
+		return m, nil
+	case albumview.PresetDeleted:
+		err := m.Core.ClientState().DeleteAlbumPreset(act.ID)
+		if err != nil {
+			m.Popups.ShowOpError(errmsg.OpPresetDelete, err)
+			return m, nil
+		}
+		// Refresh presets list in popup
+		presets, err := m.Core.ClientState().ListAlbumPresets()
+		if err != nil {
+			m.Popups.ShowOpError(errmsg.OpPresetLoad, err)
+			return m, nil
+		}
+		av := m.Navigation.AlbumView()
+		cmd := m.Popups.ShowAlbumPresets(presets, av.Settings().Settings)
+		return m, cmd
+	case albumview.PresetsClosed:
+		m.Popups.Hide(popupctl.AlbumPresets)
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleNavigatorAction handles actions from the navigator: a move it made is
+// saved, a move it refused is told in the error popup.
+func (m Model) handleNavigatorAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch a := a.(type) {
+	case navigator.NavigationChanged:
+		m.SaveNavigationState()
+	case navigator.NavigationFailed:
+		m.Popups.ShowOpError(errmsg.OpNavigate, a.Err)
+	}
+	return m, nil
+}
+
+// handleLibraryBrowserAction handles actions from the library browser.
+func (m Model) handleLibraryBrowserAction(a action.Action) (tea.Model, tea.Cmd) {
+	if _, ok := a.(librarybrowser.NavigationChanged); ok {
+		m.SaveNavigationState()
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleSearchAction handles actions from the search popup.
+func (m Model) handleSearchAction(a action.Action) (tea.Model, tea.Cmd) {
+	if act, ok := a.(search.Result); ok {
+		return m.handleSearchResultAction(act)
+	}
+	return m, nil
+}
+
+// handleSearchResultAction handles the search result action.
+func (m Model) handleSearchResultAction(act search.Result) (tea.Model, tea.Cmd) {
+	// Handle add-to-playlist mode
+	if m.Input.IsAddToPlaylistSearch() {
+		return m.handleAddToPlaylistResult(act)
+	}
+
+	// Process the result before clearing search state
+	if !act.Canceled && act.Item != nil {
+		// Auto-focus navigator when selecting a search result
+		m.SetFocus(navctl.FocusNavigator)
+		m.navigateToSearchResult(act.Item)
+	}
+
+	m.Input.EndSearch()
+	return m, nil
+}
+
+// handleAddToPlaylistResult handles search results in add-to-playlist mode.
+func (m Model) handleAddToPlaylistResult(act search.Result) (tea.Model, tea.Cmd) {
+	trackIDs := m.Input.AddToPlaylistTracks()
+	m.Input.EndSearch()
+
+	if act.Canceled || act.Item == nil {
+		return m, nil
+	}
+
+	item, ok := act.Item.(playlistnav.SearchItem)
+	if !ok {
+		return m, nil
+	}
+
+	if err := m.Core.Playlists().AddTracks(item.ID, trackIDs); err != nil {
+		m.Popups.ShowOpError(errmsg.OpPlaylistAddTrack, err)
+		return m, nil
+	}
+
+	// Update last used timestamp
+	_ = m.Core.Playlists().UpdateLastUsed(item.ID)
+
+	// Refresh playlist navigator so new tracks are visible
+	m.refreshPlaylistNavigator()
+
+	return m, nil
+}
+
+// navigateToSearchResult navigates to the selected search result item.
+func (m *Model) navigateToSearchResult(item search.Item) {
+	switch item := item.(type) {
+	case navigator.FileItem:
+		m.navigated(m.Navigation.FileNav().NavigateTo(item.Path))
+	case librarynav.SearchItem:
+		m.HandleLibrarySearchResult(item.Result)
+	case librarynav.NodeItem:
+		m.navigated(m.Navigation.LibraryNav().FocusByID(item.Node.ID()))
+	case librarybrowser.SearchItem:
+		m.Navigation.LibraryBrowser().JumpToIndex(item.Column, item.Index)
+	case playlistnav.NodeItem:
+		m.navigated(m.Navigation.PlaylistNav().FocusByID(item.Node.ID()))
+	case playlistnav.DeepSearchItem:
+		// Navigate to the selected playlist or track (deep search result)
+		m.navigated(m.Navigation.PlaylistNav().FocusByID(item.NodeID()))
+	}
+}
+
+// handleTextInputAction handles actions from the text input popup.
+func (m Model) handleTextInputAction(a action.Action) (tea.Model, tea.Cmd) {
+	if act, ok := a.(textinput.Result); ok {
+		return m.handleTextInputResultAction(act)
+	}
+	return m, nil
+}
+
+// handleTextInputResultAction handles the text input result action.
+func (m Model) handleTextInputResultAction(act textinput.Result) (tea.Model, tea.Cmd) {
+	m.Popups.Hide(popupctl.TextInput)
+
+	if act.Canceled {
+		return m, nil
+	}
+
+	ctx, ok := act.Context.(PlaylistInputContext)
+	if !ok {
+		return m, nil
+	}
+
+	return m.processPlaylistInput(ctx, act.Text)
+}
+
+// handleConfirmAction handles actions from the confirmation popup.
+func (m Model) handleConfirmAction(a action.Action) (tea.Model, tea.Cmd) {
+	if act, ok := a.(confirm.Result); ok {
+		return m.handleConfirmResultAction(act)
+	}
+	return m, nil
+}
+
+// handleConfirmResultAction handles the confirmation result action.
+func (m Model) handleConfirmResultAction(act confirm.Result) (tea.Model, tea.Cmd) {
+	m.Popups.Hide(popupctl.Confirm)
+
+	if !act.Confirmed {
+		return m, nil
+	}
+
+	return m.processConfirmResult(act.Context, act.SelectedOption)
+}
+
+// handleLibrarySourcesAction handles actions from the library sources popup.
+func (m Model) handleLibrarySourcesAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case librarysources.SourceAdded:
+		return m.handleLibrarySourceAddedAction(act)
+	case librarysources.SourceRemoved:
+		return m.handleLibrarySourceRemovedAction(act)
+	case librarysources.RequestTrackCount:
+		count, err := m.Core.Library().TrackCountBySource(act.Path)
+		if err != nil {
+			m.Popups.ShowOpError(errmsg.OpSourceLoad, err)
+			return m, nil
+		}
+		m.Popups.LibrarySources().EnterConfirmMode(count)
+		return m, nil
+	case librarysources.Close:
+		m.Popups.Hide(popupctl.LibrarySources)
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleLibrarySourceAddedAction handles adding a library source.
+func (m Model) handleLibrarySourceAddedAction(act librarysources.SourceAdded) (tea.Model, tea.Cmd) {
+	// Add source to library: the core scans it
+	err := m.Core.Library().AddSource(act.Path)
+	if errors.Is(err, core.ErrSourceExists) {
+		m.Popups.ShowError("Source already exists")
+		return m, nil
+	}
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpSourceAdd, err)
+		return m, nil
+	}
+
+	// The library has a source now, whether the read that follows fails or not
+	m.HasLibrarySources = true
+	m.refreshLibrarySources()
+	return m, nil
+}
+
+// handleLibrarySourceRemovedAction handles removing a library source.
+func (m Model) handleLibrarySourceRemovedAction(act librarysources.SourceRemoved) (tea.Model, tea.Cmd) {
+	// Remove tracks from this source
+	if err := m.Core.Library().RemoveSource(act.Path); err != nil {
+		m.Popups.ShowOpError(errmsg.OpSourceRemove, err)
+		return m, nil
+	}
+
+	m.refreshLibrarySources()
+
+	// Refresh library navigator and album view
+	m.refreshLibraryNavigator(true)
+	_ = m.Navigation.AlbumView().Refresh()
+	// The playlists lost the source's tracks and were renumbered
+	m.refreshPlaylistNavigator()
+	return m, nil
+}
+
+// refreshLibrarySources lists the library's sources in the sources popup and
+// tells whether there are any. A read that fails is told, never taken for no
+// source: the popup keeps its list and HasLibrarySources its value.
+func (m *Model) refreshLibrarySources() {
+	if sources, ok := m.readLibrarySources(); ok {
+		m.Popups.LibrarySources().SetSources(sources)
+	}
+}
+
+// readLibrarySources reads the library's sources and sets HasLibrarySources
+// from them. A read that fails is told and changes nothing: ok is false.
+func (m *Model) readLibrarySources() (sources []string, ok bool) {
+	sources, err := m.Core.Library().Sources()
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpSourceLoad, err)
+		return nil, false
+	}
+	m.HasLibrarySources = len(sources) > 0
+	return sources, true
+}
+
+// handleHelpBindingsAction handles actions from the help bindings popup.
+func (m Model) handleHelpBindingsAction(a action.Action) (tea.Model, tea.Cmd) {
+	if _, ok := a.(helpbindings.Close); ok {
+		m.Popups.Hide(popupctl.Help)
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleLyricsAction handles actions from the lyrics popup.
+func (m Model) handleLyricsAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case lyricsui.Close:
+		m.Popups.Hide(popupctl.Lyrics)
+		return m, nil
+	case lyricsui.Passthrough:
+		// Pass the key to playback handlers
+		result := m.handlePlaybackKeys(act.Key.String())
+		return m, result.Cmd
+	}
+	return m, nil
+}
+
+// handleDownloadsViewAction handles actions from the downloads view.
+func (m Model) handleDownloadsViewAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case dlview.DeleteDownload:
+		return m, downloadsCmd(m.Core.Downloads(), errmsg.OpDownloadDelete, func(dl *core.Downloads) error {
+			return dl.Delete(act.ID)
+		})
+
+	case dlview.RetryFailed:
+		// The core's next Sync shows the files queued again.
+		return m, downloadsCmd(m.Core.Downloads(), errmsg.OpDownloadRetry, func(dl *core.Downloads) error {
+			return dl.Retry(act.ID)
+		})
+
+	case dlview.ClearCompleted:
+		return m, downloadsCmd(m.Core.Downloads(), errmsg.OpDownloadClear, (*core.Downloads).ClearCompleted)
+
+	case dlview.RefreshRequest:
+		// The core reports what the Sync changes, if anything.
+		m.Core.Downloads().Sync()
+		return m, nil
+
+	case dlview.OpenImport:
+		if act.Download != nil && m.Core.Downloads().Configured() {
+			sources, err := m.Core.Library().Sources()
+			if err != nil {
+				m.Popups.ShowOpError(errmsg.OpSourceLoad, err)
+				return m, nil
+			}
+			cmd := m.Popups.ShowImport(act.Download, sources, m.Core.Downloads())
+			return m, cmd
+		}
+		return m, nil
+
+	case dlview.ImportNotReady:
+		m.Popups.ShowError("Cannot import: " + act.Reason)
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleDownloadPopupAction handles actions from the download popup.
+func (m Model) handleDownloadPopupAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch a.(type) {
+	case download.Close:
+		m.Popups.Hide(popupctl.Download)
+		return m, nil
+
+	case download.Queued:
+		// Entered from the releases list: stay on it to queue more
+		if dl := m.Popups.Download(); dl == nil || !dl.FromReleases() {
+			m.Popups.Hide(popupctl.Download)
+
+			// Switch to downloads view and focus it
+			m.Navigation.SetViewMode(navctl.ViewDownloads)
+			m.SetFocus(navctl.FocusNavigator)
+			m.SaveNavigationState()
+		}
+		// Queueing asked the core for a Sync: the downloads view follows it
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleImportPopupAction handles actions from the import popup.
+func (m Model) handleImportPopupAction(a action.Action) (tea.Model, tea.Cmd) {
+	if _, ok := a.(importpopup.Close); ok {
+		// An import the core has started goes on: importFinished tells its end.
+		m.Popups.Hide(popupctl.Import)
+	}
+	return m, nil
+}
+
+// processPlaylistInput processes text input for playlist operations.
+func (m Model) processPlaylistInput(ctx PlaylistInputContext, text string) (tea.Model, tea.Cmd) {
+	if text == "" {
+		return m, nil
+	}
+
+	var navigateToID string
+
+	switch ctx.Mode {
+	case InputNone:
+		// No action
+	case InputNewPlaylist:
+		id, err := m.Core.Playlists().Create(ctx.FolderID, text)
+		if err != nil {
+			m.Popups.ShowOpError(errmsg.OpPlaylistCreate, err)
+			return m, nil
+		}
+		navigateToID = "playlists:playlist:" + strconv.FormatInt(id, 10)
+	case InputNewFolder:
+		id, err := m.Core.Playlists().CreateFolder(ctx.FolderID, text)
+		if err != nil {
+			m.Popups.ShowOpError(errmsg.OpFolderCreate, err)
+			return m, nil
+		}
+		navigateToID = "playlists:folder:" + strconv.FormatInt(id, 10)
+	case InputRename:
+		var err error
+		if ctx.IsFolder {
+			err = m.Core.Playlists().RenameFolder(ctx.ItemID, text)
+		} else {
+			err = m.Core.Playlists().Rename(ctx.ItemID, text)
+		}
+		if err != nil {
+			op := errmsg.OpPlaylistRename
+			if ctx.IsFolder {
+				op = errmsg.OpFolderRename
+			}
+			m.Popups.ShowOpError(op, err)
+			return m, nil
+		}
+	}
+
+	// Refresh and navigate to newly created item
+	m.Navigation.PlaylistNav().Refresh()
+	if navigateToID != "" {
+		m.navigated(m.Navigation.PlaylistNav().NavigateTo(navigateToID))
+	}
+	return m, nil
+}
+
+// processConfirmResult processes the confirmation dialog result.
+func (m Model) processConfirmResult(context any, selectedOption int) (tea.Model, tea.Cmd) {
+	// Handle library delete context
+	if ctx, ok := context.(LibraryDeleteContext); ok {
+		return m.handleLibraryDeleteConfirm(ctx, selectedOption)
+	}
+
+	// Handle file browser delete context
+	if ctx, ok := context.(FileDeleteContext); ok {
+		return m.handleFileDeleteConfirm(ctx)
+	}
+
+	// Handle playlist delete context
+	ctx, ok := context.(DeleteConfirmContext)
+	if !ok {
+		return m, nil
+	}
+
+	var err error
+	if ctx.IsFolder {
+		err = m.Core.Playlists().DeleteFolder(ctx.ItemID)
+	} else {
+		err = m.Core.Playlists().Delete(ctx.ItemID)
+	}
+	if err != nil {
+		op := errmsg.OpPlaylistDelete
+		if ctx.IsFolder {
+			op = errmsg.OpFolderDelete
+		}
+		m.Popups.ShowOpError(op, err)
+		return m, nil
+	}
+
+	// Refresh playlist navigator
+	m.refreshPlaylistNavigator()
+	return m, nil
+}
+
+// handleLibraryDeleteConfirm handles library track deletion confirmation.
+func (m Model) handleLibraryDeleteConfirm(ctx LibraryDeleteContext, option int) (tea.Model, tea.Cmd) {
+	switch option {
+	case 0: // Remove from library only
+		if err := m.Core.Library().DeleteTrack(ctx.TrackID); err != nil {
+			m.Popups.ShowOpError(errmsg.OpLibraryDelete, err)
+			return m, nil
+		}
+	case 1: // Delete from disk
+		if err := os.Remove(ctx.TrackPath); err != nil {
+			m.Popups.ShowOpError(errmsg.OpFileDelete, err)
+			return m, nil
+		}
+		if err := m.Core.Library().DeleteTrack(ctx.TrackID); err != nil {
+			m.Popups.ShowOpError(errmsg.OpLibraryDelete, err)
+			return m, nil
+		}
+	default: // Cancel or unknown
+		return m, nil
+	}
+
+	// Every library view lost the track
+	m.refreshLibraryViews()
+	// The playlists lost the track and were renumbered
+	m.refreshPlaylistNavigator()
+	return m, nil
+}
+
+// handleFileDeleteConfirm handles file browser file/directory deletion confirmation.
+func (m Model) handleFileDeleteConfirm(ctx FileDeleteContext) (tea.Model, tea.Cmd) {
+	var err error
+	if ctx.IsDir {
+		err = os.RemoveAll(ctx.Path)
+	} else {
+		err = os.Remove(ctx.Path)
+	}
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpFileDelete, err)
+		return m, nil
+	}
+
+	m.Navigation.FileNav().Refresh()
+	return m, nil
+}
+
+// handleRetagPopupAction handles actions from the retag popup.
+func (m Model) handleRetagPopupAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case retag.Close:
+		m.Popups.Hide(popupctl.Retag)
+		return m, nil
+	case retag.Complete:
+		m.Popups.Hide(popupctl.Retag)
+
+		// The library views were read again when the core finished the retag
+		// (handleRetagEvent), and those on the album followed it. Show the
+		// album the popup names (see retag.Complete): with none, the views
+		// stay.
+		if act.AlbumArtist != "" && act.Album != "" {
+			m.selectAlbumInCurrentMode(act.AlbumArtist, act.Album)
+		}
+
+		return m, nil
+	}
+	return m, nil
+}
+
+// reloadExportTargets asks the open export popup to read its targets again,
+// after a rename or a delete: the read is the popup's own request.
+func (m Model) reloadExportTargets() tea.Cmd {
+	if exp := m.Popups.Export(); exp != nil {
+		return exp.ReloadTargets()
+	}
+	return nil
+}
+
+// handleExportPopupAction handles actions from the export popup.
+func (m Model) handleExportPopupAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case exportui.Close:
+		m.Popups.Hide(popupctl.Export)
+		return m, nil
+
+	case exportui.DeleteTarget:
+		if err := m.Core.Exports().DeleteTarget(act.ID); err != nil {
+			m.Popups.ShowOpError(errmsg.OpTargetDelete, err)
+			return m, nil
+		}
+		return m, m.reloadExportTargets()
+
+	case exportui.RenameTarget:
+		if err := m.Core.Exports().RenameTarget(act.ID, act.NewName); err != nil {
+			m.Popups.ShowOpError(errmsg.OpTargetRename, err)
+			return m, nil
+		}
+		return m, m.reloadExportTargets()
+
+	case exportui.StartExport:
+		// The core runs the export from here: the job bar follows its events.
+		_, err := m.Core.Exports().Start(core.ExportRequest{
+			TargetID:    act.Target.ID,
+			Tracks:      act.Tracks,
+			ConvertFLAC: act.ConvertFLAC,
+		})
+		switch {
+		case errors.Is(err, core.ErrTargetNotConnected):
+			// The popup stays: the user plugs the device in, or picks another target.
+			m.Popups.ShowError("Device for " + act.Target.Name + " is not connected")
+		case err != nil:
+			m.Popups.ShowOpError(errmsg.OpExportTarget, err)
+		default:
+			m.Popups.Hide(popupctl.Export)
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// handleSimilarArtistsAction handles actions from the similar artists popup.
+func (m Model) handleSimilarArtistsAction(a action.Action) (tea.Model, tea.Cmd) {
+	switch act := a.(type) {
+	case similarartists.Close:
+		m.Popups.Hide(popupctl.SimilarArtists)
+		return m, nil
+
+	case similarartists.GoToArtist:
+		m.Popups.Hide(popupctl.SimilarArtists)
+		// Navigate to library view and focus on artist
+		m.Navigation.SetViewMode(navctl.ViewLibrary)
+
+		if m.Navigation.LibrarySubMode() == navctl.LibraryModeBrowser {
+			// Browser mode: select artist and focus on albums
+			browser := m.Navigation.LibraryBrowser()
+			browser.SelectArtist(act.Name)
+			browser.SetActiveColumn(librarybrowser.ColumnAlbums)
+			browser.CenterCursors()
+		} else {
+			// Miller/Album view: switch to Miller and use FocusByID
+			if m.Navigation.LibrarySubMode() == navctl.LibraryModeAlbum {
+				m.Navigation.SetLibrarySubMode(navctl.LibraryModeMiller)
+			}
+			m.navigated(m.Navigation.LibraryNav().FocusByID(librarynav.ArtistNodeID(act.Name)))
+		}
+		m.SetFocus(navctl.FocusNavigator)
+		m.SaveNavigationState()
+		return m, nil
+
+	case similarartists.OpenDownload:
+		m.Popups.Hide(popupctl.SimilarArtists)
+		// Open download popup with artist pre-filled
+		if m.Core.Downloads().Configured() {
+			cmd := m.showDownloadPopup()
+			// Set search query to artist name
+			if dl := m.Popups.Download(); dl != nil {
+				dl.SetSearchQuery(act.Name)
+			}
+			return m, cmd
+		}
+		return m, nil
+	}
+	return m, nil
+}

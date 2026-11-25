@@ -1,0 +1,379 @@
+//go:build linux || freebsd
+
+package mpris
+
+import (
+	"errors"
+	"fmt"
+	"hash/fnv"
+	"math"
+	"strconv"
+	"time"
+
+	"github.com/godbus/dbus/v5"
+	"github.com/quarckster/go-mpris-server/pkg/events"
+	"github.com/quarckster/go-mpris-server/pkg/server"
+	"github.com/quarckster/go-mpris-server/pkg/types"
+
+	"github.com/llehouerou/waves/internal/cover"
+	"github.com/llehouerou/waves/internal/playback"
+)
+
+// Adapter connects PlaybackService to MPRIS over D-Bus.
+type Adapter struct {
+	service playback.Service
+	server  *server.Server
+	sub     *playback.Subscription
+	player  types.OrgMprisMediaPlayer2PlayerEventHandler // emits PropertiesChanged; the bus, but in tests
+	done    chan struct{}
+}
+
+// New creates and starts a new MPRIS adapter, over the playback service and
+// the volume of waves.
+func New(service playback.Service, volume Volume) (*Adapter, error) {
+	a := &Adapter{
+		service: service,
+		done:    make(chan struct{}),
+	}
+
+	// Create adapters that delegate to the service
+	rootAdapter := &rootAdapter{}
+	playerAdapter := &playerAdapter{service: service, volume: volume}
+
+	a.server = server.NewServer("waves", rootAdapter, playerAdapter)
+	a.player = events.NewEventHandler(a.server).Player
+	playerAdapter.bus = a.player
+	a.sub = service.Subscribe()
+
+	// Start the server in background
+	go func() {
+		_ = a.server.Listen()
+	}()
+
+	go a.runEventLoop(a.sub)
+
+	// Emit initial state after a delay so MPRIS clients have time
+	// to subscribe to signals after detecting the new player.
+	go a.emitDelayedState()
+
+	return a, nil
+}
+
+// Close stops the adapter and releases D-Bus resources.
+func (a *Adapter) Close() error {
+	close(a.done)
+	return a.server.Stop()
+}
+
+// VolumeChanged tells the bus that the volume it reports changed.
+func (a *Adapter) VolumeChanged() {
+	_ = a.player.OnVolume()
+}
+
+// initialEmitDelay is the time to wait before broadcasting initial state,
+// giving MPRIS clients time to subscribe after detecting the new player.
+const initialEmitDelay = 500 * time.Millisecond
+
+// emitDelayedState broadcasts all properties after a short delay,
+// giving MPRIS clients time to subscribe after detecting the new player.
+func (a *Adapter) emitDelayedState() {
+	select {
+	case <-time.After(initialEmitDelay):
+		_ = a.player.OnAll()
+	case <-a.done:
+	}
+}
+
+// runEventLoop reads playback events and emits D-Bus PropertiesChanged signals.
+func (a *Adapter) runEventLoop(sub *playback.Subscription) {
+	for {
+		select {
+		case <-a.done:
+			return
+		case <-sub.Done:
+			return
+		case sc := <-sub.StateChanged:
+			if sc.Current == playback.StateStopped && sc.Previous != playback.StateStopped {
+				_ = a.player.OnEnded()
+			} else {
+				_ = a.player.OnPlayback()
+			}
+		case <-sub.TrackChanged:
+			a.currentTrackChanged()
+		case <-sub.QueueChanged:
+			a.currentTrackChanged()
+		case pc := <-sub.PositionChanged:
+			_ = a.player.OnSeek(types.Microseconds(pc.Position.Microseconds()))
+		case <-sub.ModeChanged:
+			_ = a.player.OnOptions()
+		case <-sub.Error:
+			// Drain error events to prevent buffer buildup
+		}
+	}
+}
+
+// currentTrackChanged tells the bus of the current track and of what can
+// follow or precede it: a track change and a queue change can both move the
+// current track, and with it its neighbours.
+func (a *Adapter) currentTrackChanged() {
+	_ = a.player.OnTitle()
+	_ = a.player.OnOptions()
+}
+
+// rootAdapter implements OrgMprisMediaPlayer2Adapter.
+type rootAdapter struct{}
+
+func (r *rootAdapter) Raise() error {
+	return nil // Not supported
+}
+
+func (r *rootAdapter) Quit() error {
+	return nil // Not supported - app manages its own lifecycle
+}
+
+func (r *rootAdapter) CanQuit() (bool, error) {
+	return false, nil
+}
+
+func (r *rootAdapter) CanRaise() (bool, error) {
+	return false, nil
+}
+
+func (r *rootAdapter) HasTrackList() (bool, error) {
+	return false, nil // Track list interface not implemented
+}
+
+func (r *rootAdapter) Identity() (string, error) {
+	return "Waves", nil
+}
+
+//nolint:revive // Method name required by interface.
+func (r *rootAdapter) SupportedUriSchemes() ([]string, error) {
+	return []string{"file"}, nil
+}
+
+func (r *rootAdapter) SupportedMimeTypes() ([]string, error) {
+	return []string{"audio/mpeg", "audio/flac", "audio/mp3"}, nil
+}
+
+// playerAdapter implements OrgMprisMediaPlayer2PlayerAdapter and optional interfaces.
+type playerAdapter struct {
+	service playback.Service
+	volume  Volume
+	bus     types.OrgMprisMediaPlayer2PlayerEventHandler
+}
+
+func (p *playerAdapter) Next() error {
+	return p.service.Next()
+}
+
+func (p *playerAdapter) Previous() error {
+	return p.service.Previous()
+}
+
+func (p *playerAdapter) Pause() error {
+	return p.service.Pause()
+}
+
+// PlayPause pauses when playing and plays when paused or stopped. With
+// nothing to play it has no effect and reports success, as Play does.
+func (p *playerAdapter) PlayPause() error {
+	return nothingToPlayIsNoEffect(p.service.Toggle())
+}
+
+func (p *playerAdapter) Stop() error {
+	return p.service.Stop()
+}
+
+// Play follows the MPRIS spec: it starts the current track when stopped (the
+// first track of a queue with no current one), resumes when paused, and has no
+// effect when already playing, nor with no track to play: an empty queue
+// reports success.
+func (p *playerAdapter) Play() error {
+	if p.service.IsStopped() {
+		return nothingToPlayIsNoEffect(p.service.Play())
+	}
+	return p.service.Resume()
+}
+
+// nothingToPlayIsNoEffect turns the service's refusal of an empty queue into
+// success: over MPRIS, a start with no track to play has no effect. Any other
+// error is returned as it is.
+func nothingToPlayIsNoEffect(err error) error {
+	if errors.Is(err, playback.ErrEmptyQueue) {
+		return nil
+	}
+	return err
+}
+
+func (p *playerAdapter) Seek(offset types.Microseconds) error {
+	return p.service.Seek(time.Duration(offset) * time.Microsecond)
+}
+
+// SetPosition follows the MPRIS spec: it seeks to the position in the current
+// track, and does nothing when the track ID is not the current track's (a
+// stale call) or the position is below 0 or past the length of the track.
+func (p *playerAdapter) SetPosition(trackID string, position types.Microseconds) error {
+	track := p.service.CurrentTrack()
+	if track == nil || trackID != formatTrackID(track.Path) {
+		return nil
+	}
+	pos := time.Duration(position) * time.Microsecond
+	if pos < 0 || pos > p.service.Duration() {
+		return nil
+	}
+	return p.service.SeekTo(pos)
+}
+
+//nolint:revive // Method name required by interface.
+func (p *playerAdapter) OpenUri(_ string) error {
+	return nil // Not supported
+}
+
+func (p *playerAdapter) PlaybackStatus() (types.PlaybackStatus, error) {
+	switch p.service.State() {
+	case playback.StatePlaying:
+		return types.PlaybackStatusPlaying, nil
+	case playback.StatePaused:
+		return types.PlaybackStatusPaused, nil
+	case playback.StateStopped:
+		return types.PlaybackStatusStopped, nil
+	}
+	return types.PlaybackStatusStopped, nil
+}
+
+func (p *playerAdapter) Rate() (float64, error) {
+	return 1.0, nil
+}
+
+func (p *playerAdapter) SetRate(_ float64) error {
+	return nil // Not supported
+}
+
+func (p *playerAdapter) Metadata() (types.Metadata, error) {
+	track := p.service.CurrentTrack()
+	if track == nil {
+		return types.Metadata{
+			TrackId: "/org/mpris/MediaPlayer2/TrackList/NoTrack",
+		}, nil
+	}
+
+	meta := types.Metadata{
+		TrackId:     dbus.ObjectPath(formatTrackID(track.Path)),
+		Length:      types.Microseconds(p.service.Duration().Microseconds()),
+		Title:       track.Title,
+		Artist:      []string{track.Artist},
+		Album:       track.Album,
+		TrackNumber: track.TrackNumber,
+		DiscNumber:  track.DiscNumber,
+		Url:         "file://" + track.Path,
+	}
+
+	if track.Genre != "" {
+		meta.Genre = []string{track.Genre}
+	}
+
+	if track.Year > 0 {
+		meta.ContentCreated = strconv.Itoa(track.Year)
+	}
+
+	if artPath := cover.Find(track.Path); artPath != "" {
+		meta.ArtUrl = "file://" + artPath
+	}
+
+	return meta, nil
+}
+
+func (p *playerAdapter) Volume() (float64, error) {
+	return p.volume.Volume(), nil
+}
+
+func (p *playerAdapter) SetVolume(level float64) error {
+	if math.IsNaN(level) {
+		return errors.New("volume is not a number")
+	}
+	// The MPRIS spec: a negative volume is 0.
+	p.volume.SetVolume(min(max(level, 0), 1))
+	// The library signals the value asked for, unclamped; this is the value set.
+	_ = p.bus.OnVolume()
+	return nil
+}
+
+func (p *playerAdapter) Position() (int64, error) {
+	return p.service.Position().Microseconds(), nil
+}
+
+func (p *playerAdapter) MinimumRate() (float64, error) {
+	return 1.0, nil
+}
+
+func (p *playerAdapter) MaximumRate() (float64, error) {
+	return 1.0, nil
+}
+
+func (p *playerAdapter) CanGoNext() (bool, error) {
+	return p.service.QueueHasNext(), nil
+}
+
+func (p *playerAdapter) CanGoPrevious() (bool, error) {
+	return p.service.QueueCurrentIndex() > 0, nil
+}
+
+func (p *playerAdapter) CanPlay() (bool, error) {
+	return !p.service.QueueIsEmpty(), nil
+}
+
+func (p *playerAdapter) CanPause() (bool, error) {
+	return true, nil
+}
+
+func (p *playerAdapter) CanSeek() (bool, error) {
+	return true, nil
+}
+
+func (p *playerAdapter) CanControl() (bool, error) {
+	return true, nil
+}
+
+// LoopStatus implements OrgMprisMediaPlayer2PlayerAdapterLoopStatus.
+func (p *playerAdapter) LoopStatus() (types.LoopStatus, error) {
+	switch p.service.RepeatMode() {
+	case playback.RepeatOne:
+		return types.LoopStatusTrack, nil
+	case playback.RepeatAll:
+		return types.LoopStatusPlaylist, nil
+	case playback.RepeatOff, playback.RepeatRadio:
+		return types.LoopStatusNone, nil
+	}
+	return types.LoopStatusNone, nil
+}
+
+// SetLoopStatus implements OrgMprisMediaPlayer2PlayerAdapterLoopStatus.
+func (p *playerAdapter) SetLoopStatus(status types.LoopStatus) error {
+	switch status {
+	case types.LoopStatusNone:
+		p.service.SetRepeatMode(playback.RepeatOff)
+	case types.LoopStatusTrack:
+		p.service.SetRepeatMode(playback.RepeatOne)
+	case types.LoopStatusPlaylist:
+		p.service.SetRepeatMode(playback.RepeatAll)
+	}
+	return nil
+}
+
+// Shuffle implements OrgMprisMediaPlayer2PlayerAdapterShuffle.
+func (p *playerAdapter) Shuffle() (bool, error) {
+	return p.service.Shuffle(), nil
+}
+
+// SetShuffle implements OrgMprisMediaPlayer2PlayerAdapterShuffle.
+func (p *playerAdapter) SetShuffle(shuffle bool) error {
+	p.service.SetShuffle(shuffle)
+	return nil
+}
+
+func formatTrackID(path string) string {
+	h := fnv.New64a()
+	h.Write([]byte(path))
+	return fmt.Sprintf("/org/mpris/MediaPlayer2/Track/%x", h.Sum64())
+}

@@ -1,0 +1,259 @@
+package download
+
+import (
+	"fmt"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/ui/popup"
+)
+
+// handleSlskdPhaseKey handles keyboard input in the slskd phase.
+func (m *Model) handleSlskdPhaseKey(msg tea.KeyMsg) (popup.Popup, tea.Cmd) {
+	switch msg.String() {
+	case keyEnter:
+		cmd := m.handleSlskdEnter()
+		return m, cmd
+	case keyUp, "k":
+		if m.state == StateSlskdResults {
+			m.moveCursor(&m.slskdCursor, m.slskdCursor.Pos()-1, len(m.slskdResults))
+		}
+	case keyDown, "j":
+		if m.state == StateSlskdResults {
+			m.moveCursor(&m.slskdCursor, m.slskdCursor.Pos()+1, len(m.slskdResults))
+		}
+	case keyHome, "g":
+		if m.state == StateSlskdResults {
+			m.moveCursor(&m.slskdCursor, 0, len(m.slskdResults))
+		}
+	case keyEnd, "G":
+		if m.state == StateSlskdResults {
+			m.moveCursor(&m.slskdCursor, len(m.slskdResults)-1, len(m.slskdResults))
+		}
+	case keyBackspace:
+		m.handleSlskdBack()
+	case "f":
+		// Cycle format filter
+		if m.state == StateSlskdResults {
+			m.cycleFormatFilter()
+		}
+	case "s":
+		// Toggle no slot filter
+		if m.state == StateSlskdResults {
+			m.filterNoSlot = !m.filterNoSlot
+			m.reapplyFilters()
+		}
+	case "t":
+		// Toggle track count filter
+		if m.state == StateSlskdResults {
+			m.filterTrackCount = !m.filterTrackCount
+			m.reapplyFilters()
+		}
+	}
+	return m, nil
+}
+
+// handleSlskdEnter processes Enter key in the slskd phase.
+func (m *Model) handleSlskdEnter() tea.Cmd {
+	// If download is complete, close the popup
+	if m.downloadComplete {
+		return func() tea.Msg { return ActionMsg(Close{}) }
+	}
+
+	//nolint:exhaustive // Only handling slskd phase states
+	switch m.state {
+	case StateSlskdResults:
+		d, ok := m.selectedDownload()
+		if !ok {
+			return nil
+		}
+		m.state = StateDownloading
+		m.statusMsg = "Queueing download..."
+		return m.queueing.Ask(queueDownload(m.downloads, d))
+
+	case StateSlskdSearching, StateDownloading:
+		// No action during loading
+		return nil
+
+	default:
+		// Other states handled by different phase handlers
+		return nil
+	}
+}
+
+// handleSlskdBack processes Backspace key in the slskd phase.
+func (m *Model) handleSlskdBack() {
+	//nolint:exhaustive // Only handling slskd phase states
+	switch m.state {
+	case StateSlskdResults:
+		// Go back to release results (or release groups if auto-selected)
+		if len(m.releases) > 0 {
+			m.state = StateReleaseResults
+		} else {
+			m.state = StateReleaseGroupResults
+			m.selectedReleaseGroup = nil
+		}
+		m.slskdRawResponse = nil
+		m.slskdResults = nil
+		m.slskdCursor.Reset()
+		m.statusMsg = ""
+	case StateDownloading:
+		// Go back to slskd results: the download is queued all the same, the
+		// popup no longer waits to hear it
+		m.queueing.Forget()
+		m.state = StateSlskdResults
+		m.statusMsg = ""
+	case StateSlskdSearching:
+		// No escape action in loading state
+	default:
+		// Other states handled by different phase handlers
+	}
+}
+
+// cycleFormatFilter cycles through format filter options.
+func (m *Model) cycleFormatFilter() {
+	switch m.formatFilter {
+	case core.FormatBoth:
+		m.formatFilter = core.FormatLossless
+	case core.FormatLossless:
+		m.formatFilter = core.FormatLossy
+	case core.FormatLossy:
+		m.formatFilter = core.FormatBoth
+	}
+	m.reapplyFilters()
+}
+
+// startSlskdSearch asks the downloads to search slskd for the selected
+// release group. The search runs in the core: its events come back through
+// handleSearchProgressed and handleSearchFinished.
+func (m *Model) startSlskdSearch() {
+	m.state = StateSlskdSearching
+	m.statusMsg = "Searching slskd..."
+	m.slskdQuery = fmt.Sprintf("%s %s", m.selectedArtist.Name, m.selectedReleaseGroup.Title)
+	if err := m.downloads.Search(m.slskdQuery); err != nil {
+		m.searchFailed(err)
+	}
+}
+
+// searchFailed takes the user back to the release groups with the error.
+func (m *Model) searchFailed(err error) {
+	m.state = StateReleaseGroupResults
+	m.errorMsg = fmt.Sprintf("slskd error: %v", err)
+	m.statusMsg = ""
+}
+
+// ownSearch reports whether an event of the core is about the search this
+// popup is waiting for: not one a popup closed since left running.
+func (m *Model) ownSearch(query string) bool {
+	return m.state == StateSlskdSearching && query == m.slskdQuery
+}
+
+// handleSearchProgressed shows where the search is.
+func (m *Model) handleSearchProgressed(e core.SearchProgressed) (popup.Popup, tea.Cmd) {
+	if !m.ownSearch(e.Query) {
+		return m, nil
+	}
+	switch e.Phase {
+	case core.SearchFetching:
+		m.statusMsg = fmt.Sprintf("Waiting for results... (%d users)", e.Responses)
+	case core.SearchCollecting:
+		m.statusMsg = fmt.Sprintf("Collecting results... (%d users responded)", e.Responses)
+	default:
+		stateInfo := "searching"
+		if e.State != "" && e.State != "InProgress" {
+			stateInfo = e.State
+		}
+		// Show elapsed time in status when searching for a while
+		if elapsed := int(e.Elapsed.Seconds()); elapsed > 10 {
+			m.statusMsg = fmt.Sprintf("Searching Soulseek (%s) - %d users (%ds)", stateInfo, e.Responses, elapsed)
+		} else {
+			m.statusMsg = fmt.Sprintf("Searching Soulseek (%s) - %d users responded", stateInfo, e.Responses)
+		}
+	}
+	return m, nil
+}
+
+// handleSearchFinished processes the end of the search: its responses, or
+// its failure.
+func (m *Model) handleSearchFinished(e core.SearchFinished) (popup.Popup, tea.Cmd) {
+	if !m.ownSearch(e.Query) {
+		return m, nil
+	}
+	if e.Err != nil {
+		m.searchFailed(e.Err)
+		return m, nil
+	}
+
+	// Store raw responses for re-filtering
+	m.slskdRawResponse = e.Responses
+	m.slskdCursor.Reset()
+	m.state = StateSlskdResults
+	m.statusMsg = ""
+
+	// Apply current filters
+	m.reapplyFilters()
+
+	if len(m.slskdResults) == 0 {
+		m.statusMsg = "No matching results found"
+	}
+
+	return m, nil
+}
+
+// handleDownloadQueued processes download queue confirmation, if the popup
+// waits for it. A refusal takes the user back to the results: the app shows
+// the error, whether a popup waits for it or not.
+func (m *Model) handleDownloadQueued(msg SlskdDownloadQueuedMsg) (popup.Popup, tea.Cmd) {
+	if !m.queueing.Take(msg.Request) {
+		return m, nil
+	}
+	if msg.Err != nil {
+		m.state = StateSlskdResults
+		m.statusMsg = ""
+		return m, nil
+	}
+
+	entered := m.relEntered
+	m.Reset()
+	if m.fromReleases {
+		// Back to the releases list to queue more, row marked in memory only
+		if entered != nil {
+			m.relQueued[entered.ReleaseGroupMBID] = true
+		}
+		m.statusMsg = "Download queued"
+	} else {
+		// Mark download complete - popup can now be closed with Enter/Esc
+		m.downloadComplete = true
+		m.statusMsg = "Download queued successfully! Press Enter or Esc to close."
+	}
+	return m, func() tea.Msg { return ActionMsg(Queued{}) }
+}
+
+// selectedDownload is the download the highlighted slskd result would record:
+// that user's folder for the selected MusicBrainz release. ok is false when
+// nothing is highlighted or no release group is selected.
+func (m *Model) selectedDownload() (d core.Download, ok bool) {
+	pos := m.slskdCursor.Pos()
+	if m.selectedArtist == nil || m.selectedReleaseGroup == nil || pos >= len(m.slskdResults) {
+		return d, false
+	}
+	selected := m.slskdResults[pos]
+	d = core.Download{
+		MBReleaseGroupID: m.selectedReleaseGroup.ID,
+		MBArtistName:     m.selectedArtist.Name,
+		MBAlbumTitle:     m.selectedReleaseGroup.Title,
+		MBReleaseYear:    m.selectedReleaseGroup.FirstRelease,
+		MBReleaseGroup:   m.selectedReleaseGroup,
+		MBReleaseDetails: m.selectedReleaseDetails,
+		SlskdUsername:    selected.Username,
+		SlskdDirectory:   selected.Directory,
+	}
+	if m.selectedRelease != nil {
+		d.MBReleaseID = m.selectedRelease.ID
+	}
+	for _, f := range selected.Files {
+		d.Files = append(d.Files, core.DownloadFile{Filename: f.Filename, Size: f.Size})
+	}
+	return d, true
+}

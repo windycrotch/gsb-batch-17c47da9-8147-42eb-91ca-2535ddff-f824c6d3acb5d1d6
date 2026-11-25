@@ -1,0 +1,193 @@
+// internal/app/handlers_navigator.go
+package app
+
+import (
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/waves/internal/app/handler"
+	"github.com/llehouerou/waves/internal/app/navctl"
+	"github.com/llehouerou/waves/internal/errmsg"
+	"github.com/llehouerou/waves/internal/keymap"
+	"github.com/llehouerou/waves/internal/ui/librarybrowser"
+	"github.com/llehouerou/waves/internal/ui/librarynav"
+	"github.com/llehouerou/waves/internal/ui/playlistnav"
+	"github.com/llehouerou/waves/internal/ui/search"
+)
+
+// keyForBrowserRight is a synthetic key message used to move the browser column right.
+var keyForBrowserRight = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}}
+
+// handleNavigatorActionKeys handles enter, a, /, ctrl+a.
+func (m *Model) handleNavigatorActionKeys(key string) handler.Result {
+	switch m.Keys.Resolve(key) { //nolint:exhaustive // only handling navigator actions
+	case keymap.ActionSearch:
+		if !m.Navigation.ViewMode().HasSearch() {
+			return handler.HandledNoCmd
+		}
+		switch m.Navigation.ViewMode() { //nolint:exhaustive // the views with no search returned above
+		case navctl.ViewFileBrowser:
+			m.Input.StartLocalSearch(m.CurrentDirSearchItems())
+		case navctl.ViewLibrary:
+			switch {
+			case m.Navigation.IsBrowserViewActive():
+				// Browser view: local search within the active column
+				m.Input.StartLocalSearch(m.Navigation.LibraryBrowser().CurrentColumnSearchItems())
+			case m.Navigation.IsAlbumViewActive():
+				// Album view uses FTS deep search
+				searchFn := func(query string) ([]search.Item, error) {
+					results, err := m.Core.Library().SearchAlbumsFTS(query)
+					if err != nil {
+						return nil, err
+					}
+					items := make([]search.Item, len(results))
+					for i, r := range results {
+						items[i] = librarynav.SearchItem{Result: r}
+					}
+					return items, nil
+				}
+				m.Input.StartDeepSearchWithFunc(searchFn)
+			default:
+				m.Input.StartLocalSearch(m.CurrentLibrarySearchItems())
+			}
+		case navctl.ViewPlaylists:
+			m.Input.StartLocalSearch(m.CurrentPlaylistSearchItems())
+		}
+		return handler.HandledNoCmd
+	case keymap.ActionSelect:
+		// Album view handles its own enter key
+		if m.Navigation.IsAlbumViewActive() {
+			return handler.NotHandled
+		}
+		// Browser mode: handle enter based on active column
+		if m.Navigation.IsBrowserViewActive() {
+			return m.handleBrowserEnterKey()
+		}
+		return m.handleEnterKey()
+	case keymap.ActionAdd:
+		// Album view handles its own 'a' key
+		if m.Navigation.IsAlbumViewActive() {
+			return handler.NotHandled
+		}
+		if m.Navigation.IsNavigatorFocused() {
+			if cmd := m.HandleQueueAction(QueueAdd); cmd != nil {
+				return handler.Handled(cmd)
+			}
+		}
+	case keymap.ActionAddToPlaylist:
+		if m.Navigation.IsNavigatorFocused() && m.Navigation.ViewMode() == navctl.ViewLibrary {
+			return m.handleAddToPlaylist()
+		}
+	}
+	return handler.NotHandled
+}
+
+// handleEnterKey handles the enter key for navigator views (not album view).
+func (m *Model) handleEnterKey() handler.Result {
+	if !m.Navigation.IsNavigatorFocused() {
+		return handler.NotHandled
+	}
+	// Container selected: replace queue with contents, play first track
+	// Track selected: replace queue with parent container, play selected track
+	if m.isSelectedItemContainer() {
+		if cmd := m.HandleQueueAction(QueueReplace); cmd != nil {
+			return handler.Handled(cmd)
+		}
+	} else if cmd := m.HandleContainerAndPlay(); cmd != nil {
+		return handler.Handled(cmd)
+	}
+	return handler.NotHandled
+}
+
+// handleBrowserEnterKey handles the enter key for browser mode.
+func (m *Model) handleBrowserEnterKey() handler.Result {
+	if !m.Navigation.IsNavigatorFocused() {
+		return handler.NotHandled
+	}
+	browser := m.Navigation.LibraryBrowser()
+	switch browser.ActiveColumn() {
+	case librarybrowser.ColumnArtists:
+		// Move to albums column
+		cmd := m.Navigation.UpdateActiveNavigator(keyForBrowserRight)
+		if cmd != nil {
+			return handler.Handled(cmd)
+		}
+		return handler.HandledNoCmd
+	case librarybrowser.ColumnAlbums:
+		// Replace queue with album tracks and play
+		if cmd := m.HandleQueueAction(QueueReplace); cmd != nil {
+			return handler.Handled(cmd)
+		}
+		return handler.HandledNoCmd
+	case librarybrowser.ColumnTracks:
+		// Play from selected track
+		if cmd := m.HandleContainerAndPlay(); cmd != nil {
+			return handler.Handled(cmd)
+		}
+		return handler.HandledNoCmd
+	}
+	return handler.NotHandled
+}
+
+// handleAddToPlaylist initiates the add-to-playlist flow.
+func (m *Model) handleAddToPlaylist() handler.Result {
+	trackIDs, err := m.collectTrackIDsForPlaylist()
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpPlaylistAddTrack, err)
+		return handler.HandledNoCmd
+	}
+	m.startAddToPlaylist(trackIDs)
+	return handler.HandledNoCmd
+}
+
+// startAddToPlaylist opens the playlist picker on the tracks trackIDs. With
+// no track or no playlist, it does nothing; a read of the playlists that
+// failed is told.
+func (m *Model) startAddToPlaylist(trackIDs []int64) {
+	if len(trackIDs) == 0 {
+		return
+	}
+	items, err := m.Core.Playlists().AllForAddToPlaylist()
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpPlaylistAddTrack, err)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	searchItems := make([]search.Item, len(items))
+	for i, item := range items {
+		searchItems[i] = playlistnav.SearchItem{PlaylistSearchItem: item}
+	}
+	m.Input.StartAddToPlaylistSearch(trackIDs, searchItems)
+}
+
+// collectTrackIDsForPlaylist collects track IDs from the current selection
+// for add-to-playlist, and the error of a listing that failed.
+func (m *Model) collectTrackIDsForPlaylist() ([]int64, error) {
+	if m.Navigation.IsAlbumViewActive() {
+		album := m.Navigation.AlbumView().SelectedAlbum()
+		if album == nil {
+			return nil, nil
+		}
+		return m.Core.Library().AlbumTrackIDs(album.AlbumArtist, album.Album)
+	}
+	if m.Navigation.IsBrowserViewActive() {
+		tracks, err := m.collectTracksFromBrowser()
+		if err != nil {
+			return nil, err
+		}
+		var ids []int64
+		for _, t := range tracks {
+			if t.ID > 0 {
+				ids = append(ids, t.ID)
+			}
+		}
+		return ids, nil
+	}
+
+	selected := m.Navigation.LibraryNav().Selected()
+	if selected == nil {
+		return nil, nil
+	}
+	return m.collectTrackIDsFromNode(selected)
+}

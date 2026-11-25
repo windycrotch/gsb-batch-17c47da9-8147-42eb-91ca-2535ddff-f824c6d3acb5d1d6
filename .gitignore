@@ -1,0 +1,31 @@
+# Binaries
+waves
+*.exe
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+
+# Config (use config.example.toml as template)
+config.toml
+
+# OS
+.DS_Store
+
+# Test coverage
+coverage.out
+
+# docs/ is local scratch, except the agent and domain docs referenced from AGENTS.md
+docs/*
+!docs/agents/
+!docs/adr/
+.mcp.json
+
+# Go workspace (local development)
+go.work
+go.work.sum
+# Nix/direnv
+.direnv/
+result

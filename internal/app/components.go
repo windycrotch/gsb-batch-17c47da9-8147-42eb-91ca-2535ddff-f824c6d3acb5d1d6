@@ -1,0 +1,172 @@
+// internal/app/components.go
+package app
+
+import (
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/waves/internal/app/navctl"
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/errmsg"
+	"github.com/llehouerou/waves/internal/navigator"
+	"github.com/llehouerou/waves/internal/ui/librarybrowser"
+	"github.com/llehouerou/waves/internal/ui/librarynav"
+	"github.com/llehouerou/waves/internal/ui/playlistnav"
+	"github.com/llehouerou/waves/internal/ui/search"
+)
+
+// ResizeComponents updates all component sizes based on current dimensions.
+func (m *Model) ResizeComponents() {
+	navWidth := m.Layout.NavigatorWidth()
+	navHeight := m.NavigatorHeight()
+
+	navSizeMsg := tea.WindowSizeMsg{Width: navWidth, Height: navHeight}
+	m.Navigation.ResizeNavigators(navSizeMsg)
+
+	// Resize downloads view
+	m.DownloadsView.SetSize(navWidth, navHeight)
+
+	// Queue panel uses QueueHeight (different from navigator in narrow mode)
+	m.Layout.ResizeQueuePanel(m.QueueHeight())
+
+	// Update popup dimensions
+	m.Popups.SetSize(m.Layout.Width(), m.Layout.Height())
+
+	// Set bottom margin for popups to avoid overlapping player bar
+	m.Popups.SetBottomMargin(m.playerBarHeight())
+}
+
+// SetFocus changes focus to the specified target and updates all components.
+func (m *Model) SetFocus(target navctl.FocusTarget) {
+	m.Navigation.SetFocus(target)
+	m.Layout.QueuePanel().SetFocused(target == navctl.FocusQueue)
+	// Update downloads view focus when switching views
+	m.DownloadsView.SetFocused(target == navctl.FocusNavigator && m.Navigation.ViewMode() == navctl.ViewDownloads)
+}
+
+// HandleLibrarySearchResult navigates to the selected search result.
+// When in album view and an album is selected, stays in album view.
+// When in browser view, navigates within the browser.
+// Otherwise switches to Miller columns view.
+func (m *Model) HandleLibrarySearchResult(result core.SearchResult) {
+	// In album view, select album directly without switching views
+	if m.Navigation.IsAlbumViewActive() && result.Type == core.ResultAlbum {
+		m.Navigation.AlbumView().SelectAlbum(result.Artist, result.Album)
+		return
+	}
+
+	// In browser view, navigate within the browser
+	if m.Navigation.IsBrowserViewActive() {
+		browser := m.Navigation.LibraryBrowser()
+		switch result.Type {
+		case core.ResultArtist:
+			browser.SelectArtist(result.Artist)
+			browser.SetActiveColumn(librarybrowser.ColumnArtists)
+		case core.ResultAlbum:
+			browser.SelectArtist(result.Artist)
+			browser.SelectAlbum(result.Album)
+			browser.SetActiveColumn(librarybrowser.ColumnAlbums)
+		case core.ResultTrack:
+			browser.SelectArtist(result.Artist)
+			browser.SelectAlbum(result.Album)
+			browser.SelectTrackByID(result.TrackID)
+			browser.SetActiveColumn(librarybrowser.ColumnTracks)
+		}
+		browser.CenterCursors()
+		return
+	}
+
+	// Switch to Miller columns view for other search results, unless the
+	// lookup of the result failed: the error popup tells it, and the view
+	// stays as it is.
+	var err error
+	switch result.Type {
+	case core.ResultArtist:
+		_, err = m.Navigation.LibraryNav().NavigateTo(librarynav.ArtistNodeID(result.Artist))
+	case core.ResultAlbum:
+		_, err = m.Navigation.LibraryNav().NavigateTo(librarynav.AlbumNodeID(result.Artist, result.Album))
+	case core.ResultTrack:
+		_, err = m.Navigation.LibraryNav().FocusByID(librarynav.TrackNodeID(result.TrackID))
+	}
+	if err != nil {
+		m.Popups.ShowOpError(errmsg.OpNavigate, err)
+		return
+	}
+	m.Navigation.SetLibrarySubMode(navctl.LibraryModeMiller)
+}
+
+// CurrentDirSearchItems returns current directory items as search items.
+func (m *Model) CurrentDirSearchItems() []search.Item {
+	nodes := m.Navigation.FileNav().CurrentItems()
+	items := make([]search.Item, len(nodes))
+	for i, node := range nodes {
+		items[i] = navigator.FileItem{
+			Path:    node.ID(),
+			RelPath: node.DisplayName(),
+			IsDir:   node.IsContainer(),
+		}
+	}
+	return items
+}
+
+// CurrentLibrarySearchItems returns current level library items for local search.
+func (m *Model) CurrentLibrarySearchItems() []search.Item {
+	nodes := m.Navigation.LibraryNav().CurrentItems()
+	items := make([]search.Item, len(nodes))
+	for i, node := range nodes {
+		items[i] = librarynav.NodeItem{Node: node}
+	}
+	return items
+}
+
+// CurrentPlaylistSearchItems returns current level playlist items for local search.
+func (m *Model) CurrentPlaylistSearchItems() []search.Item {
+	nodes := m.Navigation.PlaylistNav().CurrentItems()
+	items := make([]search.Item, len(nodes))
+	for i, node := range nodes {
+		items[i] = playlistnav.NodeItem{Node: node}
+	}
+	return items
+}
+
+// AllPlaylistSearchItems returns all playlists and tracks for deep search.
+func (m *Model) AllPlaylistSearchItems() []search.Item {
+	results, err := m.Core.Playlists().AllDeepSearchItems()
+	if err != nil {
+		return nil
+	}
+	items := make([]search.Item, len(results))
+	for i, r := range results {
+		items[i] = playlistnav.DeepSearchItem{PlaylistDeepSearchItem: r}
+	}
+	return items
+}
+
+// refreshLibraryNavigator refreshes the library navigator data.
+// If preserveSelection is true, attempts to restore the previous selection.
+func (m *Model) refreshLibraryNavigator(preserveSelection bool) {
+	m.Navigation.RefreshLibrary(preserveSelection)
+}
+
+// refreshPlaylistNavigator refreshes the playlist navigator data, keeping
+// the cursor on the same row (see navctl.Manager.RefreshPlaylists).
+func (m *Model) refreshPlaylistNavigator() {
+	m.Navigation.RefreshPlaylists()
+}
+
+// selectedNode returns the currently selected node from the active navigator.
+// Returns nil if no item is selected.
+func (m *Model) selectedNode() navigator.Node {
+	return m.Navigation.CurrentNavigator()
+}
+
+// RefreshFavorites reads the favorites from the core and gives them to the views that mark them.
+func (m *Model) RefreshFavorites() {
+	favorites, err := m.Core.Playlists().FavoriteTrackIDs()
+	if err != nil {
+		return
+	}
+	m.Navigation.LibraryNav().SetFavorites(favorites)
+	m.Navigation.PlaylistNav().SetFavorites(favorites)
+	m.Navigation.LibraryBrowser().SetFavorites(favorites)
+	m.Layout.QueuePanel().SetFavorites(favorites)
+}

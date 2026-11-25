@@ -1,0 +1,246 @@
+package download
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/llehouerou/waves/internal/core"
+	"github.com/llehouerou/waves/internal/ui/mbworkflow"
+	"github.com/llehouerou/waves/internal/ui/popup"
+)
+
+// handleReleasePhaseKey handles keyboard input in the release phase.
+func (m *Model) handleReleasePhaseKey(msg tea.KeyMsg) (popup.Popup, tea.Cmd) {
+	switch msg.String() {
+	case keyEnter:
+		cmd := m.handleReleaseEnter()
+		return m, cmd
+	case keyUp, "k":
+		if m.state == StateReleaseResults {
+			m.moveCursor(&m.releaseCursor, m.releaseCursor.Pos()-1, len(m.releases))
+		}
+	case keyDown, "j":
+		if m.state == StateReleaseResults {
+			m.moveCursor(&m.releaseCursor, m.releaseCursor.Pos()+1, len(m.releases))
+		}
+	case keyHome, "g":
+		if m.state == StateReleaseResults {
+			m.moveCursor(&m.releaseCursor, 0, len(m.releases))
+		}
+	case keyEnd, "G":
+		if m.state == StateReleaseResults {
+			m.moveCursor(&m.releaseCursor, len(m.releases)-1, len(m.releases))
+		}
+	case keyBackspace:
+		m.handleReleaseBack()
+	case "d":
+		// Toggle deduplicate filter
+		if m.state == StateReleaseResults {
+			m.deduplicateRelease = !m.deduplicateRelease
+			m.reapplyReleaseFilters()
+		}
+	}
+	return m, nil
+}
+
+// handleReleaseEnter processes Enter key in the release phase.
+func (m *Model) handleReleaseEnter() tea.Cmd {
+	//nolint:exhaustive // Only handling release phase states
+	switch m.state {
+	case StateReleaseResults:
+		pos := m.releaseCursor.Pos()
+		if len(m.releases) == 0 || pos >= len(m.releases) {
+			return nil
+		}
+		// User selected a release - fetch full details with tracks
+		selected := m.releases[pos]
+		m.selectedRelease = &selected
+		m.expectedTracks = selected.TrackCount
+		m.state = StateReleaseDetailsLoading
+		m.statusMsg = "Loading release details..."
+		return m.waiting.Ask(mbworkflow.ReleaseDetails(m.mbClient, selected.ID))
+
+	case StateReleaseLoading, StateReleaseDetailsLoading:
+		// No action during loading
+		return nil
+
+	default:
+		// Other states handled by different phase handlers
+		return nil
+	}
+}
+
+// handleReleaseBack processes Backspace key in the release phase.
+func (m *Model) handleReleaseBack() {
+	//nolint:exhaustive // Only handling release phase states
+	switch m.state {
+	case StateReleaseResults:
+		m.leaveReleases()
+		m.releasesRaw = nil
+		m.releases = nil
+		m.releasesCut = mbworkflow.Cut{}
+		m.releaseCursor.Reset()
+		m.expectedTracks = 0
+		m.statusMsg = ""
+	case StateReleaseLoading, StateReleaseDetailsLoading:
+		// No escape action in loading states
+	default:
+		// Other states handled by different phase handlers
+	}
+}
+
+// leaveReleases goes back from the MusicBrainz releases to what stood for
+// their release group: the new releases list when the flow started there, the
+// release groups otherwise. Nothing stands for it any more.
+func (m *Model) leaveReleases() {
+	if m.fromReleases {
+		m.state = StateReleasesResults
+	} else {
+		m.state = StateReleaseGroupResults
+	}
+	m.selectedReleaseGroup = nil
+	m.relEntered = nil
+}
+
+// handleReleaseResult processes release results for track count
+// determination, if the popup waits for them.
+func (m *Model) handleReleaseResult(msg mbworkflow.ReleasesResultMsg) (popup.Popup, tea.Cmd) {
+	if !m.waiting.Take(msg.Request) {
+		return m, nil
+	}
+	if msg.Err != nil {
+		m.leaveReleases()
+		m.errorMsg = fmt.Sprintf("Error loading releases: %v", msg.Err)
+		m.statusMsg = ""
+		return m, nil
+	}
+
+	// Handle case where no releases found
+	if len(msg.Releases) == 0 {
+		m.leaveReleases()
+		m.errorMsg = "No releases found for this release group"
+		m.statusMsg = ""
+		return m, nil
+	}
+
+	// Sort releases by date ascending (oldest first)
+	releases := msg.Releases
+	sort.Slice(releases, func(i, j int) bool {
+		return releases[i].Date < releases[j].Date
+	})
+
+	// Store raw releases for re-filtering
+	m.releasesRaw = releases
+	m.releasesCut = msg.Cut
+	m.reapplyReleaseFilters()
+
+	// Always show release selection - user must choose for import process
+	m.releaseCursor.Reset()
+	m.state = StateReleaseResults
+	m.statusMsg = "Select a release"
+	return m, nil
+}
+
+// handleReleaseDetailsResult processes release details and starts slskd
+// search, if the popup waits for them. From then on, the selected release
+// group is the one of the details, on either route: the download is queued
+// with it.
+func (m *Model) handleReleaseDetailsResult(msg mbworkflow.ReleaseDetailsResultMsg) (popup.Popup, tea.Cmd) {
+	if !m.waiting.Take(msg.Request) {
+		return m, nil
+	}
+	err := msg.Err
+	if err == nil && msg.Details.ReleaseGroup == nil {
+		// Every MusicBrainz release has one: without it, nothing to queue.
+		err = errors.New("MusicBrainz gave the release no release group")
+	}
+	if err != nil {
+		m.state = StateReleaseResults
+		m.errorMsg = fmt.Sprintf("Error loading release details: %v", err)
+		m.statusMsg = ""
+		return m, nil
+	}
+
+	// Store the full release details for later use (importing)
+	m.selectedReleaseDetails = msg.Details
+	m.selectedReleaseGroup = msg.Details.ReleaseGroup
+
+	// Now start slskd search
+	m.startSlskdSearch()
+	return m, nil
+}
+
+// reapplyReleaseFilters filters releases based on current deduplicateRelease setting.
+func (m *Model) reapplyReleaseFilters() {
+	if m.deduplicateRelease {
+		m.releases = deduplicateReleases(m.releasesRaw)
+	} else {
+		m.releases = m.releasesRaw
+	}
+	// Clamp cursor if out of bounds
+	m.releaseCursor.ClampToBounds(len(m.releases))
+}
+
+// releaseKey is used for deduplicating releases.
+type releaseKey struct {
+	trackCount  int
+	year        string
+	formats     string
+	releaseType string
+}
+
+// deduplicateReleases removes duplicate releases based on (track count, year, formats, release type).
+// For duplicates, keeps the one with preferred country: XW > US > others.
+// Preserves the original order (assumes already sorted by date).
+func deduplicateReleases(releases []core.MBRelease) []core.MBRelease {
+	seen := make(map[releaseKey]int) // key -> index in result
+	result := make([]core.MBRelease, 0, len(releases))
+
+	for i := range releases {
+		r := &releases[i]
+		key := releaseKey{
+			trackCount:  r.TrackCount,
+			year:        extractYear(r.Date),
+			formats:     r.Formats,
+			releaseType: r.ReleaseType,
+		}
+
+		if existingIdx, exists := seen[key]; exists {
+			// Compare countries - replace if new one is better
+			existing := &result[existingIdx]
+			if countryPriority(r.Country) < countryPriority(existing.Country) {
+				result[existingIdx] = *r
+			}
+		} else {
+			// New key - add to result
+			seen[key] = len(result)
+			result = append(result, *r)
+		}
+	}
+
+	return result
+}
+
+// countryPriority returns priority for country (lower is better).
+// XW (worldwide) > US > others.
+func countryPriority(country string) int {
+	switch country {
+	case "XW":
+		return 0
+	case "US":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// extractYear extracts the year (first 4 chars) from a date string.
+func extractYear(date string) string {
+	if len(date) >= 4 {
+		return date[:4]
+	}
+	return date
+}
