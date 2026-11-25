@@ -12,6 +12,7 @@ import (
 	"srserver/logic/clients"
 	"srserver/logic/db"
 	"srserver/logic/handlers"
+	"srserver/logic/playermanager"
 	"time"
 )
 
@@ -23,6 +24,9 @@ func NewLogicServer() *LogicServer {
 }
 
 func (s *LogicServer) Start() error {
+	if err := playermanager.InitDb(); err != nil {
+		log.Printf("Warning: player database is unavailable, running without persistence: %v", err)
+	}
 	db.InitDb()
 	ln, err := net.Listen("tcp", ":"+conf.LOGIC_SERVER_PORT)
 	if err != nil {
@@ -60,6 +64,7 @@ func (s *LogicServer) handleConnection(conn net.Conn) {
 		Player: nil,
 	}
 	defer func() {
+		handlers.OnClientDisconnect(clients.Clients[conn])
 		delete(clients.Clients, conn)
 		conn.Close()
 	}()

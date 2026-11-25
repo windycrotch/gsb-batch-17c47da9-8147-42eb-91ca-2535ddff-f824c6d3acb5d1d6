@@ -21,6 +21,11 @@ type Player struct {
 }
 
 func (p *Player) Save() error {
+	if GetDb() == nil {
+		// Persistence is unavailable (e.g. unit tests without MySQL):
+		// the in-memory player state stays authoritative.
+		return nil
+	}
 	query := `
 		INSERT INTO players (uid, userProto) VALUES (?, ?)
 		ON DUPLICATE KEY UPDATE userProto=VALUES(userProto)`

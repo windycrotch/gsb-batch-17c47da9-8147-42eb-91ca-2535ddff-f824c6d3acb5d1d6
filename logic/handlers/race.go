@@ -1,64 +1,134 @@
 package handlers
 
 import (
-	"log"
 	"math/rand"
 	"srserver/common"
-	"srserver/conf"
 	"srserver/logic/clients"
 	"srserver/logic/db"
+	"srserver/logic/raceflow"
 	"srserver/logic/races"
 	"srserver/logic/utils"
 	pb "srserver/proto/out"
-	"time"
 )
 
-// todo
+// RaceManager is the single authority for the start -> finish/abandon
+// lifecycle of every race on this server.
+var RaceManager = raceflow.NewManager(utils.MakeId)
+
+// Indirection seams so the packet handlers can be exercised in tests
+// without the static content database (resources submodule).
+var (
+	findTrack   = db.FindTrack
+	randomTrack = func() *pb.BaseTrack {
+		baseTracks := db.Database.TrackDatabase.GetItems()
+		return baseTracks[rand.Intn(len(baseTracks))]
+	}
+	getEnemyByID      = races.GetEnemyById
+	createShadowEnemy = races.CreateEnemy
+)
+
+// CreateRace handles method 703. The resource occupation and the active-race
+// record are created atomically inside RaceManager.Start; on any validation
+// failure an error packet is returned and no balance/counter is changed.
+func CreateRace(pack *common.Pack, client *clients.Client) {
+	startParams := &pb.StartParams{}
+	pack.ReadProto(startParams)
+	player := client.Player
+	response := common.NewResponse(pack)
+
+	activeRace, err := RaceManager.Start(player, startParams.Type, startParams.EnemyId)
+	if err != nil {
+		response.SetError(true)
+		client.Write(response.ToByteBuff())
+		return
+	}
+
+	baseTrack := findTrack(2018)
+	if activeRace.Type == pb.RaceType_RACE || baseTrack == nil {
+		baseTrack = randomTrack()
+	}
+	track := utils.BuildTrack(baseTrack, player.User.World.ZoneId)
+	track.Distanse = activeRace.Distance
+	track.Distanse += 3.25 // Burnout zone distance
+
+	var enemy *pb.Enemy
+	switch activeRace.Type {
+	case pb.RaceType_SHADOW:
+		enemy = createShadowEnemy(player)
+	case pb.RaceType_RACE, pb.RaceType_POINTS:
+		enemy = getEnemyByID(activeRace.EnemyId)
+	}
+	if enemy != nil {
+		enemy.Type = activeRace.Type
+	}
+
+	response.WriteProto(track)
+	if enemy != nil {
+		response.WriteProto(enemy)
+	}
+	client.Write(response.ToByteBuff())
+}
+
+// GetRaceAward handles method 704. A finish is honoured only when it matches
+// the race recorded at CreateRace; the record is consumed before the reward
+// is granted, so forged and repeated finishes pay nothing.
 func GetRaceAward(pack *common.Pack, client *clients.Client) {
 	finishParams := &pb.FinishParams{}
 	pack.ReadProto(finishParams)
 	player := client.Player
-	//player.GetCurrentCar().Behavior = finishParams.Behavior
-	player.GetCurrentCar().AccumulatorDistance += finishParams.UserDistance
 	response := common.NewResponse(pack)
-	race := &pb.Race{}
-	race.Money = &pb.Money{
-		Money: 1000,
-	}
-	race.Items = []*pb.Item{
-		{
-			Id:     utils.MakeId(),
-			Count:  1,
-			Type:   pb.ItemType_BLUEPRINT,
-			BaseId: 101,
-		},
-	}
-	var result pb.RaceResult
-	if finishParams.UserTime < finishParams.EnemyTime {
-		result = pb.RaceResult_WIN
-	} else if (finishParams.UserTime - finishParams.EnemyTime) < 0.001 {
-		result = pb.RaceResult_DRAW
-	} else {
-		result = pb.RaceResult_LOST
+
+	result, err := RaceManager.Finish(player, finishParams)
+	if err != nil {
+		response.SetError(true)
+		client.Write(response.ToByteBuff())
+		return
 	}
 
-	race.Result = result
+	if car := player.GetCurrentCar(); car != nil {
+		car.AccumulatorDistance += finishParams.UserDistance
+	}
 
-	if finishParams.EnemyId > 0 {
-		enemy := races.GetEnemyById(finishParams.EnemyId)
-		enemy.EnemyType.RaceCount++
-		enemy.EnemyType.Races = append(enemy.EnemyType.Races, result)
+	race := &pb.Race{
+		Money:    result.Money,
+		Items:    result.Items,
+		Result:   result.Result,
+		Type:     result.Type,
+		UserTime: finishParams.UserTime,
+	}
 
-		if enemy.EnemyType.RaceCount < 3 {
-			race.IsCanRepeat = true
+	if result.EnemyId > 0 {
+		if enemy := getEnemyByID(result.EnemyId); enemy != nil {
+			enemy.EnemyType.RaceCount++
+			enemy.EnemyType.Races = append(enemy.EnemyType.Races, result.Result)
+			if enemy.EnemyType.RaceCount < 3 {
+				race.IsCanRepeat = true
+			}
 		}
 	}
 
-	race.Type = finishParams.Type
-	race.UserTime = finishParams.UserTime
-
 	response.WriteProto(race)
 	client.Write(response.ToByteBuff())
+}
+
+// BrakeRace handles method 705 ("brake"/abandon). The occupied fuel, entry
+// fee or race-count slot is restored to its pre-start state. A brake packet
+// without an active race no longer consumes fuel.
+func BrakeRace(pack *common.Pack, client *clients.Client) {
+	response := common.NewResponse(pack)
+	if err := RaceManager.Abandon(client.Player); err != nil {
+		response.SetError(true)
+	}
+	client.Write(response.ToByteBuff())
+}
+
+// OnClientDisconnect must be called when a client connection drops. Any
+// in-progress race is restored exactly once and its record removed.
+func OnClientDisconnect(client *clients.Client) {
+	if client == nil || client.Player == nil {
+		return
+	}
+	RaceManager.HandleDisconnect(client.Player)
 }
 
 func UpdateEnemies(pack *common.Pack, client *clients.Client) {
@@ -76,84 +146,6 @@ func UpdateEnemies(pack *common.Pack, client *clients.Client) {
 	response := common.NewResponse(pack)
 	response.WriteProto(enemies)
 	client.Write(response.ToByteBuff())
-}
-
-func CreateRace(pack *common.Pack, client *clients.Client) {
-	startParams := &pb.StartParams{}
-	pack.ReadProto(startParams)
-	player := client.Player
-	tc := player.User.TimersAndCounters
-	var enemy *pb.Enemy
-	var distance float32
-	var baseTrack *pb.BaseTrack = db.FindTrack(2018)
-	switch startParams.Type {
-	case pb.RaceType_TEST402:
-		distance = 402
-		player.Withdraw(conf.MONEY_FOR_TEST_RACE)
-	case pb.RaceType_TEST804:
-		distance = 804
-		player.Withdraw(conf.MONEY_FOR_TEST_RACE)
-	case pb.RaceType_SHADOW:
-		distance = 804
-		player.Withdraw(conf.MONEY_FOR_TEST_RACE)
-		enemy = races.CreateEnemy(player)
-	case pb.RaceType_RACE:
-		if !player.IsFullEnought(5) {
-			return
-		}
-		player.WithdrawFuel(5)
-		distance = 402
-		baseTrack = nil
-		enemy = races.GetEnemyById(startParams.EnemyId)
-	case pb.RaceType_POINTS:
-		if tc.RatingCount >= 5 || tc.RatingTimer > time.Now().UnixMilli() {
-			return
-		}
-		tc.RatingCount++
-		tc.RatingTimer = time.Now().UnixMilli() + conf.RATING_RACE_DELAY
-		distance = 804
-		enemy = races.GetEnemyById(startParams.EnemyId)
-	case pb.RaceType_TIME:
-		if tc.TimeCount >= 5 || tc.TimeTimer > time.Now().UnixMilli() {
-			return
-		}
-		tc.TimeCount++
-		tc.TimeTimer = time.Now().UnixMilli() + conf.TIME_RACE_DELAY
-		distance = 804
-	case pb.RaceType_CHALLENGE:
-		if tc.ChallengeCount >= 5 || tc.ChallengeTimer > time.Now().UnixMilli() {
-			return
-		}
-		tc.ChallengeCount++
-		tc.ChallengeTimer = time.Now().UnixMilli() + conf.CHALLENGE_RACE_DELAY
-		distance = 402
-
-	default:
-		log.Print("Unknown race type ", startParams.Type)
-		return
-	}
-
-	if baseTrack == nil {
-		baseTracks := db.Database.TrackDatabase.GetItems()
-		baseTrack = baseTracks[rand.Intn(len(baseTracks))]
-	}
-	track := utils.BuildTrack(baseTrack, player.User.World.ZoneId)
-	track.Distanse = distance
-	track.Distanse += 3.25 // Burnout zone distance
-
-	response := common.NewResponse(pack)
-	response.WriteProto(track)
-	if enemy != nil {
-		enemy.Type = startParams.Type
-		response.WriteProto(enemy)
-	}
-	client.Write(response.ToByteBuff())
-
-}
-
-func BrakeRace(pack *common.Pack, client *clients.Client) {
-	// idk why for BrakeRace take fuel (client hardcoded)
-	client.Player.WithdrawFuel(5)
 }
 
 func UpdatePointsEnemies(pack *common.Pack, client *clients.Client) {

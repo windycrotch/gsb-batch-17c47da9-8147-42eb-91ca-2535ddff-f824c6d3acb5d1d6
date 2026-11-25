@@ -18,23 +18,26 @@ import (
 
 var sqlDb *sql.DB
 
-func init() {
-	var err error
+// InitDb opens the player database and creates its schema.
+// It is called explicitly from the server startup instead of an init()
+// function so that packages depending on playermanager (and its tests)
+// can be used in environments without a running MySQL server.
+func InitDb() error {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s",
 		conf.DATABASE_USERNAME,
 		conf.DATABASE_PASSWORD,
 		conf.DATABASE_ADDRESS,
 		conf.DATABASE_NAME)
 
-	sqlDb, err = sql.Open("mysql", dsn)
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to the database: %v", err)
+		return fmt.Errorf("failed to open the database: %w", err)
 	}
 
-	err = sqlDb.Ping()
-	if err != nil {
-		log.Fatalf("Failed to ping the database: %v", err)
+	if err = db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping the database: %w", err)
 	}
+	sqlDb = db
 
 	createTableQuery := `
 	CREATE TABLE IF NOT EXISTS players (
@@ -42,13 +45,11 @@ func init() {
 		uid VARCHAR(255) UNIQUE,
 		userProto BLOB
 	)`
-	_, err = sqlDb.Exec(createTableQuery)
-	if err != nil {
-		log.Fatalf("Failed to create players table: %v", err)
+	if _, err = sqlDb.Exec(createTableQuery); err != nil {
+		return fmt.Errorf("failed to create players table: %w", err)
 	}
 	log.Println("SQLDB Connected")
-
-	//sqlDb.Exec("TRUNCATE TABLE players")
+	return nil
 }
 
 func GetDb() *sql.DB {
@@ -82,6 +83,9 @@ func Init(id string, conn net.Conn) *Player {
 }
 
 func LoadPlayer(uid string) (*Player, error) {
+	if sqlDb == nil {
+		return nil, nil
+	}
 	query := `SELECT id, userProto FROM players WHERE uid = ?`
 	row := GetDb().QueryRow(query, uid)
 
@@ -107,6 +111,9 @@ func LoadPlayer(uid string) (*Player, error) {
 }
 
 func FindPlayerById(id int64) *Player {
+	if sqlDb == nil {
+		return nil
+	}
 	query := `SELECT id, uid, userProto FROM players WHERE id = ?`
 	row := GetDb().QueryRow(query, id)
 	var player Player
@@ -124,6 +131,9 @@ func FindPlayerById(id int64) *Player {
 }
 
 func RandPlayer() *Player {
+	if sqlDb == nil {
+		return nil
+	}
 	query := `
 	SELECT id, uid, userProto FROM players
 	ORDER BY RAND()

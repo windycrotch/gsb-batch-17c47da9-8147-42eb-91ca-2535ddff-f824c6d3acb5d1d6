@@ -38,6 +38,16 @@ Copy `conf/Conf.go_example` to `conf/Conf.go` and fill in the required fields fo
 go run main.go
 ```
 
+## Tests
+The race lifecycle tests run without MySQL or the resources submodule.
+```sh
+go test ./...
+go test -race ./logic/raceflow/ ./logic/handlers/
+```
+See [docs/RACE_LIFECYCLE.md](docs/RACE_LIFECYCLE.md) for the start →
+finish/abandon state machine and how to build request packets without the
+game client (`cmd/raceclientdemo`).
+
 ## Warning
 The resources and items are not fully consistent with game version 1.8.x.
 
