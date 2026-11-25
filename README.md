@@ -205,6 +205,7 @@ Contract notes:
 - `ProcessInto` returns `ErrBufferTooSmall` if `output` cannot hold results.
 - On `ErrBufferTooSmall`, processing state is not advanced (safe to retry with a larger buffer).
 - Samples beyond `output[:n]` are unspecified and should be ignored.
+- The resamplers returned by `NewEngine`, `NewEngineFloat32` and `New` are safe for concurrent same-instance calls; an internal mutex serializes them. Give every goroutine its own output buffer, and keep the chunks of one audio stream in order.
 
 When using `New(config)`, access `ProcessInto` via type assertion:
 

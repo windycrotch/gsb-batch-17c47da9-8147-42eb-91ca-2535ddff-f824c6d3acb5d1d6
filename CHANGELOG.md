@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The resamplers returned by `NewEngine`, `NewEngineFloat32` and `New` are now
+  safe for concurrent use by multiple goroutines on the same instance. An
+  internal mutex serializes `Process`, `ProcessInto`, `ProcessFloat32Into`,
+  `ProcessMulti`, `Flush`, `FlushMulti`, `Reset`, latency/info and statistics
+  reads, so parallel callers can no longer trigger a data race or interleave
+  one call's buffer updates with another's. `ProcessMulti` with
+  `EnableParallel` keeps its per-channel fan-out (the workers use disjoint
+  channel state while the call holds the mutex). Chunks of one audio stream
+  still have to be supplied in order, and each goroutine must own its
+  `ProcessInto` output buffer. New `streaming_contract_test.go` covers
+  buffer-too-small retry (float64/float32 and the `New` path), all-channel
+  `FlushMulti` against serial references, repeated flush, reset-after-flush,
+  and concurrent `ProcessInto`/`ProcessMulti` under `-race`.
+
 ### Fixed
 
 - `New` no longer drops the rate change for conversions within 0.1% of 1:1 or

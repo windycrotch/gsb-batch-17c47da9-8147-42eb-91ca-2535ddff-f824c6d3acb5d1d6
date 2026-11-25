@@ -4,6 +4,8 @@
 package resampler
 
 import (
+	"sync"
+
 	"github.com/tphakala/go-audio-resampler/internal/engine"
 )
 
@@ -120,6 +122,13 @@ func NewMultiChannel(inputRate, outputRate float64, channels int, quality Qualit
 // Process once per chunk of input, and call Flush once at the end of the
 // stream.
 type SimpleResampler struct {
+	// mu serializes same-instance calls so concurrent use by multiple
+	// goroutines is data-race-free and each Process/ProcessInto/Flush/Reset
+	// invocation observes a consistent state. Calls on one audio stream still
+	// have to be ordered (audio chunks depend on that order); the mutex only
+	// makes an unsynchronized call sequence safe, it does not make arbitrary
+	// chunk interleavings correspond to a defined stream.
+	mu     sync.Mutex
 	engine *engine.Resampler[float64]
 }
 
@@ -142,6 +151,8 @@ func NewEngine(inputRate, outputRate float64, quality QualityPreset) (*SimpleRes
 // slice is owned by the caller; it is never aliased by the resampler and
 // stays valid after subsequent calls.
 func (r *SimpleResampler) Process(input []float64) ([]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.Process(input)
 }
 
@@ -151,11 +162,21 @@ func (r *SimpleResampler) Process(input []float64) ([]float64, error) {
 //
 // If output is too small, ProcessInto returns ErrBufferTooSmall before any
 // processing state is advanced, so callers can retry with a larger buffer.
+//
+// ProcessInto is safe for concurrent use by multiple goroutines on the same
+// instance; calls are serialized by an internal mutex. Each goroutine must
+// supply its own output buffer (sharing one buffer is the caller's data race).
 func (r *SimpleResampler) ProcessInto(input, output []float64) (int, error) {
+	// The size check only reads immutable configuration and the caller-owned
+	// buffer length, so doing it before taking the lock is race-free. It must
+	// stay ahead of ProcessZeroCopy: returning here advances no engine state.
 	required := r.EstimateOutput(len(input))
 	if len(output) < required {
 		return 0, ErrBufferTooSmall
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	result, err := r.engine.ProcessZeroCopy(input)
 	if err != nil {
@@ -183,6 +204,8 @@ func (r *SimpleResampler) EstimateOutput(inputLen int) int {
 // instance. GetStatistics counters are cumulative and are not reset by
 // Flush.
 func (r *SimpleResampler) Flush() ([]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.Flush()
 }
 
@@ -191,6 +214,8 @@ func (r *SimpleResampler) Flush() ([]float64, error) {
 // for use between chunks of one continuous stream: calling it mid-stream
 // destroys the filter's history and causes audible clicks.
 func (r *SimpleResampler) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.engine.Reset()
 }
 
@@ -201,6 +226,8 @@ func (r *SimpleResampler) GetRatio() float64 {
 
 // GetStatistics returns processing statistics.
 func (r *SimpleResampler) GetStatistics() map[string]int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.GetStatistics()
 }
 
@@ -212,6 +239,8 @@ func (r *SimpleResampler) GetStatistics() map[string]int64 {
 // many samples. Real-time users feeding fixed-size output buffers should
 // prime their FIFO with this many samples of silence.
 func (r *SimpleResampler) Latency() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.Latency()
 }
 
@@ -362,6 +391,9 @@ func DeinterleaveFromStereo(interleaved []float64) (left, right []float64) {
 //	}
 //	writeOutput(final)
 type SimpleResamplerFloat32 struct {
+	// mu mirrors SimpleResampler.mu: it serializes same-instance calls so
+	// concurrent goroutines stay race-free and do not interleave filter state.
+	mu     sync.Mutex
 	engine *engine.Resampler[float32]
 }
 
@@ -392,6 +424,8 @@ func NewEngineFloat32(inputRate, outputRate float64, quality QualityPreset) (*Si
 // slice is owned by the caller; it is never aliased by the resampler and
 // stays valid after subsequent calls.
 func (r *SimpleResamplerFloat32) Process(input []float32) ([]float32, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.Process(input)
 }
 
@@ -402,11 +436,18 @@ func (r *SimpleResamplerFloat32) Process(input []float32) ([]float32, error) {
 // samples. Because the underlying engine is float32-native, there is no float64
 // round-trip, so this path performs zero allocations once internal buffers have
 // warmed up. Use it for streaming float32 audio without per-call allocations.
+//
+// ProcessInto is safe for concurrent same-instance use; calls are serialized by
+// an internal mutex, and each goroutine must use its own output buffer.
 func (r *SimpleResamplerFloat32) ProcessInto(input, output []float32) (int, error) {
+	// Size check stays ahead of any state advance (see float64 twin).
 	required := r.EstimateOutput(len(input))
 	if len(output) < required {
 		return 0, ErrBufferTooSmall
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	result, err := r.engine.ProcessZeroCopy(input)
 	if err != nil {
@@ -438,6 +479,8 @@ func (r *SimpleResamplerFloat32) EstimateOutput(inputLen int) int {
 // fresh instance. GetStatistics counters are cumulative and are not reset
 // by Flush.
 func (r *SimpleResamplerFloat32) Flush() ([]float32, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.Flush()
 }
 
@@ -446,6 +489,8 @@ func (r *SimpleResamplerFloat32) Flush() ([]float32, error) {
 // for use between chunks of one continuous stream: calling it mid-stream
 // destroys the filter's history and causes audible clicks.
 func (r *SimpleResamplerFloat32) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.engine.Reset()
 }
 
@@ -456,6 +501,8 @@ func (r *SimpleResamplerFloat32) GetRatio() float64 {
 
 // GetStatistics returns processing statistics including samples processed.
 func (r *SimpleResamplerFloat32) GetStatistics() map[string]int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.GetStatistics()
 }
 
@@ -467,6 +514,8 @@ func (r *SimpleResamplerFloat32) GetStatistics() map[string]int64 {
 // many samples. Real-time users feeding fixed-size output buffers should
 // prime their FIFO with this many samples of silence.
 func (r *SimpleResamplerFloat32) Latency() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.engine.Latency()
 }
 

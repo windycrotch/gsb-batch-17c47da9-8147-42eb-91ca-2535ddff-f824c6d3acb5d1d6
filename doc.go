@@ -274,10 +274,21 @@
 //
 // # Thread Safety
 //
-// Individual [Resampler] instances are safe for concurrent use by multiple
-// goroutines when processing different channels via [Resampler.ProcessMulti].
-// However, calls to [Resampler.Process] and [Resampler.Flush] on the same
-// instance should be serialized.
+// The concrete resamplers returned by [New], [NewEngine] and
+// [NewEngineFloat32] are safe to call from multiple goroutines on the same
+// instance: an internal mutex serializes the calls, so concurrent use cannot
+// race or interleave one call's filter/buffer updates with another's. Each
+// goroutine must still supply its own ProcessInto output buffer; sharing that
+// caller-owned slice is the caller's data race. Serialization keeps the state
+// consistent but does not give an arbitrary interleaving of audio chunks a
+// defined stream order — chunks of one stream must still be fed in order. For
+// throughput, process independent channels on independent instances, or use
+// [Resampler.ProcessMulti] with Config.EnableParallel: its per-channel state
+// is disjoint and channels run concurrently inside one call.
+//
+// A third-party implementation of the [Resampler] interface is not required to
+// provide the same guarantee; the locking statement above covers the
+// implementations this package constructs.
 //
 // # Attribution
 //

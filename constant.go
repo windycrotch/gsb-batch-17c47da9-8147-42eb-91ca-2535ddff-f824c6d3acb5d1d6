@@ -19,6 +19,14 @@ type constantRateResampler struct {
 	ratio    float64
 	pipeline *Pipeline
 
+	// mu serializes calls from multiple goroutines to the same instance so
+	// concurrent Process/ProcessInto/ProcessMulti/Flush(Multi)/Reset calls are
+	// race-free and never interleave one call's buffer writes with another's.
+	// ProcessMulti's per-channel worker goroutines do not take mu: they call
+	// processChannel/flushChannel directly on disjoint channel state while the
+	// ProcessMulti call itself holds mu, so EnableParallel keeps its fan-out.
+	mu sync.Mutex
+
 	// Per-channel state
 	channels []*channelResampler
 
@@ -87,6 +95,8 @@ func newConstantRateResampler(config *Config, ratio float64) (*constantRateResam
 
 // Process resamples a mono audio channel.
 func (r *constantRateResampler) Process(input []float64) ([]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.channels) == 0 {
 		return nil, fmt.Errorf("no channels initialized")
 	}
@@ -101,7 +111,11 @@ func (r *constantRateResampler) Process(input []float64) ([]float64, error) {
 //
 // If output is too small, ProcessInto returns ErrBufferTooSmall before any
 // processing state is advanced, so callers can retry with a larger buffer.
+//
+// Safe for concurrent same-instance use; calls are serialized by r.mu.
 func (r *constantRateResampler) ProcessInto(input, output []float64) (int, error) {
+	// The size pre-check mutates nothing, so keep it ahead of the lock and of
+	// processChannelInto: an undersized buffer must leave every stage untouched.
 	if len(r.channels) == 0 {
 		return 0, fmt.Errorf("no channels initialized")
 	}
@@ -109,6 +123,8 @@ func (r *constantRateResampler) ProcessInto(input, output []float64) (int, error
 		return 0, ErrBufferTooSmall
 	}
 
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.processChannelInto(0, input, output)
 }
 
@@ -158,7 +174,8 @@ func (r *constantRateResampler) ProcessFloat32(input []float32) ([]float32, erro
 // warm. Processing still runs through the float64 pipeline for precision.
 //
 // Single-channel only, matching ProcessFloat32 and the float64 ProcessInto.
-// It is not safe for concurrent use with itself or the other Process methods.
+// It is safe for concurrent same-instance use: r.mu serializes calls and
+// protects the shared f32in/f32out scratch buffers.
 func (r *constantRateResampler) ProcessFloat32Into(input, output []float32) (int, error) {
 	if len(r.channels) == 0 {
 		return 0, fmt.Errorf("no channels initialized")
@@ -167,6 +184,9 @@ func (r *constantRateResampler) ProcessFloat32Into(input, output []float32) (int
 	if len(output) < required {
 		return 0, ErrBufferTooSmall // checked before any state is advanced
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	// Grow-only float32 -> float64 input scratch.
 	if cap(r.f32in) < len(input) {
@@ -202,7 +222,16 @@ func (r *constantRateResampler) ProcessFloat32Into(input, output []float32) (int
 // ProcessMulti processes multiple audio channels.
 // When EnableParallel is true in config, channels are processed concurrently.
 // Otherwise, channels are processed sequentially.
+//
+// Safe for concurrent use by multiple goroutines on the same instance: r.mu
+// serializes whole calls, so two callers' chunks can never interleave a
+// channel's ring buffers. Within one call EnableParallel still fans the
+// per-channel processChannel workers out because they run while this goroutine
+// holds r.mu and the workers themselves never re-take it.
 func (r *constantRateResampler) ProcessMulti(input [][]float64) ([][]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(input) != r.config.Channels {
 		return nil, fmt.Errorf("expected %d channels, got %d", r.config.Channels, len(input))
 	}
@@ -348,6 +377,8 @@ func (r *constantRateResampler) processChannelInto(channel int, input, dst []flo
 // Flush drains channel 0's pipeline. For multi-channel streams processed
 // via ProcessMulti, use FlushMulti to drain every channel.
 func (r *constantRateResampler) Flush() ([]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.channels) == 0 {
 		return []float64{}, nil
 	}
@@ -388,7 +419,16 @@ func (r *constantRateResampler) flushChannel(chIdx int, ch *channelResampler) ([
 
 // FlushMulti flushes every channel's pipeline independently, returning one
 // slice per channel.
+//
+// Like Flush it is end-of-stream only. The first call drains each channel's
+// tail and returns it; the underlying stages reset themselves while draining,
+// so any further Flush/FlushMulti call returns empty slices rather than a
+// repeated tail. Safe for concurrent same-instance use: calls serialize on r.mu
+// and the all-channel drain runs as one critical section.
 func (r *constantRateResampler) FlushMulti() ([][]float64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if len(r.channels) == 0 {
 		return [][]float64{}, nil
 	}
@@ -417,6 +457,15 @@ type startupDeficitStage interface {
 // Each stage's deficit is converted into the final output rate domain
 // through the downstream stages' ratios before summing.
 func (r *constantRateResampler) GetLatency() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.getLatencyLocked()
+}
+
+// getLatencyLocked is the lock-free body of GetLatency; callers must hold r.mu.
+// GetInfo calls it under its own lock to avoid re-entering the non-reentrant
+// mutex.
+func (r *constantRateResampler) getLatencyLocked() int {
 	if r.pipeline == nil || len(r.channels) == 0 {
 		return 0
 	}
@@ -444,9 +493,11 @@ func (r *constantRateResampler) GetLatency() int {
 
 // Reset clears all internal state.
 func (r *constantRateResampler) Reset() {
-	// No locking: doc.go documents that calls on a single instance must be
-	// serialized by the caller (standard for stateful streaming DSP), so a mutex
-	// here would protect nothing while falsely implying cross-method safety.
+	// r.mu makes Reset safe to call concurrently with the other entry points:
+	// it waits for an in-flight ProcessMulti fan-out (which holds r.mu for its
+	// whole duration) instead of clearing ring buffers under its workers.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, ch := range r.channels {
 		// Reset all stages
 		for _, stage := range ch.stages {
@@ -467,9 +518,12 @@ func (r *constantRateResampler) GetRatio() float64 {
 
 // GetInfo returns information about the resampler.
 func (r *constantRateResampler) GetInfo() Info {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	info := Info{
 		Algorithm: "multi-stage",
-		Latency:   r.GetLatency(),
+		Latency:   r.getLatencyLocked(),
 	}
 
 	// Calculate total memory usage
