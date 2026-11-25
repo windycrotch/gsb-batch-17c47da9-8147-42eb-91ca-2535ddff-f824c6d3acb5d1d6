@@ -47,9 +47,20 @@ func rms(frame []float32) float32 {
 const (
 	// gateAttackTau / gateReleaseTau are the one-pole time constants for the gate
 	// gain ramp: attack ~3ms (open) and release ~120ms (close). Ramping the gain
-	// (never hard-muting) is what keeps the gate click-free.
+	// (never hard-muting) is what keeps the gate click-free. These govern the
+	// VOICE-ACTIVITY transitions, where a slow release is exactly what we want.
 	gateAttackTau  = 0.003
 	gateReleaseTau = 0.120
+
+	// gateForceTau is the ramp time constant for a FORCED gate transition (Mute,
+	// Always, PTT key down/up). It is ~0.5ms, i.e. two orders of magnitude faster
+	// than the voice release, so a forced open/close reaches its target gain within
+	// the very next 480-sample frame (exp(-480/(0.0005*48000)) == exp(-20) ~ 2e-9 of
+	// the old gain survives) while still fading rather than hard-cutting. This is the
+	// convergence fix for "切换输入模式后...声音被错误地压掉或漏出": the old code
+	// reused the ~120ms release for a forced close, so muting left the mic audible
+	// for a dozen frames and the UI meter disagreed with the cable.
+	gateForceTau = 0.0005
 
 	// gateHoldFrames keeps the gate open for ~30ms after energy drops below the
 	// close threshold, so brief inter-syllable dips do not chop a word. The gate is
@@ -131,15 +142,24 @@ type noiseGate struct {
 	open     bool    // hysteresis latch: true while above-close-threshold
 	holdLeft int     // frames remaining in the post-trigger hold window
 
-	attack  float32 // per-sample coef toward open
-	release float32 // per-sample coef toward closed
+	attack  float32 // per-sample coef toward open (voice activity)
+	release float32 // per-sample coef toward closed (voice activity)
+
+	// forceAttack / forceRelease are the fast ramps used when the gate is FORCED
+	// (Mute / Always / PTT). They are ~0.5ms, so a forced transition is complete
+	// by the end of the very next 480-sample frame instead of trickling out over
+	// the ~120ms voice release. Still a ramp, so it is click-free.
+	forceAttack  float32
+	forceRelease float32
 }
 
 // newGate builds a closed gate.
 func newGate() *noiseGate {
 	return &noiseGate{
-		attack:  smoothingCoef(gateAttackTau),
-		release: smoothingCoef(gateReleaseTau),
+		attack:       smoothingCoef(gateAttackTau),
+		release:      smoothingCoef(gateReleaseTau),
+		forceAttack:  smoothingCoef(gateForceTau),
+		forceRelease: smoothingCoef(gateForceTau),
 	}
 }
 
@@ -212,18 +232,44 @@ func (g *noiseGate) updateLatchVAD(p, openProb float32) {
 // and multiplies frame in place. It returns the gain value at the END of the frame
 // for the UI meter. forceOpen / forceClosed override the latch for the "always"
 // and "mute"/PTT-up modes.
+//
+// FORCED transitions (Mute, Always, PTT key down/up) are ramped with the fast
+// forceAttack/forceRelease (~0.5ms) rather than the voice-activity attack/release
+// (~3ms/~120ms), so a mode switch reaches its target gain by the END of the very
+// next frame instead of trickling out of a ~120ms release. (The first post-switch
+// frame still carries the click-free fade, so it is not bit-silent; the gain — and
+// thus the published GateLevel — has converged, and the following frame is fully at
+// the new level. At the cable the RT callback additionally hard-zeros a force-closed
+// buffer, so mute is silent to Discord on the very next buffer.)
+//
+// A FORCED frame also drops the voice-activity latch. The latch is not updated
+// while forced, so leaving it set would let a return to VAD re-open the gate from
+// a stale "open" state — leaking the first frames of a quiet room. Clearing it
+// makes the VAD decision re-arm from closed and open only on fresh evidence.
 func (g *noiseGate) apply(frame []float32, forceOpen, forceClosed bool) float32 {
 	target := float32(0)
+	forced := forceOpen || forceClosed
+	coef := g.release
 	switch {
 	case forceClosed:
 		target = 0
+		g.open = false
+		g.holdLeft = 0
 	case forceOpen:
 		target = 1
+		g.open = false
+		g.holdLeft = 0
 	case g.open:
 		target = 1
 	}
-	coef := g.release
-	if target > g.gain {
+	if forced {
+		// Fast ramp in whichever direction the forced target requires.
+		if target > g.gain {
+			coef = g.forceAttack
+		} else {
+			coef = g.forceRelease
+		}
+	} else if target > g.gain {
 		coef = g.attack
 	}
 	gg := g.gain

@@ -54,6 +54,15 @@ const (
 	// that an idle mic does not pin a core. The added end-to-end latency is about
 	// one period + one frame (~14ms), as designed.
 	workerIdleSleep = 2 * time.Millisecond
+
+	// denRecoverFrames is the retry interval, in worker frames, for rebuilding a
+	// real speech-probability denoiser after the current one has degraded to a
+	// Passthrough (e.g. a runtime native-allocation failure). At 10ms/frame this is
+	// ~2s. It is deliberately NOT zero: rebuilding every frame would hammer the
+	// allocator while the condition persists, and waiting a beat keeps the
+	// energy-gate fallback stable long enough to be the observable behavior. Once a
+	// rebuild succeeds the worker returns to probability-driven gating.
+	denRecoverFrames = 200
 )
 
 // micWorker is the DSP worker's state: the real WebRTC APM plus the post-APM hard
@@ -73,19 +82,40 @@ type micWorker struct {
 	gate *noiseGate       // post-APM hard gate / VAD latch (APM has no hard mute)
 	den  denoise.Denoiser // RNNoise (Strong-tier denoiser + speech-probability VAD source)
 
+	// denFactory rebuilds a real denoiser when the current one has degraded to a
+	// non-VAD Passthrough (see reconcileDenoiser). startWorker sets it to
+	// denoise.New(true); the test harness leaves it nil unless a test wants to drive
+	// the recovery path deterministically. nil means "do not attempt recovery" — the
+	// worker then simply stays on the energy latch, which is the correct degrade.
+	denFactory func() denoise.Denoiser
+
 	// denVAD reports whether den actually provides a trained speech probability:
 	// true only when a real RNNoise denoiser was constructed (cgo build AND the
 	// native state allocated successfully), false when den fell back to Passthrough.
 	// When false the advanced VAD gate falls back to the energy latch, since
 	// Passthrough returns p==0 and would otherwise hold the gate permanently shut.
+	//
+	// It is reconciled EVERY frame in process (not only at construction) so that a
+	// denoiser which degrades at runtime — Close or a later allocation failure —
+	// drops the VAD gate back to energy instead of freezing the mic, and so that a
+	// recovered denoiser is picked back up.
 	denVAD bool
+
+	// denRecoverIn counts frames remaining before the next attempt to rebuild a
+	// degraded denoiser via denFactory. Zero means "try now". Only used while
+	// denVAD is false; worker-owned.
+	denRecoverIn int
 
 	// nsTierApplied / agcApplied / aecApplied track the APM submodule state currently
 	// applied so process() re-applies config ONLY when a user toggle changes, never
 	// per frame. They mirror the engine's nsTier()/agc()/echoCancellation() atomics.
+	// denVADApplied mirrors the denoiser capability the current APM config was built
+	// for: because Strong means "APM NS off", a change in whether RNNoise can
+	// actually denoise must also trigger a re-apply (see buildAPMConfigFor).
 	nsTierApplied int32
 	agcApplied    bool
 	aecApplied    bool
+	denVADApplied bool
 
 	// vadScratch is a preallocated copy buffer: in the None/Standard/High tiers the
 	// worker copies the post-APM frame here and runs RNNoise on the COPY purely to
@@ -114,21 +144,12 @@ type micWorker struct {
 // a no-op Processor, so the chain degrades to a clean passthrough + the hard gate,
 // never a broken pipeline.
 func (e *Engine) startWorker() {
-	// Build the APM config from the live noise-suppression tier plus the AGC/echo
-	// toggles. The tier maps to the APM noise-suppression submodule (none->off,
-	// standard->Moderate, high->High, strong->off because RNNoise denoises instead).
-	cfg := e.buildAPMConfig()
-
-	proc, err := apm.New(cfg)
-	if err != nil {
-		// Non-fatal: New returns a no-op Processor alongside the error, so the worker
-		// still runs (clean passthrough + hard gate). main logs availability honestly
-		// via apm.Available()/apm.LoadError(); we keep the no-op proc here.
-		_ = err
-	}
-
-	// Build the RNNoise denoiser once, here, OFF the audio thread (like the APM). It
-	// serves two roles: the Strong-tier denoiser, and the speech-probability source
+	// Build the RNNoise denoiser ONCE, here, OFF the audio thread (like the APM),
+	// before building the APM config — because the config depends on whether a real
+	// denoiser exists (a Strong tier with no working RNNoise must keep the APM's own
+	// suppressor ON rather than disable it).
+	//
+	// It serves two roles: the Strong-tier denoiser, and the speech-probability source
 	// for the advanced VAD gate in every tier. denoise.New(true) returns the real
 	// RNNoise when this binary built with cgo, else Passthrough (p==0). The denoiser
 	// runs only on THIS goroutine, never the malgo callback.
@@ -140,27 +161,53 @@ func (e *Engine) startWorker() {
 	// runtime (crnnoise.New/rnnoise_create failure). Passthrough.Process always
 	// returns p==0, so if denVAD were left true on that fallback the advanced VAD
 	// latch would see every frame below closeProb, never open, and silently mute the
-	// mic to Discord with no energy-gate safety net. Deriving it from the concrete
-	// type means a runtime allocation failure correctly drops the advanced VAD gate
-	// back to the energy latch (Passthrough is the only non-VAD Denoiser, so a type
-	// assertion is the exact, allocation-free test).
-	_, denIsPassthrough := den.(denoise.Passthrough)
-	denVAD := denoise.Available() && !denIsPassthrough
+	// mic to Discord with no energy-gate safety net. denoiserProvidesVAD is the
+	// single, allocation-free test (Passthrough is the only non-VAD Denoiser), shared
+	// with process()'s per-frame reconciliation so the two can never drift.
+	denVAD := denoiserProvidesVAD(den)
+
+	// Build the APM config from the live noise-suppression tier plus the AGC/echo
+	// toggles, honouring the ACTUAL denoiser capability (see buildAPMConfigFor). The
+	// tier maps to the APM noise-suppression submodule (none->off, standard->Moderate,
+	// high->High, strong->off when RNNoise is available because it denoises instead).
+	cfg := e.buildAPMConfigFor(e.nsTier(), e.agc(), e.echoCancellation(), denVAD)
+
+	proc, err := apm.New(cfg)
+	if err != nil {
+		// Non-fatal: New returns a no-op Processor alongside the error, so the worker
+		// still runs (clean passthrough + hard gate). main logs availability honestly
+		// via apm.Available()/apm.LoadError(); we keep the no-op proc here.
+		_ = err
+	}
 
 	w := &micWorker{
 		e:             e,
 		apm:           proc,
 		gate:          newGate(),
 		den:           den,
+		denFactory:    func() denoise.Denoiser { return denoise.New(true) },
 		denVAD:        denVAD,
 		nsTierApplied: e.nsTier(),
 		agcApplied:    e.agc(),
 		aecApplied:    e.echoCancellation(),
+		denVADApplied: denVAD,
 		stop:          make(chan struct{}),
 	}
 	e.worker = w
 	w.wg.Add(1)
 	go w.run()
+}
+
+// denoiserProvidesVAD reports whether den can supply a trained speech probability.
+// Passthrough (and a nil denoiser) cannot: Passthrough.Process always returns 0,
+// which would hold an advanced-VAD latch permanently shut. Any other Denoiser is
+// the real RNNoise and does. Allocation-free; safe to call per frame.
+func denoiserProvidesVAD(den denoise.Denoiser) bool {
+	if den == nil {
+		return false
+	}
+	_, isPassthrough := den.(denoise.Passthrough)
+	return !isPassthrough
 }
 
 // stopWorker signals the worker to exit, waits for it, and frees its native APM.
@@ -246,15 +293,29 @@ func (w *micWorker) run() {
 }
 
 // buildAPMConfig assembles the APM Config from the engine's live noise-suppression
-// tier and AGC/echo toggles. It is the single place the tier -> APM noise-suppression
-// mapping lives, shared by startWorker (first apply) and process (runtime re-apply).
+// tier and AGC/echo toggles, assuming a REAL denoiser is in hand (denVAD true). It
+// is used by startWorker (first apply) and the config-consistency tests; the worker's
+// runtime re-apply uses buildAPMConfigFor with the exact snapshot it is comparing
+// against, so the applied config and its epoch bookkeeping can never disagree.
+//
+// With denVAD true a Strong tier disables APM noise suppression because RNNoise
+// denoises instead — the two are NEVER stacked. See nsConfigForTierApplied.
 func (e *Engine) buildAPMConfig() apm.Config {
+	return e.buildAPMConfigFor(e.nsTier(), e.agc(), e.echoCancellation(), true)
+}
+
+// buildAPMConfigFor builds the APM config from the given settings snapshot and
+// denoiser capability. Passing the tier/AGC/echo values in (rather than re-reading
+// the atomics here) lets process build a config that is EXACTLY consistent with the
+// values it is about to record as applied — no torn read where the config reflects
+// a newer tier than the epoch bookkeeping does. When denVAD is false a Strong tier
+// cannot be honoured by RNNoise, so it falls back to the APM's High suppressor
+// rather than leaving noise suppression off entirely.
+func (e *Engine) buildAPMConfigFor(tier int32, agcOn, echoOn, denVAD bool) apm.Config {
 	cfg := apm.DiscordConfig()
-	cfg.GainControlEnabled = e.agc()
-	cfg.EchoCancellationEnabled = e.echoCancellation()
-	enabled, level := nsConfigForTier(e.nsTier())
-	cfg.NoiseSuppressionEnabled = enabled
-	cfg.NoiseSuppressionLevel = level
+	cfg.GainControlEnabled = agcOn
+	cfg.EchoCancellationEnabled = echoOn
+	cfg.NoiseSuppressionEnabled, cfg.NoiseSuppressionLevel = nsConfigForTierApplied(tier, denVAD)
 	return cfg
 }
 
@@ -263,12 +324,27 @@ func (e *Engine) buildAPMConfig() apm.Config {
 // signal instead — the two are NEVER stacked. None also disables it. Standard and
 // High map to the WebRTC Moderate/High aggressiveness levels.
 func nsConfigForTier(tier int32) (enabled bool, level apm.NSLevel) {
+	return nsConfigForTierApplied(tier, true)
+}
+
+// nsConfigForTierApplied is nsConfigForTier parameterised by whether a real
+// denoiser is available to do the Strong tier's work. With denVAD true it is
+// exactly nsConfigForTier (Strong -> APM NS OFF, no stacking). With denVAD false a
+// Strong tier CANNOT be honoured by RNNoise, so rather than transmit raw mic it
+// degrades to the APM's High suppressor — a Strong request always ends with noise
+// suppression ON, either from RNNoise or, in its absence, from the APM.
+func nsConfigForTierApplied(tier int32, denVAD bool) (enabled bool, level apm.NSLevel) {
 	switch tier {
 	case nsTierStandard:
 		return true, apm.NSLevelModerate
 	case nsTierHigh:
 		return true, apm.NSLevelHigh
-	default: // nsTierNone, nsTierStrong -> APM NS off
+	case nsTierStrong:
+		if denVAD {
+			return false, apm.NSLevelModerate // RNNoise denoises; never stack APM NS
+		}
+		return true, apm.NSLevelHigh // denoiser unavailable: keep suppression via the APM
+	default: // nsTierNone
 		return false, apm.NSLevelModerate
 	}
 }
@@ -294,18 +370,30 @@ func nsConfigForTier(tier int32) (enabled bool, level apm.NSLevel) {
 // Everything here runs on the worker goroutine (never the malgo callback) and uses
 // only preallocated scratch — no alloc, lock, or IO in the hot loop.
 func (w *micWorker) process(frame []float32) {
-	// 1) Re-apply the APM config only when the tier/AGC/echo toggles changed since the
-	//    last frame — never per frame. This runs on THIS goroutine (the same one that
-	//    calls ProcessCapture), satisfying WebRTC's "no config setter concurrent with
-	//    ProcessStream" rule.
+	// 0) Reconcile the denoiser's VAD capability for THIS frame. A denoiser can
+	//    degrade at runtime (Close, or a native state that later fails), and it can
+	//    also recover. Reading the capability freshly — instead of trusting the
+	//    denVAD captured once at startWorker — is what lets the advanced-VAD gate
+	//    fall back to energy the moment a probability can no longer be produced,
+	//    rather than locking the mic shut on a constant p==0.
+	w.reconcileDenoiser()
+
+	// 1) Re-apply the APM config only when the tier/AGC/echo toggles OR the live
+	//    denoiser capability changed since the last frame — never per frame. This runs
+	//    on THIS goroutine (the same one that calls ProcessCapture), satisfying
+	//    WebRTC's "no config setter concurrent with ProcessStream" rule. The
+	//    denoiser-capability term is what re-enables the APM's own suppressor when a
+	//    Strong-tier denoiser degrades (or disables it again when one recovers), so
+	//    the applied config never disagrees with what the chain can actually do.
 	tier := w.e.nsTier()
 	ag := w.e.agc()
 	aec := w.e.echoCancellation()
-	if tier != w.nsTierApplied || ag != w.agcApplied || aec != w.aecApplied {
-		w.apm.Reconfigure(w.e.buildAPMConfig())
+	if tier != w.nsTierApplied || ag != w.agcApplied || aec != w.aecApplied || w.denVAD != w.denVADApplied {
+		w.apm.Reconfigure(w.e.buildAPMConfigFor(tier, ag, aec, w.denVAD))
 		w.nsTierApplied = tier
 		w.agcApplied = ag
 		w.aecApplied = aec
+		w.denVADApplied = w.denVAD
 	}
 
 	// 2) Run the real WebRTC capture chain (HPF + NS(tier) + AGC) in place. On a no-op
@@ -317,8 +405,17 @@ func (w *micWorker) process(frame []float32) {
 	//    to read the probability, leaving the APM output as the transmitted signal. It
 	//    is only run when its result is actually needed (Strong always; the VAD gate
 	//    when it is the active decision), so quiet/forced modes stay cheap.
+	//
+	//    Strong is only true when the denoiser can ACTUALLY denoise (denVAD): a
+	//    degraded (Passthrough) denoiser in the Strong tier must not pretend to
+	//    denoise, or the tier would report "RNNoise on" while the mic sits at raw
+	//    passthrough — and, worse, the APM's own suppressor is switched OFF for a
+	//    working Strong, so nothing would suppress. In that degraded case the APM
+	//    re-enables its suppressor (buildAPMConfigFor) and the gate falls back to
+	//    energy. When the denoiser IS real, Strong still feeds the probability to the
+	//    advanced-VAD latch exactly as the other tiers do. See denStrong.
 	forceOpen, forceClosed := w.gateOverride()
-	strong := tier == nsTierStrong
+	strong := w.denStrong(tier)
 	useVAD := !forceOpen && !forceClosed && w.e.advancedVAD() && w.denVAD
 	var p float32
 	if w.den != nil {
@@ -347,6 +444,60 @@ func (w *micWorker) process(frame []float32) {
 	//    the UI mic-open meter — derived from the signal Discord actually receives.
 	level := w.gate.apply(frame, forceOpen, forceClosed)
 	w.e.setGateLevel(level)
+}
+
+// reconcileDenoiser refreshes w.denVAD from the denoiser that is ACTUALLY in hand
+// and, when that denoiser has degraded to a non-VAD Passthrough, periodically
+// tries to rebuild a real one so the worker can return to probability-driven
+// gating once the underlying condition (e.g. a transient native-allocation
+// failure) clears. It is allocation-free on the steady path (a type assertion)
+// and only attempts denoise.New on the throttled recovery tick.
+//
+// This is the "降噪器退化为直通时门控回落到能量判定；恢复可用后重新按概率判定"
+// contract: denVAD false => process takes the energy latch; a successful rebuild
+// flips it back to true and process then drives the probability latch again. The
+// shared open/hold state carries across the switch, so a gate already open on
+// energy stays open (no chop) while a gate closed on energy re-opens only once the
+// probability crosses the VAD threshold — which is exactly the intended behavior.
+func (w *micWorker) reconcileDenoiser() {
+	provides := denoiserProvidesVAD(w.den)
+	if provides {
+		w.denVAD = true
+		w.denRecoverIn = 0
+		return
+	}
+	w.denVAD = false
+	// Throttled recovery: try to rebuild a real denoiser only every denRecoverFrames
+	// frames. Rebuilding every frame while unavailable would hammer the allocator;
+	// waiting also keeps the energy-gate fallback stable long enough to be observed.
+	if w.denRecoverIn > 0 {
+		w.denRecoverIn--
+		return
+	}
+	w.denRecoverIn = denRecoverFrames
+	if w.denFactory == nil {
+		// No factory wired (the test harness's default): the worker simply stays on
+		// the energy latch. That is the correct degraded behaviour, and it keeps this
+		// path allocation-free so a test can drive process() without spawning RNNoise.
+		return
+	}
+	if w.den != nil {
+		w.den.Close()
+	}
+	if fresh := w.denFactory(); fresh != nil {
+		w.den = fresh
+		w.denVAD = denoiserProvidesVAD(fresh)
+	}
+}
+
+// denStrong reports whether the Strong tier should run the denoiser on the
+// TRAINED frame for this frame. It requires both the Strong tier AND a denoiser
+// that can actually denoise; a degraded (Passthrough) denoiser in Strong drops
+// back to the APM-only path so the APM's own suppressor (which buildAPMConfigFor
+// re-enables in exactly that case, see nsConfigForTierApplied) still removes noise
+// instead of leaving the transmitted signal raw.
+func (w *micWorker) denStrong(tier int32) bool {
+	return tier == nsTierStrong && w.denVAD
 }
 
 // energyThreshold returns the energy-gate OPEN threshold for this frame. With

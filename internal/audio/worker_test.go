@@ -17,7 +17,12 @@ import (
 // allocates no RNNoise C state, which is what the APM/energy-path tests want. Tests
 // that exercise the advanced VAD or Strong tier inject a denoiser via newWorkerWithDen.
 func newWorkerFor(e *Engine) *micWorker {
-	proc, _ := apm.New(e.buildAPMConfig())
+	// Build the APM for the NO-denoiser case (denVAD=false): this harness injects no
+	// denoiser, so a Strong tier must keep the APM's own suppressor ON. Building it
+	// with buildAPMConfig() (denVAD=true) would arm the APM for a Strong tier it can
+	// never honour, and the worker's epoch bookkeeping would then start one revision
+	// behind the live APM. buildAPMConfigFor keeps the two consistent from frame 0.
+	proc, _ := apm.New(e.buildAPMConfigFor(e.nsTier(), e.agc(), e.echoCancellation(), false))
 	return &micWorker{
 		e:             e,
 		apm:           proc,
@@ -25,6 +30,7 @@ func newWorkerFor(e *Engine) *micWorker {
 		nsTierApplied: e.nsTier(),
 		agcApplied:    e.agc(),
 		aecApplied:    e.echoCancellation(),
+		denVADApplied: false,
 		stop:          make(chan struct{}),
 	}
 }

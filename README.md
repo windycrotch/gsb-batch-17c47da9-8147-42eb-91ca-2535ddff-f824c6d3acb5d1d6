@@ -166,7 +166,19 @@ gate — so breathing, which has energy but is not speech, stops opening your mi
 
 **A hard gate sits after the APM**, because the APM has no hard mute. Mute and push-to-talk-up are
 enforced on the **real-time thread**, so the mic is authoritatively silent even if the DSP worker
-falls behind.
+falls behind — the callback drains the output ring and emits a full buffer of silence on a
+force-closed buffer, so stale pre-mute audio and the raw live mic can neither leak nor be spliced
+in after a mode switch. A forced open/close ramps with a ~0.5 ms time constant (versus the ~120 ms
+voice-activity release), so the gate and its UI level reach the new state within the very next
+frame instead of drifting for a dozen frames.
+
+**Configuration changes converge.** A tier / AGC / echo-cancellation switch re-applies the APM
+config on the next frame from the exact atomics it compares against (no stale epoch), and the
+Strong tier never stacks RNNoise over the APM's own suppressor. If RNNoise degrades to a pass-
+through at runtime (e.g. a native allocation failure), the APM's suppressor is re-enabled and the
+advanced voice gate falls back to the energy latch rather than freezing shut on a constant zero
+speech probability; when a real denoiser is available again the gate returns to probability-driven
+gating.
 
 **Real-time safety.** The heavy DSP runs on a worker goroutine fed by lock-free SPSC ring buffers,
 never inside the audio callback. The mic path adds roughly one period plus one frame of latency.

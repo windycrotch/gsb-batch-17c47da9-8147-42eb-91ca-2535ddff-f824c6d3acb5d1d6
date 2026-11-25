@@ -53,15 +53,29 @@ func (e *Engine) duplexCallback(pOutput, pInput []byte, frameCount uint32) {
 	// Mute is made AUTHORITATIVE here, on the RT thread, rather than relying on the
 	// worker to keep up: when the effective gate is force-closed (Mute mode, or PTT
 	// mode with the key UP), the live mic must NEVER reach the cable even if the
-	// worker underruns. We pass that state into the worker bridge so the underrun
-	// tail is silenced (not raw passthrough). When the rings are NOT wired we silence
-	// the whole mic view directly so the degenerate passthrough path is muted too.
+	// worker underruns. We pass that state into the worker bridge so the whole buffer
+	// is silenced (not raw passthrough or stale processed audio). When the rings are
+	// NOT wired we silence the whole mic view directly so the degenerate passthrough
+	// path is muted too.
+	forceClosed := e.micForceClosed()
 	if e.inRing != nil && e.outRing != nil && frames <= len(e.monIn) {
-		e.processMicThroughWorker(mic, frames, e.micForceClosed())
-	} else if e.micForceClosed() {
+		e.processMicThroughWorker(mic, frames, forceClosed)
+	} else if forceClosed {
 		for i := range mic {
 			mic[i] = 0
 		}
+	}
+
+	// When the gate is force-closed the cable is guaranteed silent THIS buffer (the
+	// branch above zeroed the whole mic view), so publish GateLevel 0 here on the RT
+	// thread. The worker publishes the ramp value each frame too, but while it is a
+	// frame or two behind it would otherwise report the pre-mute level and the UI
+	// meter would disagree with the definitively-silent cable — exactly the "门控状态
+	// 与界面显示对不上" symptom. Publishing 0 from the RT side makes the meter track
+	// what is actually transmitted even under worker lag; when the gate is not forced
+	// the worker remains the authority for the open/ramp level.
+	if forceClosed {
+		e.setGateLevel(0)
 	}
 
 	// Compute the per-buffer soundboard level for the cable path: the MASTER gain,
@@ -139,8 +153,27 @@ func (e *Engine) processMicThroughWorker(mic []float32, frames int, forceClosed 
 	}
 	e.inRing.push(e.monIn[:frames])
 
-	// Pull processed mono back. got may be < frames on underrun.
+	// Pull processed mono back. got may be < frames on underrun. We pull even when
+	// force-closed so the output ring is DRAINED and cannot replay stale pre-mute
+	// audio when the mic re-opens — but the pulled samples are NOT emitted below.
 	got := e.outRing.pull(e.monOut[:frames])
+
+	// MUTE / PTT-UP IS AUTHORITATIVE ON THE RT THREAD. When the effective gate is
+	// force-closed the cable must be silent THIS buffer regardless of what the
+	// worker produced — including stale pre-mute audio still sitting in the output
+	// ring while the worker is a frame or two behind. Zeroing the whole mic view here
+	// (rather than only the underrun tail) closes the window in which a lagging
+	// worker used to leak the live mic or pre-mute processed audio into the cable.
+	// The worker's own fast force ramp (see noiseGate.apply) means that in the
+	// common, caught-up case the pulled samples are already silent, so this is not a
+	// hard-cut click in practice; and when the worker lags, no-leak wins over
+	// click-freedom per the mute contract.
+	if forceClosed {
+		for i := 0; i < frames*channels; i++ {
+			mic[i] = 0
+		}
+		return
+	}
 
 	// Head: samples the worker produced. Replace the mic with the processed value
 	// on both channels.
@@ -181,17 +214,8 @@ func (e *Engine) processMicThroughWorker(mic []float32, frames int, forceClosed 
 
 	// FULL underrun (got == 0): no processed sample to hold from. Documented
 	// fallback — raw mic passthrough for the whole buffer (added latency, never a
-	// stall), or silence when force-closed so mute stays authoritative.
-	if forceClosed {
-		for f := 0; f < frames; f++ {
-			base := f * channels
-			for ch := 0; ch < channels; ch++ {
-				mic[base+ch] = 0
-			}
-		}
-	}
-	// When not force-closed, the mic view already holds the gained raw passthrough,
-	// so there is nothing to write.
+	// stall). forceClosed was handled above, so the mic view already holds the gained
+	// raw passthrough; nothing to write.
 }
 
 // micForceClosed reports whether the live mic must be silenced to the cable on this
