@@ -1,0 +1,382 @@
+package playlist
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/globocom/go-m3u8/internal"
+	"github.com/rs/zerolog/log"
+)
+
+// Node names
+const (
+	commentNode         = "Comment"
+	cueOutNode          = "CueOut"
+	cueInNode           = "CueIn"
+	dateRangeNode       = "DateRange"
+	programDateTimeNode = "ProgramDateTime"
+	extInfNode          = "ExtInf"
+)
+
+// Attribute keys
+const (
+	commentAttr   = "Comment"
+	scte35OutAttr = "SCTE35-OUT"
+	scte35InAttr  = "SCTE35-IN"
+)
+
+// Comments
+const (
+	spliceInsertComment   = "## splice_insert"
+	programStartComment   = "## splice_insert(Program Start)"
+	autoReturnModeComment = "## Auto Return Mode"
+)
+
+var (
+	ErrParseLine = errors.New("failed to parse tag")
+	ParamRegex   = regexp.MustCompile(`([a-zA-Z\d_-]+)=("[^"]+"|[^",]+)`)
+)
+
+type Playlist struct {
+	*internal.DoublyLinkedList
+	CurrentSegment        *ExtInfData
+	CurrentStreamInf      *StreamInfData
+	ProgramDateTime       time.Time
+	MediaSequence         int
+	DiscontinuitySequence int
+	SegmentsCounter       int
+	DVR                   float64
+}
+
+// Returns new Playlist instance with an empty doubly linked list
+func NewPlaylist() *Playlist {
+	return &Playlist{
+		DoublyLinkedList:      new(internal.DoublyLinkedList),
+		CurrentSegment:        nil,
+		CurrentStreamInf:      nil,
+		ProgramDateTime:       time.Time{},
+		MediaSequence:         0,
+		DiscontinuitySequence: 0,
+		SegmentsCounter:       0,
+		DVR:                   0,
+	}
+}
+
+// Prints the playlist to stdout for debugging purposes
+func (p *Playlist) Print() {
+	if p.Head == nil || p.Tail == nil {
+		log.Warn().Str("service", "go-m3u8/playlist.go").Msg("playlist is empty")
+		return
+	}
+
+	current := p.Head
+	for current != nil {
+		fmt.Printf(">>>>>>>>> Node: %+v\n", current)
+		if current.HLSElement != nil {
+			fmt.Printf("HLSElement: %+v\n", current.HLSElement)
+		}
+		current = current.Next
+	}
+}
+
+// Returns the Version (#EXT-X-VERSION) tag's value as a string
+func (p *Playlist) VersionValue() string {
+	node, found := p.Find("Version")
+	if !found {
+		return ""
+	}
+	return node.HLSElement.Attrs["#EXT-X-VERSION"]
+}
+
+// Returns the Version (#EXT-X-VERSION) tag as a Node if it exists, otherwise returns nil and false
+func (p *Playlist) VersionTag() (*internal.Node, bool) {
+	return p.Find("Version")
+}
+
+// Returns the MediaSequence (#EXT-X-MEDIA-SEQUENCE) tag's value as a string
+func (p *Playlist) MediaSequenceValue() string {
+	node, found := p.Find("MediaSequence")
+	if !found {
+		return ""
+	}
+	return node.HLSElement.Attrs["#EXT-X-MEDIA-SEQUENCE"]
+}
+
+// Returns the MediaSequence (#EXT-X-MEDIA-SEQUENCE) tag as a Node if it exists, otherwise returns nil and false
+func (p *Playlist) MediaSequenceTag() (*internal.Node, bool) {
+	return p.Find("MediaSequence")
+}
+
+// Returns the DiscontinuitySequence (#EXT-X-DISCONTINUITY-SEQUENCE) tag's value as a string
+func (p *Playlist) DiscontinuitySequenceValue() string {
+	node, found := p.Find("DiscontinuitySequence")
+	if !found {
+		return ""
+	}
+	return node.HLSElement.Attrs["#EXT-X-DISCONTINUITY-SEQUENCE"]
+}
+
+// Returns the DiscontinuitySequence (#EXT-X-DISCONTINUITY-SEQUENCE) tag as a Node if it exists, otherwise returns nil and false
+func (p *Playlist) DiscontinuitySequenceTag() (*internal.Node, bool) {
+	return p.Find("DiscontinuitySequence")
+}
+
+// Returns the VariableDefine (#EXT-X-DEFINE) tag as a Node if it exists, otherwise returns nil and false
+func (p *Playlist) VariableDefineTag() (*internal.Node, bool) {
+	return p.Find("VariableDefine")
+}
+
+// Returns all StreamInf (#EXT-X-STREAM-INF) nodes in the playlist
+func (p *Playlist) Variants() []*internal.Node {
+	return p.FindAll("StreamInf")
+}
+
+// Returns all Media (#EXT-X-MEDIA) nodes in the playlist (i.e. AUDIO groups, CLOSED-CAPTIONS groups, etc.)
+func (p *Playlist) MediaGroups() []*internal.Node {
+	return p.FindAll("Media")
+}
+
+// Returns all IFrameStreamInf (#EXT-X-I-FRAME-STREAM-INF) nodes in the playlist (i.e. keyframes)
+func (p *Playlist) Keyframes() []*internal.Node {
+	return p.FindAll("IFrameStreamInf")
+}
+
+// Returns all ExtInf (#EXTINF) nodes in the playlist
+func (p *Playlist) Segments() []*internal.Node {
+	return p.FindAll(extInfNode)
+}
+
+// Returns all Key (#EXT-X-KEY) nodes in the playlist
+func (p *Playlist) EncryptionTags() []*internal.Node {
+	return p.FindAll("Key")
+}
+
+// Returns all ProgramDateTime (#EXT-X-PROGRAM-DATE-TIME) nodes in the playlist
+func (p *Playlist) ProgramDateTimeTags() []*internal.Node {
+	return p.FindAll(programDateTimeNode)
+}
+
+// Returns all CueOut (#EXT-X-CUE-OUT) nodes in the playlist
+func (p *Playlist) CueOutEvents() []*internal.Node {
+	return p.FindAll(cueOutNode)
+}
+
+// Returns all CueIn (#EXT-X-CUE-IN) nodes in the playlist
+func (p *Playlist) CueInEvents() []*internal.Node {
+	return p.FindAll(cueInNode)
+}
+
+// Returns all DateRange (#EXT-X-DATERANGE) nodes with SCTE35-OUT marking in the playlist
+func (p *Playlist) Breaks() []*internal.Node {
+	result := make([]*internal.Node, 0)
+	nodes := p.FindAll(dateRangeNode)
+	for i := range nodes {
+		if nodes[i].HLSElement.Attrs[scte35OutAttr] != "" {
+			result = append(result, nodes[i])
+		}
+	}
+	return result
+}
+
+// Returns all DateRange (#EXT-X-DATERANGE) nodes with SCTE35-IN marking in the playlist
+func (p *Playlist) SCTE35InTags() []*internal.Node {
+	result := make([]*internal.Node, 0)
+	nodes := p.FindAll(dateRangeNode)
+	for i := range nodes {
+		if nodes[i].HLSElement.Attrs[scte35InAttr] != "" {
+			result = append(result, nodes[i])
+		}
+	}
+	return result
+}
+
+// Returns the first Comment node in the playlist whose value contains the given matchString.
+//
+//	Example: "# variants", "# AUDIO groups", etc
+func (p *Playlist) Comment(matchString string) *internal.Node {
+	nodes := p.FindAll(commentNode)
+	for i := range nodes {
+		if strings.Contains(nodes[i].HLSElement.Attrs[commentAttr], matchString) {
+			return nodes[i]
+		}
+	}
+	return nil
+}
+
+// Returns true if node is inside ad break and false otherwise.
+// When true, method also returns the DateRange (#EXT-X-DATERANGE) object for the Ad Break.
+//
+// For entering the Ad Break, we always have DateRange tag with SCTE-OUT and CueOut (#EXT-X-CUE-OUT) tag.
+// However, for exiting the Ad Break, we have three possible manifests:
+//
+//   - DateRange SCTE-IN is ALWAYS present.
+//   - No DateRange SCTE-IN. Exit is ONLY marked by CueIn (#EXT-X-CUE-IN) tag instead.
+//   - SOMETIMES DateRange SCTE-IN is present, alongside the CueIn tag.
+func (p *Playlist) FindNodeInsideAdBreak(node *internal.Node) (*internal.Node, bool) {
+	current := node.Prev
+	for current != nil {
+		// node is inside Ad Break if it is preceded by a DateRange tag with attribute SCTE35-OUT
+		if (current.HLSElement.Name == dateRangeNode) && (current.HLSElement.Attrs[scte35OutAttr] != "") {
+			return current, true
+		}
+
+		// node is outside Ad Break if it is preceded by a CueIn tag or a DateRange tag with attribute SCTE35-IN
+		if (current.HLSElement.Name == cueInNode) || (current.HLSElement.Name == dateRangeNode && current.HLSElement.Attrs[scte35InAttr] != "") {
+			return nil, false
+		}
+
+		current = current.Prev
+	}
+
+	return nil, false
+}
+
+// Returns the last DateRange (#EXT-X-DATERANGE) node with SCTE35-OUT marking (i.e. the last Ad Break) in the playlist
+func (p *Playlist) FindLastAdBreak() (*internal.Node, bool) {
+	adBreaks := p.Breaks()
+	if len(adBreaks) == 0 {
+		return nil, false
+	}
+	return adBreaks[len(adBreaks)-1], true
+}
+
+// FindSecondLastAdBreak returns the DateRange node immediately preceding the last one, if it exists.
+func (p *Playlist) FindSecondLastAdBreak() (*internal.Node, bool) {
+	adBreaks := p.Breaks()
+	if len(adBreaks) < 2 {
+		return nil, false
+	}
+	return adBreaks[len(adBreaks)-2], true
+}
+
+// Returns the previous segment (#EXTINF) before the given node, or nil if none exists.
+func (p *Playlist) FindPreviousSegment(node *internal.Node) *internal.Node {
+	current := node.Prev
+	for current != nil {
+		if current.HLSElement.Name == extInfNode {
+			return current
+		}
+		current = current.Prev
+	}
+	return nil
+}
+
+// Returns the next segment (#EXTINF) after the given node, or nil if none exists.
+func (p *Playlist) FindNextSegment(node *internal.Node) *internal.Node {
+	current := node.Next
+	for current != nil {
+		if current.HLSElement.Name == extInfNode {
+			return current
+		}
+		current = current.Next
+	}
+	return nil
+}
+
+// Returns true if the given node is a segment (#EXTINF), false otherwise.
+func IsSegment(node *internal.Node) bool {
+	return node.HLSElement.Name == extInfNode
+}
+
+// Trims invalid and duplicated ad breaks from the playlist
+func (p *Playlist) TrimInvalidBreaks() {
+	adBreaks := p.Breaks()
+	for i, adBreak := range adBreaks {
+		if _, err := ValidateStartDate(adBreak); err != nil {
+			p.removeInvalidBreakTags(adBreak)
+		}
+
+		if _, err := ValidateMediaSequence(adBreak); err != nil {
+			p.removeInvalidBreakTags(adBreak)
+		}
+
+		if err := ValidatePlannedDuration(adBreak); err != nil {
+			p.removeInvalidBreakTags(adBreak)
+		}
+
+		if i > 0 && len(adBreaks) > 1 {
+			if IsDuplicatedProgramStartBreak(adBreak, adBreaks[i-1]) {
+				p.removeProgramStartDaterange(adBreak)
+			} else if IsDuplicatedBreak(adBreak, adBreaks[i-1]) {
+				p.removeDuplicateBreakTags(adBreak)
+			}
+		}
+	}
+}
+
+func (p *Playlist) removeInvalidBreakTags(adBreak *internal.Node) {
+	if adBreak.Next.Next != nil && adBreak.Next.Next.HLSElement.Name == programDateTimeNode {
+		p.Remove(adBreak.Next.Next)
+	}
+
+	if adBreak.Next != nil && adBreak.Next.HLSElement.Name == cueOutNode {
+		p.Remove(adBreak.Next)
+	}
+
+	cueIns := p.CueInEvents()
+	for i := range cueIns {
+		adBreakCueIn, found := p.FindNodeInsideAdBreak(cueIns[i])
+		if found && adBreakCueIn == adBreak {
+			if cueIns[i].Prev != nil && cueIns[i].Prev.HLSElement.Name == commentNode && cueIns[i].Prev.HLSElement.Attrs[commentAttr] == autoReturnModeComment {
+				p.Remove(cueIns[i].Prev)
+			}
+
+			if cueIns[i].Next != nil && cueIns[i].Next.HLSElement.Name == programDateTimeNode {
+				p.Remove(cueIns[i].Next)
+			}
+
+			p.Remove(cueIns[i])
+		}
+	}
+
+	if adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode && strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], spliceInsertComment) {
+		p.Remove(adBreak.Prev)
+	}
+
+	p.Remove(adBreak)
+}
+
+func (p *Playlist) removeDuplicateBreakTags(adBreak *internal.Node) {
+	if adBreak.Next != nil && adBreak.Next.HLSElement.Name == cueOutNode {
+		p.Remove(adBreak.Next)
+	}
+
+	cueIns := p.CueInEvents()
+	for i := range cueIns {
+		adBreakCueIn, found := p.FindNodeInsideAdBreak(cueIns[i])
+		if cueIns[i].Prev != nil && cueIns[i].Prev.HLSElement.Name == commentNode && cueIns[i].Prev.HLSElement.Attrs[commentAttr] == autoReturnModeComment {
+			p.Remove(cueIns[i].Prev)
+		}
+
+		if found && adBreakCueIn == adBreak {
+			p.Remove(cueIns[i])
+			break
+		}
+	}
+
+	if adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode && strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], spliceInsertComment) {
+		p.Remove(adBreak.Prev)
+	}
+
+	p.Remove(adBreak)
+}
+
+// Returns true if the given ad break is preceded by the "## splice_insert(Program Start)" comment
+func isProgramStartSpliceInsert(adBreak *internal.Node) bool {
+	return adBreak.Prev != nil && adBreak.Prev.HLSElement.Name == commentNode && strings.Contains(adBreak.Prev.HLSElement.Attrs[commentAttr], programStartComment)
+}
+
+// Removes a duplicated Program Start ad break, which shares the CueIn tag with the other break.
+// Only the Program Start comment, the DateRange tag and its CueOut tag are removed.
+func (p *Playlist) removeProgramStartDaterange(adBreak *internal.Node) {
+	if adBreak.Next != nil && adBreak.Next.HLSElement.Name == cueOutNode {
+		p.Remove(adBreak.Next)
+	}
+
+	p.Remove(adBreak.Prev)
+
+	p.Remove(adBreak)
+}

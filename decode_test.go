@@ -1,0 +1,913 @@
+package go_m3u8_test
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	m3u8 "github.com/globocom/go-m3u8"
+	pl "github.com/globocom/go-m3u8/playlist"
+	"github.com/globocom/go-m3u8/tags"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
+)
+
+type fakeSource struct{}
+
+func (f fakeSource) Read(p []byte) (n int, err error) {
+	return 0, fmt.Errorf("fake error")
+}
+
+func (f fakeSource) Close() error {
+	return nil
+}
+
+func setupPlaylist(input string) (*pl.Playlist, error) {
+	return m3u8.ParsePlaylist(io.NopCloser(strings.NewReader(input)))
+}
+
+func validatePlaylist(t *testing.T, p *pl.Playlist, err error) {
+	assert.NoError(t, err)
+	assert.Nil(t, p.CurrentSegment)
+	assert.Nil(t, p.CurrentStreamInf)
+	assert.Equal(t, p.Head.HLSElement.Name, "M3u8Identifier")
+}
+
+func TestIdentifierParser(t *testing.T) {
+	playlist := "#EXTM3U"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.M3u8IdentifierName)
+	assert.True(t, found)
+	assert.Equal(t, "", node.HLSElement.Attrs["#EXTM3U"])
+}
+
+func TestVersionParser(t *testing.T) {
+	playlist := "#EXT-X-VERSION:3"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.VersionName)
+	assert.True(t, found)
+	assert.Equal(t, "3", node.HLSElement.Attrs["#EXT-X-VERSION"])
+}
+
+func TestMediaSequenceParser(t *testing.T) {
+	playlist := "#EXT-X-MEDIA-SEQUENCE:360948012"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.MediaSequenceName)
+	assert.True(t, found)
+	assert.Equal(t, "360948012", node.HLSElement.Attrs["#EXT-X-MEDIA-SEQUENCE"])
+}
+
+func TestDiscontinuitySequenceParser(t *testing.T) {
+	playlist := "#EXT-X-DISCONTINUITY-SEQUENCE:18"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.DiscontinuitySequenceName)
+	assert.True(t, found)
+	assert.Equal(t, "18", node.HLSElement.Attrs["#EXT-X-DISCONTINUITY-SEQUENCE"])
+}
+
+func TestIndependentSegmentsParser(t *testing.T) {
+	playlist := "#EXT-X-INDEPENDENT-SEGMENTS"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.IndependentSegmentsName)
+	assert.True(t, found)
+	assert.Equal(t, "", node.HLSElement.Attrs["#EXT-X-INDEPENDENT-SEGMENT"])
+}
+
+func TestVariableDefineParser(t *testing.T) {
+	// test valid variable define tag with NAME and VALUE
+	playlist := "#EXT-X-DEFINE:NAME=\"video_id\",VALUE=\"12345\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.VariableDefineName)
+	assert.True(t, found)
+	assert.Equal(t, "video_id", node.HLSElement.Attrs["NAME"])
+	assert.Equal(t, "12345", node.HLSElement.Attrs["VALUE"])
+
+	// test valid variable define tag with QUERYPARAM
+	playlist = "#EXT-X-DEFINE:QUERYPARAM=\"video_id\""
+	p, err = setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found = p.Find(tags.VariableDefineName)
+	assert.True(t, found)
+	assert.Equal(t, "video_id", node.HLSElement.Attrs["QUERYPARAM"])
+
+	// test invalid variable define tag with NAME but without VALUE
+	playlist = "#EXT-X-DEFINE:NAME=\"video_id\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+}
+
+func TestTargetDurationParser(t *testing.T) {
+	playlist := "#EXT-X-TARGETDURATION:7"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.TargetDurationName)
+	assert.True(t, ok)
+	assert.Equal(t, "7", node.HLSElement.Attrs["#EXT-X-TARGETDURATION"])
+}
+
+func TestUspTimestampMapParser(t *testing.T) {
+	playlist := "#USP-X-TIMESTAMP-MAP:MPEGTS=900000,LOCAL=2025-01-01T12:34:56Z"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.USPTimestampMapName)
+	assert.True(t, ok)
+	assert.Equal(t, "900000", node.HLSElement.Attrs["MPEGTS"])
+	assert.Equal(t, "2025-01-01T12:34:56Z", node.HLSElement.Attrs["LOCAL"])
+}
+
+func TestProgramDateTimeParser(t *testing.T) {
+	playlist := "#EXT-X-PROGRAM-DATE-TIME:2025-01-01T12:34:56Z"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.ProgramDateTimeName)
+	assert.True(t, ok)
+	assert.Equal(t, "2025-01-01T12:34:56Z", node.HLSElement.Attrs["#EXT-X-PROGRAM-DATE-TIME"])
+}
+
+func TestKeyParser(t *testing.T) {
+	// test valid ext key tag
+	playlist := "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"drm-uri\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	keys := p.EncryptionTags()
+
+	assert.Len(t, keys, 1)
+	assert.Equal(t, "SAMPLE-AES", keys[0].HLSElement.Attrs["METHOD"])
+	assert.Equal(t, "drm-uri", keys[0].HLSElement.Attrs["URI"])
+	assert.Equal(t, "com.apple.streamingkeydelivery", keys[0].HLSElement.Attrs["KEYFORMAT"])
+	assert.Equal(t, "1", keys[0].HLSElement.Attrs["KEYFORMATVERSIONS"])
+
+	// test invalid ext key without METHOD
+	playlist = "#EXT-X-KEY:KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid ext key with METHOD not NONE and without URI
+	playlist = "#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid ext key with METHOD AES-128 and without IV
+	playlist = "#EXT-X-KEY:METHOD=AES-128,URI=\"https://example.com/keys/key1.bin\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+}
+
+func TestMapParser(t *testing.T) {
+	// test valid ext map tag with URI and BYTERANGE
+	playlist := "#EXT-X-MAP:URI=\"hls/main.mp4\",BYTERANGE=\"560@0\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.MapName)
+	assert.True(t, found)
+	assert.Equal(t, "hls/main.mp4", node.HLSElement.Attrs["URI"])
+	assert.Equal(t, "560@0", node.HLSElement.Attrs["BYTERANGE"])
+
+	// test valid ext map tag with URI and no BYTERANGE
+	playlist = "#EXT-X-MAP:URI=\"hls/channel-hevc-hdr-video=18000000.m4s\""
+	p, err = setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found = p.Find(tags.MapName)
+	assert.True(t, found)
+	assert.Equal(t, "hls/channel-hevc-hdr-video=18000000.m4s", node.HLSElement.Attrs["URI"])
+
+	// test invalid map tag without URI
+	playlist = "#EXT-X-MAP:BYTERANGE=\"560@0\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+}
+
+func TestDateRangeParser(t *testing.T) {
+	playlist := "#EXT-X-DATERANGE:SCTE35-OUT=0xFF0000,ID=\"break1\",START-DATE=\"2025-01-01T00:00:00Z\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.DateRangeName)
+	assert.True(t, found)
+	assert.Equal(t, "0xFF0000", node.HLSElement.Attrs["SCTE35-OUT"])
+	assert.Equal(t, "break1", node.HLSElement.Attrs["ID"])
+	assert.Equal(t, "2025-01-01T00:00:00Z", node.HLSElement.Attrs["START-DATE"])
+}
+
+func TestDateRangeParser_SCTE35SegmentationUPIDData(t *testing.T) {
+	playlist := "#EXT-X-DATERANGE:ID=\"3221225472-1787681921\",START-DATE=\"2026-08-25T18:18:41.966666Z\",PLANNED-DURATION=120.4,SCTE35-OUT=0xFC303F00000000000000FFF01405C00000007FEFFFDB6680287E00A55820B7190002001A0218435545490000016B7FFF0000A5584408043220505400000047F03520"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.DateRangeName)
+	assert.True(t, found)
+	// expected segmentation_upid.Data decoded from bytes 0x32 0x20 0x50 0x54 => "2 PT"
+	assert.Equal(t, "2 PT", node.HLSElement.Details[tags.DateRangeUPIDData])
+}
+
+func TestDateRangeParser_SCTE35EmptySegmentationUPIDData(t *testing.T) {
+	playlist := "#EXT-X-DATERANGE:ID=\"no-upid\",START-DATE=\"2026-08-25T18:18:41.966666Z\",PLANNED-DURATION=120.4,SCTE35-OUT=0xFC3025000000000BB800FFF01405F00001BB7FEFFE06EF5210FE005265C0000101010000E50D79A2"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.DateRangeName)
+	assert.True(t, found)
+	UPID, ok := node.HLSElement.Details[tags.DateRangeUPIDData]
+	assert.False(t, ok)
+	// expected segmentation_upid.Data is empty since the SCTE-35 does not contain segmentation_upid()
+	assert.Equal(t, "", UPID)
+}
+
+func TestDateRangeParser_SCTE35SegmentationUPIDData_LongValue(t *testing.T) {
+	playlist := "#EXT-X-DATERANGE:ID=\"test-long-upid\",START-DATE=\"2026-09-30T18:58:11.999999Z\",PLANNED-DURATION=10,SCTE35-OUT=0xFC304A000000000BB800FFF01405C00000007FEFFE3E2E4620FE0036EE804414000000250223435545490000049B7FFF000036EE800C0F205245443230323630393135383520100101428611E9"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.DateRangeName)
+	assert.True(t, found)
+	// Expected: " RED2026091585 " (15 bytes with leading and trailing spaces preserved)
+	assert.Equal(t, " RED2026091585 ", node.HLSElement.Details[tags.DateRangeUPIDData])
+}
+
+func TestCueOutParser(t *testing.T) {
+	playlist := "#EXT-X-CUE-OUT:30"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.EventCueOutName)
+	assert.True(t, ok)
+	assert.Equal(t, "30", node.HLSElement.Attrs["#EXT-X-CUE-OUT"])
+}
+
+func TestCueOutParserWithoutDuration(t *testing.T) {
+	playlist := "#EXT-X-CUE-OUT"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.EventCueOutName)
+	assert.True(t, ok)
+	assert.Equal(t, "0", node.HLSElement.Attrs["#EXT-X-CUE-OUT"])
+}
+
+func TestCueInParser(t *testing.T) {
+	playlist := strings.Join([]string{
+		"#EXT-X-DATERANGE:SCTE35-IN=0xFF0000,ID=\"break1\",START-DATE=\"2025-01-01T00:00:00Z\"",
+		"#EXT-X-CUE-IN",
+	}, "\n")
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.EventCueInName)
+	assert.True(t, ok)
+	assert.Equal(t, "", node.HLSElement.Attrs["#EXT-X-CUE-IN"])
+}
+
+func TestDiscontinuityParser(t *testing.T) {
+	playlist := "#EXT-X-DISCONTINUITY"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.DiscontinuityName)
+	assert.True(t, ok)
+	assert.Equal(t, "", node.HLSElement.Attrs["#EXT-X-DISCONTINUITY"])
+}
+
+func TestGapParser(t *testing.T) {
+	playlist := "#EXT-X-GAP"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, ok := p.Find(tags.GapName)
+	assert.True(t, ok)
+	assert.Equal(t, "", node.HLSElement.Attrs["#EXT-X-GAP"])
+}
+
+func TestExtInfParser(t *testing.T) {
+	playlist := "#EXTINF:4.8, no desc"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 4.8, p.CurrentSegment.Duration)
+	assert.Equal(t, " no desc", p.CurrentSegment.Title)
+}
+
+func TestStreamInfParser(t *testing.T) {
+	playlist := "#EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS=\"avc1.42c00a\",RESOLUTION=1280x720"
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	assert.Equal(t, "300000", p.CurrentStreamInf.Bandwidth)
+	assert.Equal(t, []string{"avc1.42c00a"}, p.CurrentStreamInf.Codecs)
+	assert.Equal(t, "1280x720", p.CurrentStreamInf.Resolution)
+}
+
+func TestMediaParser(t *testing.T) {
+	playlist := "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-aacl-96\",LANGUAGE=\"qaa\",NAME=\"Reserved for local use\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"channel-video_1=96000.m3u8?dvr_window_length=120\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.MediaName)
+	assert.True(t, found)
+	assert.Equal(t, "audio-aacl-96", node.HLSElement.Attrs["GROUP-ID"])
+	assert.Equal(t, "qaa", node.HLSElement.Attrs["LANGUAGE"])
+	assert.Equal(t, "Reserved for local use", node.HLSElement.Attrs["NAME"])
+	assert.Equal(t, "YES", node.HLSElement.Attrs["DEFAULT"])
+	assert.Equal(t, "YES", node.HLSElement.Attrs["AUTOSELECT"])
+	assert.Equal(t, "2", node.HLSElement.Attrs["CHANNELS"])
+	assert.Equal(t, "channel-video_1=96000.m3u8?dvr_window_length=120", node.HLSElement.Attrs["URI"])
+	assert.Equal(t, "AUDIO", node.HLSElement.Attrs["TYPE"])
+
+	// test invalid media tag without TYPE
+	playlist = "#EXT-X-MEDIA:GROUP-ID=\"audio-aacl-96\",LANGUAGE=\"qaa\",NAME=\"Reserved for local use\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"channel-video_1=96000.m3u8?dvr_window_length=120\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid media tag with invalid TYPE
+	playlist = "#EXT-X-MEDIA:TYPE=INVALID,GROUP-ID=\"audio-aacl-96\",LANGUAGE=\"qaa\",NAME=\"Reserved for local use\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"channel-video_1=96000.m3u8?dvr_window_length=120\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test media tag with TYPE CLOSED-CAPTIONS and URI
+	playlist = "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc-group\",NAME=\"English CC\",DEFAULT=YES,AUTOSELECT=YES,URI=\"cc-uri.m3u8\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+}
+
+func TestIFrameStreamInfParser(t *testing.T) {
+	playlist := "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=82000,CODECS=\"avc1.64001F\",RESOLUTION=640x360,URI=\"keyframes/channel-video=558976.m3u8?dvr_window_length=120\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.IFrameStreamInfName)
+	assert.True(t, found)
+	assert.Equal(t, "82000", node.HLSElement.Attrs["BANDWIDTH"])
+	assert.Equal(t, "avc1.64001F", node.HLSElement.Attrs["CODECS"])
+	assert.Equal(t, "640x360", node.HLSElement.Attrs["RESOLUTION"])
+	assert.Equal(t, "keyframes/channel-video=558976.m3u8?dvr_window_length=120", node.HLSElement.Attrs["URI"])
+
+	// test invalid IFrameStreamInf tag without URI
+	playlist = "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=82000,CODECS=\"avc1.64001F\",RESOLUTION=640x360"
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid IFrameStreamInf tag with missing BANDWIDTH
+	playlist = "#EXT-X-I-FRAME-STREAM-INF:CODECS=\"avc1.64001F\",RESOLUTION=640x360,URI=\"keyframes/channel-video=558976.m3u8?dvr_window_length=120\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid IFrameStreamInf tag with missing CODECS
+	playlist = "#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=82000,RESOLUTION=640x360,URI=\"keyframes/channel-video=558976.m3u8?dvr_window_length=120\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+}
+
+func TestSessionKeyParser(t *testing.T) {
+	playlist := "#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI=\"skd://12345\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	node, found := p.Find(tags.SessionKeyName)
+	assert.True(t, found)
+	assert.Equal(t, "SAMPLE-AES", node.HLSElement.Attrs["METHOD"])
+	assert.Equal(t, "skd://12345", node.HLSElement.Attrs["URI"])
+	assert.Equal(t, "com.apple.streamingkeydelivery", node.HLSElement.Attrs["KEYFORMAT"])
+	assert.Equal(t, "1", node.HLSElement.Attrs["KEYFORMATVERSIONS"])
+
+	// test invalid session key without METHOD
+	playlist = "#EXT-X-SESSION-KEY:URI=\"skd://12345\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid session key with METHOD NONE
+	playlist = "#EXT-X-SESSION-KEY:METHOD=NONE,URI=\"skd://12345\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid session key without URI
+	playlist = "#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+
+	// test invalid session key with METHOD AES-128 and without IV
+	playlist = "#EXT-X-SESSION-KEY:METHOD=AES-128,URI=\"skd://12345\",KEYFORMAT=\"com.apple.streamingkeydelivery\",KEYFORMATVERSIONS=\"1\""
+	_, err = setupPlaylist(playlist)
+	assert.Error(t, err)
+}
+
+func TestCommentParser(t *testing.T) {
+	playlist := `#EXTM3U
+							#EXT-X-VERSION:4
+
+							## Created with Unified Streaming Platform  (version=1.14.4-30793)
+							# AUDIO groups
+							#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-aacl-96",LANGUAGE="pt",NAME="Portuguese",DEFAULT=YES,AUTOSELECT=YES,CHANNELS="2"`
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+
+	nodes := p.FindAll(tags.CommentLineName)
+	assert.True(t, len(nodes) == 2)
+	assert.Equal(t, "## Created with Unified Streaming Platform  (version=1.14.4-30793)", nodes[0].HLSElement.Attrs["Comment"])
+	assert.Equal(t, "# AUDIO groups", nodes[1].HLSElement.Attrs["Comment"])
+}
+
+func TestMultiLineHLSElements_Segments(t *testing.T) {
+	playlist := `#EXTINF:4.8, no desc
+              1.ts`
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+	assert.Nil(t, p.CurrentSegment)
+
+	node, found := p.Find(tags.ExtInfName)
+	assert.True(t, found)
+	assert.Equal(t, "1.ts", node.HLSElement.URI)
+	assert.Equal(t, "4.8", node.HLSElement.Attrs["Duration"])
+	assert.Equal(t, " no desc", node.HLSElement.Attrs["Title"])
+
+	playlist = `#EXTINF:3.6
+              0.ts`
+	p, err = setupPlaylist(playlist)
+	assert.NoError(t, err)
+	assert.Nil(t, p.CurrentSegment)
+
+	node, found = p.Find(tags.ExtInfName)
+	assert.True(t, found)
+	assert.Equal(t, "0.ts", node.HLSElement.URI)
+	assert.Equal(t, "3.6", node.HLSElement.Attrs["Duration"])
+	assert.Equal(t, "", node.HLSElement.Attrs["Title"])
+}
+
+func TestMultiLineHLSElements_StreamInf(t *testing.T) {
+	playlist := `#EXT-X-STREAM-INF:BANDWIDTH=206000,AVERAGE-BANDWIDTH=187000,CODECS="mp4a.40.2,avc1.64001F",RESOLUTION=256x144,FRAME-RATE=30
+              channel-audio_1=96000-video=80000.m3u8`
+	p, err := setupPlaylist(playlist)
+	assert.NoError(t, err)
+	assert.Nil(t, p.CurrentStreamInf)
+
+	node, found := p.Find(tags.StreamInfName)
+	assert.True(t, found)
+	assert.Equal(t, "channel-audio_1=96000-video=80000.m3u8", node.HLSElement.URI)
+	assert.Equal(t, "206000", node.HLSElement.Attrs["BANDWIDTH"])
+	assert.Equal(t, "187000", node.HLSElement.Attrs["AVERAGE-BANDWIDTH"])
+	assert.Equal(t, "mp4a.40.2,avc1.64001F", node.HLSElement.Attrs["CODECS"])
+	assert.Equal(t, "256x144", node.HLSElement.Attrs["RESOLUTION"])
+	assert.Equal(t, "30", node.HLSElement.Attrs["FRAME-RATE"])
+}
+
+func TestParsePlaylist_Error_EmptySource(t *testing.T) {
+	_, err := m3u8.ParsePlaylist(fakeSource{})
+	assert.Error(t, err, "fake error")
+}
+
+func TestParsePlaylist_Error_MissingVersion(t *testing.T) {
+	file, _ := os.Open("mocks/multivariant/missingVersion.m3u8")
+	_, err := m3u8.ParsePlaylist(file)
+
+	assert.Error(t, err, "invalid version tag")
+}
+
+func TestParseMultivariantPlaylist(t *testing.T) {
+	file, _ := os.Open("mocks/multivariant/multivariant.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	variants := p.Variants()
+
+	assert.Len(t, variants, 8)
+	assert.Equal(t, p.Tail.HLSElement.Name, tags.StreamInfName)
+	assert.Equal(t, "channel-audio_1=96000-video=80000.m3u8", variants[0].HLSElement.URI)
+	assert.Equal(t, "206000", variants[0].HLSElement.Attrs["BANDWIDTH"])
+	assert.Equal(t, "187000", variants[0].HLSElement.Attrs["AVERAGE-BANDWIDTH"])
+	assert.Equal(t, "mp4a.40.2,avc1.64001F", variants[0].HLSElement.Attrs["CODECS"])
+	assert.Equal(t, "256x144", variants[0].HLSElement.Attrs["RESOLUTION"])
+	assert.Equal(t, "30", variants[0].HLSElement.Attrs["FRAME-RATE"])
+}
+
+func TestParseMultivariantPlaylist_WithMediaGroups_ValidMedia(t *testing.T) {
+	// manifest with AUDIO groups and CLOSED-CAPTIONS groups
+	file, _ := os.Open("mocks/multivariant/withClosedCaptionGroups.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	mediaGroups := p.MediaGroups()
+	variants := p.Variants()
+	closedCaptionsNodeURI := mediaGroups[3].HLSElement.Attrs["URI"]
+
+	assert.Len(t, mediaGroups, 4)
+	assert.Len(t, variants, 1)
+	assert.Empty(t, closedCaptionsNodeURI)
+	assert.Equal(t, "AUDIO", mediaGroups[1].HLSElement.Attrs["TYPE"])
+	assert.Equal(t, "channel-audio_2=96000.m3u8", mediaGroups[1].HLSElement.Attrs["URI"])
+
+	// mandatory attributes for media groups
+	for _, media := range mediaGroups {
+		assert.NotEmpty(t, media.HLSElement.Attrs["TYPE"])
+		assert.NotEmpty(t, media.HLSElement.Attrs["GROUP-ID"])
+		assert.Condition(t, func() bool {
+			acceptableTypes := []string{"AUDIO", "VIDEO", "SUBTITLES", "CLOSED-CAPTIONS"}
+			return lo.Contains(acceptableTypes, media.HLSElement.Attrs["TYPE"])
+		})
+	}
+
+	// if a EXT-X-STREAM-INF tag has media attributes (e.g. AUDIO, VIDEO, etc)
+	// they MUST match the GROUP-ID of an existing EXT-X-MEDIA tag
+	variantAudio := variants[0].HLSElement.Attrs["AUDIO"]
+	variantClosedCaption := variants[0].HLSElement.Attrs["CLOSED-CAPTIONS"]
+	audioGroupID := mediaGroups[0].HLSElement.Attrs["GROUP-ID"]
+	closedCaptionsGroupID := mediaGroups[3].HLSElement.Attrs["GROUP-ID"]
+
+	assert.Equal(t, variantAudio, audioGroupID)
+	assert.Equal(t, variantClosedCaption, closedCaptionsGroupID)
+}
+
+func TestParseMultivariantPlaylist_WithMediaGroups_ValidKeyframes(t *testing.T) {
+	// manifest with AUDIO groups
+	file, _ := os.Open("mocks/multivariant/withAudioGroups.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	mediaGroups := p.MediaGroups()
+	variants := p.Variants()
+	keyframes := p.Keyframes()
+
+	assert.Len(t, mediaGroups, 3)
+	assert.Len(t, variants, 4)
+	assert.Len(t, keyframes, 4)
+
+	// mandatory attributes for keyframes
+	for _, media := range keyframes {
+		assert.NotEmpty(t, media.HLSElement.Attrs["BANDWIDTH"])
+		assert.NotEmpty(t, media.HLSElement.Attrs["CODECS"])
+		assert.NotEmpty(t, media.HLSElement.Attrs["URI"])
+	}
+}
+
+func TestParseMultivariantPlaylist_WithEncryption(t *testing.T) {
+	file, _ := os.Open("mocks/multivariant/withEncryption.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	sessionKeyNode, found := p.Find(tags.SessionKeyName)
+
+	assert.True(t, found)
+	assert.Equal(t, "SAMPLE-AES", sessionKeyNode.HLSElement.Attrs["METHOD"])
+	assert.Equal(t, "sample-aes-uri", sessionKeyNode.HLSElement.Attrs["URI"])
+	assert.Equal(t, "com.apple.streamingkeydelivery", sessionKeyNode.HLSElement.Attrs["KEYFORMAT"])
+}
+
+func TestParseMultivariantPlaylist_WithFragmentedMP4(t *testing.T) {
+	file, _ := os.Open("mocks/multivariant/withHEVCAndFMP4.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	// CMAF Segments can’t contain multiple media types
+	// EXT-X-MEDIA tags need to be used to associate audio and subtitle playlists with video
+	mediaGroups := p.MediaGroups()
+	variants := p.Variants()
+
+	assert.True(t, len(mediaGroups) > 0)
+
+	audioAACGroupID := mediaGroups[0].HLSElement.Attrs["GROUP-ID"]
+	audioEC3GroupID := mediaGroups[1].HLSElement.Attrs["GROUP-ID"]
+	variantWithAACAudio := variants[0].HLSElement.Attrs["AUDIO"]
+	variantWithEC3Audio := variants[8].HLSElement.Attrs["AUDIO"]
+
+	assert.Equal(t, variantWithAACAudio, audioAACGroupID)
+	assert.Equal(t, variantWithEC3Audio, audioEC3GroupID)
+}
+
+func TestParseMultivariantPlaylist_WithQueryParam(t *testing.T) {
+	file, _ := os.Open("mocks/multivariant/withQueryParam.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	variableDefineNode, found := p.VariableDefineTag()
+	variants := p.Variants()
+
+	assert.True(t, found)
+	assert.Equal(t, "stream_id", variableDefineNode.HLSElement.Attrs["QUERYPARAM"])
+	assert.Contains(t, variants[0].HLSElement.URI, fmt.Sprintf("{$%s}", variableDefineNode.HLSElement.Attrs["QUERYPARAM"]))
+}
+
+func TestParseMediaPlaylist(t *testing.T) {
+	file, _ := os.Open("mocks/media/media.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	assert.Len(t, p.Segments(), 27)
+	assert.Len(t, p.Breaks(), 1)
+	assert.Equal(t, p.MediaSequence, 364042169)
+	assert.Equal(t, p.ProgramDateTime, time.Date(2025, 05, 16, 13, 33, 27, 966666000, time.UTC))
+	assert.Equal(t, p.DVR, 129.5999)
+}
+
+func TestParseMediaPlaylist_WithCompleteAdBreak(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withCompleteAdBreak.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	_, foundCueIn := p.Find(tags.EventCueInName)
+	breaks := p.Breaks()
+
+	assert.True(t, foundCueOut)
+	assert.True(t, foundCueIn)
+	assert.Equal(t, len(breaks), 1)
+	assert.Equal(t, breaks[0].HLSElement.Details["StartMediaSequence"], "363969994")
+	assert.Equal(t, breaks[0].HLSElement.Details["Status"], tags.BreakStatusComplete)
+}
+
+func TestParseMediaPlaylist_WithPartialAdBreak_BeforeDVRLimit(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withAdBreakBeforeDVRLimit.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+
+	assert.True(t, foundCueOut)
+	assert.Equal(t, len(allBreaks), 1)
+	assert.Equal(t, fmt.Sprintf("%d", p.MediaSequence), "363991004")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "363991006")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusComplete)
+	assert.Equal(t, len(allPDTs), 3)
+	assert.NotEqual(t, allPDTs[0].HLSElement.Attrs["#EXT-X-PROGRAM-DATE-TIME"], allBreaks[0].HLSElement.Attrs["START-DATE"])
+	assert.Equal(t, allPDTs[1].HLSElement.Attrs["#EXT-X-PROGRAM-DATE-TIME"], allBreaks[0].HLSElement.Attrs["START-DATE"])
+}
+
+func TestParseMediaPlaylist_WithPartialAdBreak_OnDVRLimit(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withAdBreakOnDVRLimit.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+
+	assert.True(t, foundCueOut)
+	assert.Equal(t, len(allBreaks), 1)
+	assert.Equal(t, fmt.Sprintf("%d", p.MediaSequence), "363991006")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "0")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusLeavingDVR)
+	assert.Equal(t, len(allPDTs), 2)
+	assert.Equal(t, allPDTs[0].HLSElement.Attrs["#EXT-X-PROGRAM-DATE-TIME"], allBreaks[0].HLSElement.Attrs["START-DATE"])
+}
+
+func TestParseMediaPlaylist_WithPartialAdBreak_OutsideDVRLimit(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withAdBreakOutsideDVRLimit.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+
+	assert.False(t, foundCueOut)
+	assert.Equal(t, len(allBreaks), 1)
+	assert.Equal(t, fmt.Sprintf("%d", p.MediaSequence), "363991008")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "0")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusLeavingDVR)
+	assert.Equal(t, len(allPDTs), 2)
+	assert.NotEqual(t, allPDTs[0].HLSElement.Attrs["#EXT-X-PROGRAM-DATE-TIME"], allBreaks[0].HLSElement.Attrs["START-DATE"])
+}
+
+func TestParseMediaPlaylist_WithPartialAdBreak_NewNotReady(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withAdBreakNewNotReady.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+
+	assert.False(t, foundCueOut)
+	assert.Nil(t, allBreaks[0].Next)
+	assert.Equal(t, len(allPDTs), 1)
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "0")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusNotReady)
+	assert.Equal(t, p.Tail.HLSElement.Name, tags.DateRangeName)
+}
+
+func TestParseMediaPlaylist_WithPartialAdBreak_NewReadyButNoSegment(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withAdBreakNewReady.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+
+	assert.False(t, foundCueOut)
+	assert.Nil(t, allBreaks[0].Next)
+	assert.Equal(t, len(allPDTs), 1)
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "363969994")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusComplete)
+}
+
+func TestParseMediaPlaylist_WithPartialAdBreak_NewReadyButWithSegment(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withAdBreakNewReadyWithSegment.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+	newestSegment := p.Tail
+
+	assert.True(t, foundCueOut)
+	assert.NotNil(t, allBreaks[0].Next)
+	assert.Equal(t, len(allPDTs), 2)
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], newestSegment.HLSElement.Details["MediaSequence"])
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusComplete)
+}
+
+func TestParseMediaPlaylist_WithCompleteAdBreak_BreakStartTimePrecision(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withBreakStartTimePrecisionEx1.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut := p.Find(tags.EventCueOutName)
+	allBreaks := p.Breaks()
+	allPDTs := p.FindAll(tags.ProgramDateTimeName)
+
+	assert.True(t, foundCueOut)
+	assert.Equal(t, len(allBreaks), 1)
+	assert.Equal(t, len(allPDTs), 3)
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "547307194")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusComplete)
+
+	file, _ = os.Open("mocks/media/scte35/withBreakStartTimePrecisionEx2.m3u8")
+	p, err = m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, foundCueOut = p.Find(tags.EventCueOutName)
+	allBreaks = p.Breaks()
+	allPDTs = p.FindAll(tags.ProgramDateTimeName)
+
+	assert.True(t, foundCueOut)
+	assert.Equal(t, len(allBreaks), 1)
+	assert.Equal(t, len(allPDTs), 3)
+	assert.Equal(t, allBreaks[0].HLSElement.Details["StartMediaSequence"], "548062663")
+	assert.Equal(t, allBreaks[0].HLSElement.Details["Status"], tags.BreakStatusComplete)
+}
+
+func TestParseMediaPlaylist_WithCompleteAdBreak_UsingHLSInterstitials(t *testing.T) {
+	file, _ := os.Open("mocks/media/scte35/withHLSInterstitials.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	breaks := p.Breaks()
+
+	assert.Len(t, breaks, 1)
+	assert.Equal(t, "com.apple.hls.interstitial", breaks[0].HLSElement.Attrs["CLASS"])
+	assert.Equal(t, "https://dai.google.com/network/1234/ad_break_id/playlist.m3u8?stream_id={$stream_id}", breaks[0].HLSElement.Attrs["X-ASSET-URI"])
+	assert.Equal(t, p.VersionValue(), "11")
+}
+
+func TestParseMediaPlaylist_WithDiscontinuity(t *testing.T) {
+	file, _ := os.Open("mocks/media/withDiscontinuity.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	discontinuitySequenceNode, found := p.Find(tags.DiscontinuitySequenceName)
+	discontinuityNodes := p.FindAll(tags.DiscontinuityName)
+
+	assert.True(t, found)
+	assert.Equal(t, "87498", discontinuitySequenceNode.HLSElement.Attrs["#EXT-X-DISCONTINUITY-SEQUENCE"])
+	assert.Equal(t, p.DiscontinuitySequence, 87498)
+	assert.Len(t, discontinuityNodes, 2)
+	assert.Equal(t, "", discontinuityNodes[0].HLSElement.Attrs["#EXT-X-DISCONTINUITY"])
+	assert.Equal(t, p.ProgramDateTime, time.Date(2025, 7, 1, 19, 1, 40, 466666000, time.UTC))
+	assert.Equal(t, p.DVR, 51.1998)
+	assert.Len(t, p.Segments(), 16)
+}
+
+func TestParseMediaPlaylist_WithEncryption_AES128(t *testing.T) {
+	file, _ := os.Open("mocks/media/encryption/withAES128.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	keys := p.EncryptionTags()
+
+	assert.Len(t, keys, 1)
+	assert.Equal(t, "AES-128", keys[0].HLSElement.Attrs["METHOD"])
+	assert.Equal(t, "https://example.com/keys/key1.bin", keys[0].HLSElement.Attrs["URI"])
+	assert.Equal(t, "0x0123456789abcdef0123456789abcdef", keys[0].HLSElement.Attrs["IV"])
+}
+
+func TestParseMediaPlaylist_WithEncryption_SampleAES(t *testing.T) {
+	file, _ := os.Open("mocks/media/encryption/withSampleAES.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	keys := p.EncryptionTags()
+
+	assert.Len(t, keys, 1)
+	assert.Equal(t, "SAMPLE-AES", keys[0].HLSElement.Attrs["METHOD"])
+	assert.Equal(t, "sample-aes-uri", keys[0].HLSElement.Attrs["URI"])
+	assert.Equal(t, "com.apple.streamingkeydelivery", keys[0].HLSElement.Attrs["KEYFORMAT"])
+	assert.Equal(t, "1", keys[0].HLSElement.Attrs["KEYFORMATVERSIONS"])
+}
+
+func TestParseMediaPlaylist_WithEncryptionAndCompleteAdBreak(t *testing.T) {
+	file, _ := os.Open("mocks/media/withEncryptionAndSCTE35.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	dateRangeNodes := p.Breaks()
+	extKeyNodes := p.EncryptionTags()
+	_, found1 := p.FindNodeInsideAdBreak(extKeyNodes[0])
+	_, found2 := p.FindNodeInsideAdBreak(extKeyNodes[1])
+	_, found3 := p.FindNodeInsideAdBreak(extKeyNodes[2])
+
+	assert.Len(t, dateRangeNodes, 1)
+	assert.Len(t, extKeyNodes, 3)
+	assert.False(t, found1)
+	assert.True(t, found2)
+	assert.False(t, found3)
+}
+
+func TestMediaPlaylist_WithMediaSegmentFormat_FragmentedMP4(t *testing.T) {
+	// format Fragmented MPEG-4 (fmp4)
+	file, _ := os.Open("mocks/media/withFormatFMP4.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	mapTag, found := p.Find(tags.MapName)
+	segment := p.Segments()[0]
+
+	assert.True(t, found)
+	assert.Equal(t, "hls/channel-hevc-hdr-video=18000000.m4s", mapTag.HLSElement.Attrs["URI"])
+	assert.Contains(t, segment.HLSElement.URI, ".m4s")
+}
+
+func TestMediaPlaylist_WithMediaSegmentFormat_AudioAAC(t *testing.T) {
+	// format Packed Audio AAC (aac)
+	file, _ := os.Open("mocks/media/withFormatAudioAAC.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	segment := p.Segments()[0]
+
+	assert.Contains(t, segment.HLSElement.URI, ".aac")
+}
+
+func TestMediaPlaylist_WithIFramesOnly(t *testing.T) {
+	// test IFramesOnly with invalid HLS version (needs >= HLSv4)
+	file, _ := os.Open("mocks/media/withIFramesOnlyAndInvalidVersion.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+
+	assert.Error(t, err)
+
+	// test IFramesOnly with valid HLS version
+	file, _ = os.Open("mocks/media/withIFramesOnly.m3u8")
+	p, err = m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	_, found := p.Find(tags.IFramesOnlyName)
+	assert.True(t, found)
+
+	// test IFramesOnly with FMP4 segments
+	file, _ = os.Open("mocks/media/withIFramesOnlyAndFMP4.m3u8")
+	p, err = m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	framesOnlyTag, _ := p.Find(tags.IFramesOnlyName)
+	mapTag, _ := p.Find(tags.MapName)
+	segment := p.Segments()[0]
+
+	assert.NotNil(t, framesOnlyTag)
+	assert.Equal(t, "hls/channel-hevc-hdr-video=18000000.m4s", mapTag.HLSElement.Attrs["URI"])
+	assert.Contains(t, segment.HLSElement.URI, ".m4s")
+}
+
+func TestMediaPlaylist_WithEndList(t *testing.T) {
+	file, _ := os.Open("mocks/media/withEndList.m3u8")
+	p, err := m3u8.ParsePlaylist(file)
+	validatePlaylist(t, p, err)
+
+	endListTag, found := p.Find(tags.EndListName)
+	assert.True(t, found)
+
+	segment := p.Segments()[0]
+
+	assert.NotNil(t, endListTag)
+	assert.Contains(t, segment.HLSElement.URI, ".ts")
+}
