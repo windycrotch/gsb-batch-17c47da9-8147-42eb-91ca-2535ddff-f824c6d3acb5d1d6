@@ -1,0 +1,148 @@
+/*
+Copyright 2022-2025 The nagare media authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"path"
+
+	"go.uber.org/zap"
+
+	"github.com/nagare-media/ingest/pkg/app"
+	"github.com/nagare-media/ingest/pkg/function"
+	"github.com/nagare-media/ingest/pkg/server"
+	"github.com/nagare-media/ingest/pkg/volume"
+)
+
+type Controller interface {
+	Exec(ctx context.Context, execCtx *ExecCtx) error
+}
+
+type ControllerFunc func(ctx context.Context, execCtx *ExecCtx) error
+
+func (f ControllerFunc) Exec(ctx context.Context, execCtx *ExecCtx) error {
+	return f(ctx, execCtx)
+}
+
+type ExecCtx struct {
+	log          *zap.SugaredLogger
+	ingestCtrl   IngestController
+	serverCtrl   ServerController
+	appCtrl      AppController
+	functionCtrl FunctionController
+}
+
+var _ volume.ExecCtx = &ExecCtx{}
+var _ server.ExecCtx = &ExecCtx{}
+var _ app.ExecCtx = &ExecCtx{}
+var _ function.ExecCtx = &ExecCtx{}
+
+func (c *ExecCtx) Logger() *zap.SugaredLogger       { return c.log }
+func (c *ExecCtx) IngestCtrl() IngestController     { return c.ingestCtrl }
+func (c *ExecCtx) ServerCtrl() ServerController     { return c.serverCtrl }
+func (c *ExecCtx) AppCtrl() AppController           { return c.appCtrl }
+func (c *ExecCtx) FunctionCtrl() FunctionController { return c.functionCtrl }
+
+func (c *ExecCtx) Server() server.Server {
+	if c.serverCtrl != nil {
+		return c.serverCtrl.Server()
+	}
+	return nil
+}
+
+func (c *ExecCtx) App() app.App {
+	if c.appCtrl != nil {
+		return c.appCtrl.App()
+	}
+	return nil
+}
+
+func (c *ExecCtx) Function() function.Function {
+	if c.functionCtrl != nil {
+		return c.functionCtrl.Function()
+	}
+	return nil
+}
+
+func (c *ExecCtx) PathPrefix(override ...string) string {
+	seg := make([]string, 0, 2)
+
+	if c.serverCtrl != nil {
+		seg = append(seg, c.serverCtrl.Server().Config().Name)
+	}
+	if c.appCtrl != nil {
+		seg = append(seg, c.appCtrl.App().Config().Name)
+	}
+	if len(override) > 0 {
+		if len(seg) < len(override) {
+			seg = override
+		} else {
+			copy(seg[len(seg)-len(override):], override)
+		}
+	}
+	return path.Clean("/" + path.Join(seg...))
+}
+
+func (c *ExecCtx) VolumeRegistry() volume.Registry {
+	return &volumeRegistry{
+		ingestCtrl: c.ingestCtrl,
+	}
+}
+
+func (c *ExecCtx) WithLogger(l *zap.SugaredLogger) *ExecCtx {
+	copy := *c
+	copy.log = l
+	return &copy
+}
+
+func (c *ExecCtx) WithIngestCtrl(ingestCtrl IngestController) *ExecCtx {
+	copy := *c
+	copy.ingestCtrl = ingestCtrl
+	return &copy
+}
+
+func (c *ExecCtx) WithServerCtrl(serverCtrl ServerController) *ExecCtx {
+	copy := *c
+	copy.serverCtrl = serverCtrl
+	return &copy
+}
+
+func (c *ExecCtx) WithAppCtrl(appCtrl AppController) *ExecCtx {
+	copy := *c
+	copy.appCtrl = appCtrl
+	return &copy
+}
+
+func (c *ExecCtx) WithFunctionCtrl(functionCtrl FunctionController) *ExecCtx {
+	copy := *c
+	copy.functionCtrl = functionCtrl
+	return &copy
+}
+
+type volumeRegistry struct {
+	ingestCtrl IngestController
+}
+
+var _ volume.Registry = &volumeRegistry{}
+
+func (reg *volumeRegistry) Get(name string) (volume.Volume, bool) {
+	if reg.ingestCtrl == nil {
+		return nil, false
+	}
+	vol, ok := reg.ingestCtrl.Volumes()[name]
+	return vol, ok
+}
