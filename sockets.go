@@ -11,12 +11,90 @@ import (
 )
 
 var (
-	conns connections = connections{}
+	conns connections = connections{accepting: true, active: make(map[*websocket.Conn]struct{})}
 )
 
 type connections struct {
 	conns    int
 	connsMux sync.Mutex
+	// accepting is false once shutdown starts; add() then rejects new sockets.
+	accepting bool
+	// active tracks upgraded websocket connections so shutdown can close them
+	// and deterministically drain the counter.
+	active map[*websocket.Conn]struct{}
+}
+
+// reset prepares the counter for a new server generation.
+func (c *connections) reset() {
+	c.connsMux.Lock()
+	c.conns = 0
+	c.accepting = true
+	c.active = make(map[*websocket.Conn]struct{})
+	c.connsMux.Unlock()
+}
+
+// seal rejects any further new connections and closes all currently upgraded
+// websockets. It is idempotent.
+func (c *connections) sealAndCloseAll() {
+	c.connsMux.Lock()
+	c.accepting = false
+	active := make([]*websocket.Conn, 0, len(c.active))
+	for conn := range c.active {
+		active = append(active, conn)
+	}
+	c.connsMux.Unlock()
+
+	for _, conn := range active {
+		// Close is safe to call concurrently with the read loop and causes
+		// that loop to exit and release its count exactly once.
+		conn.Close()
+	}
+}
+
+// track registers an upgraded websocket for shutdown closure.
+func (c *connections) track(conn *websocket.Conn) {
+	c.connsMux.Lock()
+	if c.active == nil {
+		c.active = make(map[*websocket.Conn]struct{})
+	}
+	c.active[conn] = struct{}{}
+	c.connsMux.Unlock()
+}
+
+// untrack removes a websocket from the active set.
+func (c *connections) untrack(conn *websocket.Conn) {
+	c.connsMux.Lock()
+	if c.active != nil {
+		delete(c.active, conn)
+	}
+	c.connsMux.Unlock()
+}
+
+// waitZero polls until the connection count reaches zero or the timeout
+// elapses. It returns true when the count is zero.
+func (c *connections) waitZero(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		c.connsMux.Lock()
+		n := c.conns
+		c.connsMux.Unlock()
+		if n <= 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// forceZero reconciles the counter to zero after shutdown. The subtract method
+// independently clamps at zero, so a late release can never make it negative.
+func (c *connections) forceZero() {
+	c.connsMux.Lock()
+	c.conns = 0
+	c.active = make(map[*websocket.Conn]struct{})
+	c.connsMux.Unlock()
 }
 
 type clientAction struct {
@@ -45,6 +123,7 @@ func socketInitializer(w http.ResponseWriter, r *http.Request) {
 	// CLIENT CONNECT CALLBACK
 	if clientConnectCallback != nil && !clientConnectCallback(&w, r) {
 		http.Error(w, "Could not establish a connection.", http.StatusForbidden)
+		conns.subtract()
 		return
 	}
 
@@ -52,8 +131,12 @@ func socketInitializer(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Upgrade(w, r, w.Header(), 1024, 1024)
 	if err != nil {
 		http.Error(w, "Could not establish a connection.", http.StatusForbidden)
+		conns.subtract()
 		return
 	}
+
+	// TRACK THE UPGRADED SOCKET SO SHUTDOWN CAN CLOSE IT
+	conns.track(conn)
 
 	// START WEBSOCKET LOOP
 	go clientActionListener(conn)
@@ -77,7 +160,7 @@ func clientActionListener(conn *websocket.Conn) {
 		tagMessage := map[string]interface{}{
 			helpers.ServerActionRequestDeviceTag: nil,
 		}
-		writeErr := conn.WriteJSON(tagMessage)
+		writeErr := helpers.SafeWriteJSON(conn, tagMessage)
 		if writeErr != nil {
 			closeSocket(conn)
 			return
@@ -108,7 +191,7 @@ func clientActionListener(conn *websocket.Conn) {
 				tagMessage := map[string]interface{}{
 					helpers.ServerActionSetDeviceTag: deviceTag,
 				}
-				writeErr := conn.WriteJSON(tagMessage)
+				writeErr := helpers.SafeWriteJSON(conn, tagMessage)
 				if writeErr != nil {
 					closeSocket(conn)
 					return
@@ -125,7 +208,7 @@ func clientActionListener(conn *websocket.Conn) {
 					notFiledMessage := map[string]interface{}{
 						helpers.ServerActionAutoLoginNotFiled: nil,
 					}
-					writeErr := conn.WriteJSON(notFiledMessage)
+					writeErr := helpers.SafeWriteJSON(conn, notFiledMessage)
 					if writeErr != nil {
 						closeSocket(conn)
 						return
@@ -174,7 +257,7 @@ func clientActionListener(conn *websocket.Conn) {
 				newPassMessage := map[string]interface{}{
 					helpers.ServerActionSetAutoLoginPass: devicePass,
 				}
-				writeErr := conn.WriteJSON(newPassMessage)
+				writeErr := helpers.SafeWriteJSON(conn, newPassMessage)
 				if writeErr != nil {
 					closeSocket(conn)
 					return
@@ -203,7 +286,7 @@ func clientActionListener(conn *websocket.Conn) {
 							},
 						},
 					}
-					writeErr := conn.WriteJSON(autologMessage)
+					writeErr := helpers.SafeWriteJSON(conn, autologMessage)
 					if writeErr != nil {
 						closeSocket(conn)
 						return
@@ -237,7 +320,7 @@ func clientActionListener(conn *websocket.Conn) {
 
 		if respond {
 			//SEND RESPONSE
-			if writeErr := conn.WriteJSON(helpers.MakeClientResponse(action.A, responseVal, actionErr)); writeErr != nil {
+			if writeErr := helpers.SafeWriteJSON(conn, helpers.MakeClientResponse(action.A, responseVal, actionErr)); writeErr != nil {
 				//DISCONNECT USER
 				clientMux.Lock()
 				sockedDropped(user, connID, &clientMux)
@@ -252,8 +335,10 @@ func clientActionListener(conn *websocket.Conn) {
 }
 
 func closeSocket(conn *websocket.Conn) {
-	conn.WriteControl(websocket.CloseMessage, []byte{}, time.Now().Add(time.Second*1))
+	_ = helpers.SafeWriteControl(conn, websocket.CloseMessage, []byte{}, time.Now().Add(time.Second*1))
 	conn.Close()
+	helpers.ReleaseWriteLock(conn)
+	conns.untrack(conn)
 	conns.subtract()
 }
 
@@ -269,8 +354,17 @@ func sockedDropped(user *core.User, connID string, clientMux *sync.Mutex) {
 
 func (c *connections) add() bool {
 	c.connsMux.Lock()
-	//
-	if (*settings).MaxConnections != 0 && c.conns == (*settings).MaxConnections {
+	// Reject while shut down (or sealed) so the count cannot grow after the
+	// server has stopped accepting traffic.
+	if !c.accepting {
+		c.connsMux.Unlock()
+		return false
+	}
+	maxConns := 0
+	if settings != nil {
+		maxConns = settings.MaxConnections
+	}
+	if maxConns != 0 && c.conns == maxConns {
 		c.connsMux.Unlock()
 		return false
 	}
@@ -282,7 +376,11 @@ func (c *connections) add() bool {
 
 func (c *connections) subtract() {
 	c.connsMux.Lock()
-	c.conns--
+	// Clamp at zero: shutdown reconciles the counter and a socket release
+	// racing that reconciliation must never produce a negative count.
+	if c.conns > 0 {
+		c.conns--
+	}
 	c.connsMux.Unlock()
 }
 

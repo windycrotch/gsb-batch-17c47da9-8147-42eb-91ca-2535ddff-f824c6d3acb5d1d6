@@ -2,8 +2,9 @@ package core
 
 import (
 	"errors"
-	"github.com/hewiefreeman/GopherGameServer/helpers"
 	"sync"
+
+	"github.com/hewiefreeman/GopherGameServer/helpers"
 )
 
 // Room represents a room on the server that Users can join and leave. Use core.NewRoom() to make a new Room.
@@ -93,6 +94,92 @@ func NewRoom(name string, rType string, isPrivate bool, maxUsers int, owner stri
 //   DELETE A ROOM   //////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// ResetRooms removes every Room from the server registry. It is used by the
+// start-up recovery lifecycle to emulate the empty memory of a freshly started
+// process, and by tests that need to drive repeated save/restore cycles in one
+// process.
+func ResetRooms() {
+	roomsMux.Lock()
+	rooms = make(map[string]*Room)
+	roomsMux.Unlock()
+}
+
+// ClearRooms is an alias for ResetRooms.
+func ClearRooms() { ResetRooms() }
+
+// RemoveRoomByName force-removes a Room from the registry without performing
+// any socket I/O. It is used to roll back a Room whose recovery failed part
+// way so no half-finished room (nor its invites/variables) remains visible.
+// Returns true when a room with that name was present.
+func RemoveRoomByName(name string) bool {
+	roomsMux.Lock()
+	r, ok := rooms[name]
+	if ok {
+		delete(rooms, name)
+	}
+	roomsMux.Unlock()
+	if !ok {
+		return false
+	}
+
+	// Mark the detached room as disposed so any stale reference reports that
+	// it no longer exists instead of mutating recovered state.
+	r.mux.Lock()
+	r.usersMap = nil
+	r.mux.Unlock()
+	return true
+}
+
+// RestoreRoom rebuilds a single Room from a persisted RoomRecoveryState.
+//
+// If the room cannot be created, or restoring its invites/variables fails or
+// panics after the room was inserted, any partial room is removed before the
+// error is returned. A caller iterating an archive can therefore continue with
+// the remaining entries knowing a failed room leaves no half product behind.
+func RestoreRoom(name string, state RoomRecoveryState) (restoreErr error) {
+	if len(name) == 0 {
+		return errors.New("cannot restore a room with an empty name")
+	}
+	if _, ok := roomTypes[state.T]; !ok {
+		return errors.New("invalid room type '" + state.T + "'")
+	}
+
+	created := false
+	defer func() {
+		if rec := recover(); rec != nil {
+			// A panic may have occurred after NewRoom inserted the room but
+			// before the created flag was assigned, so remove by name
+			// unconditionally; removal is a no-op if nothing was inserted.
+			RemoveRoomByName(name)
+			restoreErr = errors.New("panic while restoring room '" + name + "'")
+		} else if restoreErr != nil && created {
+			RemoveRoomByName(name)
+		}
+	}()
+
+	room, err := NewRoom(name, state.T, state.P, state.M, state.O)
+	if err != nil {
+		return err
+	}
+	created = true
+
+	// Restore the invite list. Invite restoration is best-effort and never
+	// discards an otherwise valid room: duplicate entries in a hand-edited
+	// archive are ignored, and a contradictory entry (e.g. an invite list on a
+	// public room) is skipped just as in the original recovery flow.
+	for _, userName := range state.I {
+		if invErr := room.AddInvite(userName); invErr != nil {
+			continue
+		}
+	}
+
+	if state.V != nil {
+		room.SetVariables(state.V)
+	}
+
+	return nil
+}
+
 // Delete deletes the Room from the server. Will also send a room leave message to all the Users in the Room that you can
 // capture with the client APIs.
 func (r *Room) Delete() error {
@@ -110,7 +197,7 @@ func (r *Room) Delete() error {
 		//CHANGE User's room POINTER TO nil & SEND MESSAGES
 		u.mux.Lock()
 		for key := range u.conns {
-			(*u.conns[key]).socket.WriteJSON(leaveMessage)
+			helpers.SafeWriteJSON((*u.conns[key]).socket, leaveMessage)
 			u.user.mux.Lock()
 			(*u.conns[key]).room = nil
 			u.user.mux.Unlock()
@@ -243,6 +330,13 @@ func (r *Room) AddUser(user *User, connID string) error {
 	// CHANGE USER'S ROOM
 	c.room = r
 
+	// Snapshot the room's users under the room lock so the broadcast below
+	// iterates a stable slice instead of reading r.usersMap without the lock.
+	roomUsers := make([]*RoomUser, 0, len(r.usersMap))
+	for _, ruCandidate := range r.usersMap {
+		roomUsers = append(roomUsers, ruCandidate)
+	}
+
 	user.mux.Unlock()
 	r.mux.Unlock()
 
@@ -256,11 +350,11 @@ func (r *Room) AddUser(user *User, connID string) error {
 				"g": user.isGuest,
 			},
 		}
-		for _, u := range r.usersMap {
+		for _, u := range roomUsers {
 			u.mux.Lock()
 			if u.user.Name() != userName {
 				for _, conn := range u.conns {
-					(*conn).socket.WriteJSON(message)
+					helpers.SafeWriteJSON((*conn).socket, message)
 				}
 			}
 			u.mux.Unlock()
@@ -273,7 +367,7 @@ func (r *Room) AddUser(user *User, connID string) error {
 
 	// SEND RESPONSE TO CLIENT
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionJoinRoom, r.Name(), helpers.NoError())
-	c.socket.WriteJSON(clientResp)
+	helpers.SafeWriteJSON(c.socket, clientResp)
 
 	//
 	return nil
@@ -320,7 +414,11 @@ func (r *Room) RemoveUser(user *User, connID string) error {
 		delete(r.usersMap, user.name)
 	}
 	ru.mux.Unlock()
-	userList := r.usersMap
+	// Snapshot remaining users under the room lock for a stable broadcast.
+	userList := make([]*RoomUser, 0, len(r.usersMap))
+	for _, remaining := range r.usersMap {
+		userList = append(userList, remaining)
+	}
 	r.mux.Unlock()
 	//
 	roomType := roomTypes[r.rType]
@@ -343,7 +441,7 @@ func (r *Room) RemoveUser(user *User, connID string) error {
 		for _, u := range userList {
 			u.mux.Lock()
 			for _, conn := range u.conns {
-				conn.socket.WriteJSON(message)
+				helpers.SafeWriteJSON(conn.socket, message)
 			}
 			u.mux.Unlock()
 		}
@@ -361,7 +459,7 @@ func (r *Room) RemoveUser(user *User, connID string) error {
 
 	//SEND RESPONSE TO CLIENT
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionLeaveRoom, r.Name(), helpers.NoError())
-	uConn.socket.WriteJSON(clientResp)
+	helpers.SafeWriteJSON(uConn.socket, clientResp)
 
 	//
 	return nil

@@ -20,6 +20,8 @@
 package core
 
 import (
+	"fmt"
+
 	"github.com/hewiefreeman/GopherGameServer/helpers"
 )
 
@@ -51,10 +53,12 @@ type RoomRecoveryState struct {
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // SetServerStarted is for Gopher Game Server internal mechanics only.
+//
+// Assigning false is used by the shut-down lifecycle to return the package to
+// its pre-start configuration state so the server can be started again in the
+// same process (for example in tests that exercise repeated recovery cycles).
 func SetServerStarted(val bool) {
-	if !serverStarted {
-		serverStarted = val
-	}
+	serverStarted = val
 }
 
 // SettingsSet is for Gopher Game Server internal mechanics only.
@@ -101,7 +105,7 @@ func Pause() {
 				conn.clientMux.Unlock()
 
 				//SEND LOG OUT MESSAGE
-				conn.socket.WriteJSON(clientResp)
+				helpers.SafeWriteJSON(conn.socket, clientResp)
 			}
 			user.mux.Unlock()
 		}
@@ -122,22 +126,89 @@ func Resume() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // GetRoomsState is only for internal Gopher Game Server mechanics.
+//
+// The returned map and all of its reference fields (invite lists and variable
+// maps) are independent copies. It is therefore safe to serialize the result
+// after the room locks have been released without racing concurrent room
+// mutations, and the snapshot can never partially observe an update.
 func GetRoomsState() map[string]RoomRecoveryState {
 	state := make(map[string]RoomRecoveryState)
 	roomsMux.Lock()
 	for _, room := range rooms {
 		room.mux.Lock()
+		invites := make([]string, len(room.inviteList))
+		copy(invites, room.inviteList)
+
+		vars := make(map[string]interface{}, len(room.vars))
+		for key, val := range room.vars {
+			vars[key] = deepCopyRecoveryValue(val)
+		}
+
 		state[room.name] = RoomRecoveryState{
 			T: room.rType,
 			P: room.private,
 			O: room.owner,
 			M: room.maxUsers,
-			I: room.inviteList,
-			V: room.vars,
+			I: invites,
+			V: vars,
 		}
 		room.mux.Unlock()
 	}
 	roomsMux.Unlock()
 	//
 	return state
+}
+
+// deepCopyRecoveryValue recursively copies the common JSON-compatible
+// composite values stored in room variables. Scalar values are returned as-is.
+// This keeps a persisted snapshot isolated from later in-place mutation of
+// nested maps or slices.
+func deepCopyRecoveryValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		cp := make(map[string]interface{}, len(val))
+		for k, item := range val {
+			cp[k] = deepCopyRecoveryValue(item)
+		}
+		return cp
+	case []interface{}:
+		cp := make([]interface{}, len(val))
+		for i, item := range val {
+			cp[i] = deepCopyRecoveryValue(item)
+		}
+		return cp
+	case []string:
+		cp := make([]string, len(val))
+		copy(cp, val)
+		return cp
+	default:
+		return v
+	}
+}
+
+// RecoveryReport describes the outcome of restoring rooms from an archive.
+type RecoveryReport struct {
+	// Archive is the file name the state was restored from. Empty when no
+	// usable archive was found.
+	Archive string
+	// Restored is the number of rooms successfully rebuilt.
+	Restored int
+	// Failed maps a room name to the reason its rebuild failed and was rolled
+	// back.
+	Failed map[string]error
+	// SkippedArchives lists archive candidates that were unreadable or
+	// corrupt and therefore skipped, newest first.
+	SkippedArchives []string
+}
+
+// String renders a concise, human readable recovery summary.
+func (r RecoveryReport) String() string {
+	if r.Archive == "" {
+		return "No valid recovery archive found; no rooms to restore."
+	}
+	msg := fmt.Sprintf("Recovered %d room(s) from %s", r.Restored, r.Archive)
+	if len(r.Failed) > 0 {
+		msg += fmt.Sprintf("; %d room(s) failed and were discarded", len(r.Failed))
+	}
+	return msg
 }

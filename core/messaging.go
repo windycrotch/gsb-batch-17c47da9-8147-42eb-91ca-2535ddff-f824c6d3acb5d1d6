@@ -51,12 +51,12 @@ func (u *User) PrivateMessage(userName string, message interface{}) {
 	//SEND MESSAGES
 	user.mux.Lock()
 	for _, conn := range user.conns {
-		(*conn).socket.WriteJSON(theMessage)
+		helpers.SafeWriteJSON((*conn).socket, theMessage)
 	}
 	user.mux.Unlock()
 	u.mux.Lock()
 	for _, conn := range u.conns {
-		(*conn).socket.WriteJSON(theMessage)
+		helpers.SafeWriteJSON((*conn).socket, theMessage)
 	}
 	u.mux.Unlock()
 
@@ -78,11 +78,11 @@ func (u *User) DataMessage(data interface{}, connID string) {
 	u.mux.Lock()
 	if connID == "" {
 		for _, conn := range u.conns {
-			(*conn).socket.WriteJSON(message)
+			helpers.SafeWriteJSON((*conn).socket, message)
 		}
 	} else {
 		if conn, ok := u.conns[connID]; ok {
-			(*conn).socket.WriteJSON(message)
+			helpers.SafeWriteJSON((*conn).socket, message)
 		}
 	}
 	u.mux.Unlock()
@@ -141,7 +141,7 @@ func (r *Room) DataMessage(message interface{}, recipients []string) error {
 		for _, u := range userMap {
 			u.mux.Lock()
 			for _, conn := range u.conns {
-				conn.socket.WriteJSON(theMessage)
+				helpers.SafeWriteJSON(conn.socket, theMessage)
 			}
 			u.mux.Unlock()
 		}
@@ -150,7 +150,7 @@ func (r *Room) DataMessage(message interface{}, recipients []string) error {
 			if u, ok := userMap[recipients[i]]; ok {
 				u.mux.Lock()
 				for _, conn := range u.conns {
-					conn.socket.WriteJSON(theMessage)
+					helpers.SafeWriteJSON(conn.socket, theMessage)
 				}
 				u.mux.Unlock()
 			}
@@ -188,7 +188,7 @@ func (r *Room) sendMessage(mt int, st int, rec []string, a string, m interface{}
 		for _, u := range userMap {
 			u.mux.Lock()
 			for _, conn := range u.conns {
-				conn.socket.WriteJSON(message)
+				helpers.SafeWriteJSON(conn.socket, message)
 			}
 			u.mux.Unlock()
 		}
@@ -197,7 +197,7 @@ func (r *Room) sendMessage(mt int, st int, rec []string, a string, m interface{}
 			if u, ok := userMap[rec[i]]; ok {
 				u.mux.Lock()
 				for _, conn := range u.conns {
-					conn.socket.WriteJSON(message)
+					helpers.SafeWriteJSON(conn.socket, message)
 				}
 				u.mux.Unlock()
 			}
@@ -233,7 +233,7 @@ func (r *Room) VoiceStream(userName string, userSocket *websocket.Conn, stream i
 	//SEND MESSAGE TO USERS
 	for _, u := range userMap {
 		for _, conn := range u.conns {
-			(*conn).socket.WriteJSON(theMessage)
+			helpers.SafeWriteJSON((*conn).socket, theMessage)
 		}
 	}
 
@@ -243,7 +243,7 @@ func (r *Room) VoiceStream(userName string, userSocket *websocket.Conn, stream i
 	}
 
 	//SEND PING MESSAGE TO SENDING USER
-	userSocket.WriteJSON(pingMessage)
+	helpers.SafeWriteJSON(userSocket, pingMessage)
 
 	//
 	return
@@ -256,9 +256,9 @@ func (r *Room) VoiceStream(userName string, userSocket *websocket.Conn, stream i
 // SetPrivateMessageCallback sets the callback function for when a *User sends a private message to another *User.
 // The function passed must have the same parameter types as the following example:
 //
-//    func onPrivateMessage(from *core.User, to *core.User, message interface{}) {
-//	     //code...
-//	 }
+//	   func onPrivateMessage(from *core.User, to *core.User, message interface{}) {
+//		     //code...
+//		 }
 func SetPrivateMessageCallback(cb func(*User, *User, interface{})) {
 	if !serverStarted {
 		privateMessageCallback = cb
@@ -270,9 +270,9 @@ func SetPrivateMessageCallback(cb func(*User, *User, interface{})) {
 // SetChatMessageCallback sets the callback function for when a *User sends a chat message to a *Room.
 // The function passed must have the same parameter types as the following example:
 //
-//    func onChatMessage(userName string, room *core.Room, message interface{}) {
-//	     //code...
-//	 }
+//	   func onChatMessage(userName string, room *core.Room, message interface{}) {
+//		     //code...
+//		 }
 func SetChatMessageCallback(cb func(string, *Room, interface{})) {
 	if !serverStarted {
 		chatMessageCallback = cb
@@ -283,9 +283,9 @@ func SetChatMessageCallback(cb func(string, *Room, interface{})) {
 // SetServerMessageCallback sets the callback function for when the server sends a message to a *Room.
 // The function passed must have the same parameter types as the following example:
 //
-//    func onServerMessage(room *core.Room, messageType int, message interface{}) {
-//	     //code...
-//	 }
+//	   func onServerMessage(room *core.Room, messageType int, message interface{}) {
+//		     //code...
+//		 }
 //
 // The messageType value can be one of: core.ServerMessageGame, core.ServerMessageNotice,
 // core.ServerMessageImportant, or a custom value you have set.

@@ -40,7 +40,7 @@ func (u *User) SetVariable(key string, value interface{}, connID string) {
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionSetVariable, resp, helpers.NoError())
 
 	//SEND RESPONSE TO CLIENT
-	socket.WriteJSON(clientResp)
+	helpers.SafeWriteJSON(socket, clientResp)
 }
 
 // SetVariables sets all the specified User variables at once. The client API of the User will also receive these changes. If you are using MultiConnect in ServerSettings, the connID
@@ -70,7 +70,7 @@ func (u *User) SetVariables(values map[string]interface{}, connID string) {
 
 	//SEND RESPONSE TO CLIENT
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionSetVariables, values, helpers.NoError())
-	socket.WriteJSON(clientResp)
+	helpers.SafeWriteJSON(socket, clientResp)
 
 }
 

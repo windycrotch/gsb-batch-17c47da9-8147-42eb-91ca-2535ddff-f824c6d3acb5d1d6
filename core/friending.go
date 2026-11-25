@@ -57,7 +57,7 @@ func (u *User) FriendRequest(friendName string) error {
 		}
 		friend.mux.Lock()
 		for _, conn := range friend.conns {
-			(*conn).socket.WriteJSON(message)
+			helpers.SafeWriteJSON((*conn).socket, message)
 		}
 		friend.mux.Unlock()
 	}
@@ -66,7 +66,7 @@ func (u *User) FriendRequest(friendName string) error {
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionFriendRequest, friendName, helpers.NoError())
 	u.mux.Lock()
 	for _, conn := range u.conns {
-		(*conn).socket.WriteJSON(clientResp)
+		helpers.SafeWriteJSON((*conn).socket, clientResp)
 	}
 	u.mux.Unlock()
 
@@ -127,7 +127,7 @@ func (u *User) AcceptFriendRequest(friendName string) error {
 		}
 		friend.mux.Lock()
 		for _, conn := range friend.conns {
-			(*conn).socket.WriteJSON(message)
+			helpers.SafeWriteJSON((*conn).socket, message)
 		}
 		fStatus = friend.status
 		friend.mux.Unlock()
@@ -143,7 +143,7 @@ func (u *User) AcceptFriendRequest(friendName string) error {
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionAcceptFriend, responseMap, helpers.NoError())
 	u.mux.Lock()
 	for _, conn := range u.conns {
-		(*conn).socket.WriteJSON(clientResp)
+		helpers.SafeWriteJSON((*conn).socket, clientResp)
 	}
 	u.mux.Unlock()
 
@@ -203,7 +203,7 @@ func (u *User) DeclineFriendRequest(friendName string) error {
 		}
 		friend.mux.Lock()
 		for _, conn := range friend.conns {
-			(*conn).socket.WriteJSON(message)
+			helpers.SafeWriteJSON((*conn).socket, message)
 		}
 		friend.mux.Unlock()
 	}
@@ -212,7 +212,7 @@ func (u *User) DeclineFriendRequest(friendName string) error {
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionDeclineFriend, friendName, helpers.NoError())
 	u.mux.Lock()
 	for _, conn := range u.conns {
-		(*conn).socket.WriteJSON(clientResp)
+		helpers.SafeWriteJSON((*conn).socket, clientResp)
 	}
 	u.mux.Unlock()
 
@@ -272,7 +272,7 @@ func (u *User) RemoveFriend(friendName string) error {
 		}
 		friend.mux.Lock()
 		for _, conn := range friend.conns {
-			(*conn).socket.WriteJSON(message)
+			helpers.SafeWriteJSON((*conn).socket, message)
 		}
 		friend.mux.Unlock()
 	}
@@ -281,7 +281,7 @@ func (u *User) RemoveFriend(friendName string) error {
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionRemoveFriend, friendName, helpers.NoError())
 	u.mux.Lock()
 	for _, conn := range u.conns {
-		(*conn).socket.WriteJSON(clientResp)
+		helpers.SafeWriteJSON((*conn).socket, clientResp)
 	}
 	u.mux.Unlock()
 
@@ -300,7 +300,7 @@ func (u *User) sendToFriends(message interface{}) {
 			if friendErr == nil {
 				friend.mux.Lock()
 				for _, friendConn := range friend.conns {
-					(*friendConn).socket.WriteJSON(message)
+					helpers.SafeWriteJSON((*friendConn).socket, message)
 				}
 				friend.mux.Unlock()
 			}

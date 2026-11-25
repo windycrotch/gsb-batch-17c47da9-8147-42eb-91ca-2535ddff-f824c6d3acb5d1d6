@@ -9,6 +9,6 @@ func TestStartAndStop(t *testing.T) {
 	go Start(nil)
 	time.Sleep(time.Second * 2)
 	if sdErr := ShutDown(); sdErr != nil {
-		t.Errorf(sdErr.Error())
+		t.Errorf("ShutDown returned an error: %v", sdErr)
 	}
 }

@@ -75,17 +75,16 @@ const (
 //
 // (*)Callback function format:
 //
-//     func yourFunction(actionData interface{}, client *Client) {
-//         //...
+//	func yourFunction(actionData interface{}, client *Client) {
+//	    //...
 //
-//         // optional client response
-//         client.Respond("example", nil);
-//     }
+//	    // optional client response
+//	    client.Respond("example", nil);
+//	}
 //
 // - actionData: The data the client sent along with the action
 //
 // - client: A `Client` object representing the client that sent the action
-//
 //
 // Note: This function can only be called BEFORE starting the server.
 func New(actionType string, dataType int, callback func(interface{}, *Client)) error {
@@ -133,7 +132,6 @@ func HandleCustomClientAction(action string, data interface{}, user *core.User, 
 	}
 }
 
-//
 func typesMatch(data interface{}, theType int) bool {
 	switch data.(type) {
 	case bool:
@@ -222,7 +220,7 @@ func (c *Client) Respond(response interface{}, err ClientError) {
 		r[helpers.ServerActionCustomClientActionResponse]["r"] = response
 	}
 	//SEND MESSAGE TO CLIENT
-	(*c).socket.WriteJSON(r)
+	helpers.SafeWriteJSON((*c).socket, r)
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////

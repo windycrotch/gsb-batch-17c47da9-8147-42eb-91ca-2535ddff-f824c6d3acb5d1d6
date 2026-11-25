@@ -28,9 +28,8 @@ type RoomType struct {
 // Though you can always make a CustomClientAction to create a Room, initialize it, send requests, etc.
 // When making a new RoomType you can chain the broadcasts and callbacks you want for it like so:
 //
-//    rooms.NewRoomType("lobby", true).EnableBroadcastUserEnter().EnableBroadcastUserLeave().
-//         .SetCreateCallback(yourFunc).SetDeleteCallback(anotherFunc)
-//
+//	rooms.NewRoomType("lobby", true).EnableBroadcastUserEnter().EnableBroadcastUserLeave().
+//	     .SetCreateCallback(yourFunc).SetDeleteCallback(anotherFunc)
 func NewRoomType(name string, serverOnly bool) *RoomType {
 	if len(name) == 0 {
 		return &RoomType{}

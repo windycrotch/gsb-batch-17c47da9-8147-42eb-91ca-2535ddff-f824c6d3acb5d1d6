@@ -129,7 +129,7 @@ func Login(userName string, dbID int, autologPass string, isGuest bool, remMe bo
 				(*(*conn).clientMux).Unlock()
 				// Send logout message to client
 				clientResp := helpers.MakeClientResponse(helpers.ClientActionLogout, nil, helpers.NoError())
-				(*conn).socket.WriteJSON(clientResp)
+				helpers.SafeWriteJSON((*conn).socket, clientResp)
 			}
 			userOnline.mux.Unlock()
 
@@ -220,8 +220,8 @@ func Login(userName string, dbID int, autologPass string, isGuest bool, remMe bo
 	var responseVal map[string]interface{}
 	if rememberMe && len(autologPass) > 0 && remMe {
 		responseVal = map[string]interface{}{
-			"n": userName,
-			"f": friends,
+			"n":  userName,
+			"f":  friends,
 			"ai": dbID,
 			"ap": autologPass,
 		}
@@ -232,7 +232,7 @@ func Login(userName string, dbID int, autologPass string, isGuest bool, remMe bo
 		}
 	}
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionLogin, responseVal, helpers.NoError())
-	socket.WriteJSON(clientResp)
+	helpers.SafeWriteJSON(socket, clientResp)
 
 	//
 	return connID, helpers.NoError()
@@ -240,7 +240,7 @@ func Login(userName string, dbID int, autologPass string, isGuest bool, remMe bo
 
 func makeFriendsResponse(friendsMap map[string]*database.Friend) []map[string]interface{} {
 	friends := make([]map[string]interface{}, len(friendsMap), len(friendsMap))
-	i := 0;
+	i := 0
 	for _, val := range friendsMap {
 		frs := val.RequestStatus()
 		friendEntry := map[string]interface{}{
@@ -256,7 +256,7 @@ func makeFriendsResponse(friendsMap map[string]*database.Friend) []map[string]in
 			}
 		}
 		friends[i] = friendEntry
-		i++;
+		i++
 	}
 	return friends
 }
@@ -346,7 +346,7 @@ func (u *User) Logout(connID string) {
 
 	// Send response
 	clientResp := helpers.MakeClientResponse(helpers.ClientActionLogout, nil, helpers.NoError())
-	socket.WriteJSON(clientResp)
+	helpers.SafeWriteJSON(socket, clientResp)
 
 	// Run callback
 	if LogoutCallback != nil {
@@ -388,7 +388,7 @@ func (u *User) Kick() {
 		(*conn).clientMux.Unlock()
 
 		// Send response
-		(*conn).socket.WriteJSON(clientResp)
+		helpers.SafeWriteJSON((*conn).socket, clientResp)
 	}
 
 	u.mux.Unlock()
@@ -571,7 +571,7 @@ func (u *User) Invite(invUser *User, connID string) error {
 	// Send response to all connections
 	invUser.mux.Lock()
 	for _, conn := range invUser.conns {
-		(*conn).socket.WriteJSON(invMessage)
+		helpers.SafeWriteJSON((*conn).socket, invMessage)
 	}
 	invUser.mux.Unlock()
 

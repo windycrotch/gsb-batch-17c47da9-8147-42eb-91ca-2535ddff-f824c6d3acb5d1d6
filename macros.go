@@ -10,10 +10,16 @@ import (
 )
 
 func macroListener() {
+	reader := bufio.NewReader(os.Stdin)
 	for {
-		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("[Gopher] Command: ")
-		text, _ := reader.ReadString('\n')
+		text, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			// stdin is closed/EOF (common in tests or background runs). Stop
+			// listening instead of spinning on the immediately-returning read.
+			fmt.Println()
+			return
+		}
 		text = strings.TrimSpace(text)
 		stop := handleMacro(text)
 		if stop {
