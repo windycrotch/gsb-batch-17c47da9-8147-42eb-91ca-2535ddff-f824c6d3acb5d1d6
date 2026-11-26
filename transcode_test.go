@@ -27,6 +27,12 @@ func TestTranscode(t *testing.T) {
 			logf("(unknown %x) %s", ptr, line)
 		}
 	})
+	// The callback is process-global and captures this test's T; detach it
+	// when the test finishes so later tests/repeated runs cannot log through
+	// a completed T.
+	t.Cleanup(func() {
+		goff.LogSetCallback(goff.LogLevel_QUIET, nil)
+	})
 
 	must := func(err error) {
 		if err != nil {

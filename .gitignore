@@ -1,2 +1,5 @@
 /vendor_c
 out.mp4
+# Local FFmpeg runtime shims copied next to the test package so plain
+# `go test -race` finds av*.dll on this Windows evaluation machine.
+/*.dll

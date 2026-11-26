@@ -1,6 +1,8 @@
 package goff
 
-//#cgo pkg-config: libavutil libavformat libavcodec libswscale
+//#cgo !windows pkg-config: libavutil libavformat libavcodec libswscale
+//#cgo windows CFLAGS: -IC:/ffmpeg-dl/441/ffmpeg-4.4.1-full_build-shared/include
+//#cgo windows LDFLAGS: -LC:/ffmpeg-dl/441/ffmpeg-4.4.1-full_build-shared/lib -lavformat -lavcodec -lswscale -lavutil
 //#include <stdio.h>
 //#include <stdlib.h>
 //#include <inttypes.h>
@@ -62,7 +64,12 @@ func BoolToInt(b bool) C.int {
 	return 0
 }
 
-type CodecContext = C.struct_AVCodecContext
+// CodecContext is the Go-defined receiver type for an AVCodecContext.
+//
+// It is a defined type (not an alias) so that methods can be declared on it
+// with all Go toolchains, including Go 1.27+, which reject methods on aliases
+// of cgo-generated types. Pointer conversions at the cgo boundary are explicit.
+type CodecContext C.struct_AVCodecContext
 
 // Initialize the AVCodecContext to use the given AVCodec.
 //
@@ -78,13 +85,14 @@ type CodecContext = C.struct_AVCodecContext
 // Note: Always call this function before using decoding routines (such as
 // avcodec_receive_frame()).
 func (cctx *CodecContext) Open2(codec *Codec, options **Dictionary) error {
-	return CheckErr(C.avcodec_open2(cctx, codec, options))
+	return CheckErr(C.avcodec_open2((*C.struct_AVCodecContext)(cctx), (*C.struct_AVCodec)(codec), (**C.struct_AVDictionary)(unsafe.Pointer(options))))
 }
 
 // Free the codec context and everything associated with it and write NULL to
 // the provided pointer.
 func (cctx *CodecContext) Free() {
-	C.avcodec_free_context(&cctx)
+	p := (*C.struct_AVCodecContext)(cctx)
+	C.avcodec_free_context(&p)
 }
 
 func (cctx *CodecContext) CodecID() CodecID {
@@ -136,11 +144,11 @@ func (cctx *CodecContext) SetPixelFormat(pf PixelFormat) {
 }
 
 func (cctx *CodecContext) TimeBase() Rational {
-	return cctx.time_base
+	return Rational(cctx.time_base)
 }
 
 func (cctx *CodecContext) SetTimeBase(tb Rational) {
-	cctx.time_base = tb
+	cctx.time_base = C.struct_AVRational(tb)
 }
 
 func (cctx *CodecContext) Width() int {
@@ -254,7 +262,7 @@ func (cctx *CodecContext) PrivData() unsafe.Pointer {
 //     AVERROR(EINVAL): codec not opened, or it is an encoder other errors:
 //     legitimate decoding errors
 func (cctx *CodecContext) ReceivePacket(pkt *Packet) error {
-	return CheckErr(C.avcodec_receive_packet(cctx, pkt))
+	return CheckErr(C.avcodec_receive_packet((*C.struct_AVCodecContext)(cctx), (*C.struct_AVPacket)(pkt)))
 }
 
 // Supply raw packet data as input to a decoder.
@@ -275,7 +283,7 @@ func (cctx *CodecContext) ReceivePacket(pkt *Packet) error {
 //     The AVCodecContext MUST have been opened with avcodec_open2() before packets
 //     may be fed to the decoder.
 func (cctx *CodecContext) SendPacket(pkt *Packet) error {
-	return CheckErr(C.avcodec_send_packet(cctx, pkt))
+	return CheckErr(C.avcodec_send_packet((*C.struct_AVCodecContext)(cctx), (*C.struct_AVPacket)(pkt)))
 }
 
 // Return decoded output data from a decoder.
@@ -291,7 +299,7 @@ func (cctx *CodecContext) SendPacket(pkt *Packet) error {
 // AVERROR(EINVAL): codec not opened, or it is an encoder other negative values:
 // legitimate decoding errors
 func (cctx *CodecContext) ReceiveFrame(frame *Frame) error {
-	return CheckErr(C.avcodec_receive_frame(cctx, frame))
+	return CheckErr(C.avcodec_receive_frame((*C.struct_AVCodecContext)(cctx), (*C.struct_AVFrame)(frame)))
 }
 
 // Supply a raw video or audio frame to the encoder.
@@ -317,7 +325,7 @@ func (cctx *CodecContext) ReceiveFrame(frame *Frame) error {
 // Returns
 //     0 on success, otherwise negative error code: AVERROR(EAGAIN): input is not accepted in the current state - user must read output with avcodec_receive_packet() (once all output is read, the packet should be resent, and the call will not fail with EAGAIN). AVERROR_EOF: the encoder has been flushed, and no new frames can be sent to it AVERROR(EINVAL): codec not opened, refcounted_frames not set, it is a decoder, or requires flush AVERROR(ENOMEM): failed to add packet to internal queue, or similar other errors: legitimate decoding errors
 func (cctx *CodecContext) SendFrame(frame *Frame) error {
-	return CheckErr(C.avcodec_send_frame(cctx, frame))
+	return CheckErr(C.avcodec_send_frame((*C.struct_AVCodecContext)(cctx), (*C.struct_AVFrame)(frame)))
 }
 
 type Profile = C.int
@@ -420,7 +428,7 @@ var (
 	Profile_SBC_MSBC Profile = C.FF_PROFILE_SBC_MSBC
 )
 
-type Codec = C.struct_AVCodec
+type Codec C.struct_AVCodec
 
 // Allocate an AVCodecContext and set its fields to default values.
 //
@@ -436,7 +444,7 @@ type Codec = C.struct_AVCodec
 // Returns
 //     An AVCodecContext filled with default values or NULL on failure.
 func (codec *Codec) AllocContext3() *CodecContext {
-	return C.avcodec_alloc_context3(codec)
+	return (*CodecContext)(C.avcodec_alloc_context3((*C.struct_AVCodec)(codec)))
 }
 
 func (codec *Codec) String() string {
@@ -473,7 +481,7 @@ func (cid CodecID) C() C.enum_AVCodecID {
 // Returns
 //   A decoder if one was found, NULL otherwise.
 func (cid CodecID) FindDecoder() *Codec {
-	return C.avcodec_find_decoder(cid.C())
+	return (*Codec)(C.avcodec_find_decoder(cid.C()))
 }
 
 // Find a registered encoder with a matching codec ID.
@@ -484,7 +492,7 @@ func (cid CodecID) FindDecoder() *Codec {
 // Returns
 //   An encoder if one was found, NULL otherwise.
 func (cid CodecID) FindEncoder() *Codec {
-	return C.avcodec_find_encoder(cid.C())
+	return (*Codec)(C.avcodec_find_encoder(cid.C()))
 }
 
 var (
@@ -962,7 +970,7 @@ var (
 	CodecID_WRAPPED_AVFRAME CodecID = C.AV_CODEC_ID_WRAPPED_AVFRAME
 )
 
-type CodecParameters = C.struct_AVCodecParameters
+type CodecParameters C.struct_AVCodecParameters
 
 func (cp *CodecParameters) CodecType() MediaType {
 	return MediaType(cp.codec_type)
@@ -989,7 +997,7 @@ func (cp *CodecParameters) SampleFormat() SampleFormat {
 // Returns
 //     >= 0 on success, a negative AVERROR code on failure.
 func (cp *CodecParameters) ToContext(cctx *CodecContext) error {
-	return CheckErr(C.avcodec_parameters_to_context(cctx, cp))
+	return CheckErr(C.avcodec_parameters_to_context((*C.struct_AVCodecContext)(cctx), (*C.struct_AVCodecParameters)(cp)))
 }
 
 // Fill the parameters struct based on the values from the supplied codec
@@ -1001,15 +1009,15 @@ func (cp *CodecParameters) ToContext(cctx *CodecContext) error {
 // Returns
 //     >= 0 on success, a negative AVERROR code on failure
 func (cp *CodecParameters) FromContext(cctx *CodecContext) error {
-	return CheckErr(C.avcodec_parameters_from_context(cp, cctx))
+	return CheckErr(C.avcodec_parameters_from_context((*C.struct_AVCodecParameters)(cp), (*C.struct_AVCodecContext)(cctx)))
 }
 
 func (cp *CodecParameters) Copy(cpDest *CodecParameters) error {
-	return CheckErr(C.avcodec_parameters_copy(cp, cpDest))
+	return CheckErr(C.avcodec_parameters_copy((*C.struct_AVCodecParameters)(cp), (*C.struct_AVCodecParameters)(cpDest)))
 }
 
-type Dictionary = C.struct_AVDictionary
-type DictionaryEntry = C.struct_AVDictionaryEntry
+type Dictionary C.struct_AVDictionary
+type DictionaryEntry C.struct_AVDictionaryEntry
 type DictionaryFlags = C.int
 
 var (
@@ -1035,9 +1043,9 @@ var (
 // Returns
 //   0 on success, negative AVERROR code on failure. If dst was allocated by this function, callers should free the associated memory.
 func (d *Dictionary) Copy(flags DictionaryFlags) (*Dictionary, error) {
-	var dst *Dictionary
-	err := CheckErr(C.av_dict_copy(&dst, d, C.int(flags)))
-	return dst, err
+	var dst *C.struct_AVDictionary
+	err := CheckErr(C.av_dict_copy(&dst, (*C.struct_AVDictionary)(d), C.int(flags)))
+	return (*Dictionary)(dst), err
 }
 
 func (d *Dictionary) AsMap() map[string]string {
@@ -1058,13 +1066,13 @@ func (d *Dictionary) Keys() []string {
 	key_ := C.CString("")
 	defer FreeString(key_)
 
-	var entry *DictionaryEntry = nil
+	var entry *C.struct_AVDictionaryEntry = nil
 	for {
-		entry = C.av_dict_get(d, key_, entry, DictionaryFlags_IGNORE_SUFFIX)
+		entry = C.av_dict_get((*C.struct_AVDictionary)(d), key_, entry, DictionaryFlags_IGNORE_SUFFIX)
 		if entry == nil {
 			break
 		}
-		keys = append(keys, entry.Key())
+		keys = append(keys, (*DictionaryEntry)(entry).Key())
 	}
 	return keys
 }
@@ -1073,13 +1081,13 @@ func (d *Dictionary) Get(key string) (string, bool) {
 	key_ := CString(key)
 	defer FreeString(key_)
 
-	var entry *DictionaryEntry
-	entry = C.av_dict_get(d, key_, nil, 0)
+	var entry *C.struct_AVDictionaryEntry
+	entry = C.av_dict_get((*C.struct_AVDictionary)(d), key_, nil, 0)
 
 	if entry == nil {
 		return "", false
 	}
-	return entry.Value(), true
+	return (*DictionaryEntry)(entry).Value(), true
 }
 
 // Set the given entry in *pm, overwriting an existing entry.
@@ -1108,14 +1116,16 @@ func (d *Dictionary) Set(key string, value string) (*Dictionary, error) {
 	value_ := CString(value)
 	defer FreeString(value_)
 
-	err := CheckErr(C.av_dict_set(&d, key_, value_, 0))
-	return d, err
+	cd := (*C.struct_AVDictionary)(d)
+	err := CheckErr(C.av_dict_set(&cd, key_, value_, 0))
+	return (*Dictionary)(cd), err
 }
 
 // Free all the memory allocated for an AVDictionary struct and all keys and
 // values.
 func (d *Dictionary) Free() {
-	C.av_dict_free(&d)
+	cd := (*C.struct_AVDictionary)(d)
+	C.av_dict_free(&cd)
 }
 
 func (e *DictionaryEntry) Key() string {
@@ -1213,50 +1223,52 @@ var (
 	ERROR_HTTP_SERVER_ERROR ErrNum = C.AVERROR_HTTP_SERVER_ERROR
 )
 
-type FormatContext = C.struct_AVFormatContext
-type InputFormat = C.struct_AVInputFormat
-type OutputFormat = C.struct_AVOutputFormat
+type FormatContext C.struct_AVFormatContext
+type InputFormat C.struct_AVInputFormat
+type OutputFormat C.struct_AVOutputFormat
 
 // Open an input stream and read the header.
 //
 // The codecs are not opened. The stream must be closed with avformat_close_input().
 func FormatOpenInput(url string, format *InputFormat, options **Dictionary) (*FormatContext, error) {
-	var ctx *FormatContext
+	var ctx *C.struct_AVFormatContext
 
 	url_ := CString(url)
 	defer FreeString(url_)
 
-	ret := C.avformat_open_input(&ctx, url_, format, options)
-	return ctx, CheckErr(ret)
+	ret := C.avformat_open_input(&ctx, url_, (*C.struct_AVInputFormat)(format), (**C.struct_AVDictionary)(unsafe.Pointer(options)))
+	return (*FormatContext)(ctx), CheckErr(ret)
 }
 
 func FormatAllocOutputContext2(oformat *OutputFormat, formatName string, filename string) (*FormatContext, error) {
-	var ctx *FormatContext
+	var ctx *C.struct_AVFormatContext
 
 	formatName_ := CString(formatName)
 	defer FreeString(formatName_)
 	filename_ := CString(filename)
 	defer FreeString(filename_)
 
-	ret := C.avformat_alloc_output_context2(&ctx, oformat, formatName_, filename_)
-	return ctx, CheckErr(ret)
+	ret := C.avformat_alloc_output_context2(&ctx, (*C.struct_AVOutputFormat)(oformat), formatName_, filename_)
+	return (*FormatContext)(ctx), CheckErr(ret)
 }
 
 func FormatAllocContext() *FormatContext {
-	return C.avformat_alloc_context()
+	return (*FormatContext)(C.avformat_alloc_context())
 }
 
 func (ctx *FormatContext) OpenInput(url string, format *InputFormat, options **Dictionary) error {
 	url_ := CString(url)
 	defer FreeString(url_)
 
-	ret := C.avformat_open_input(&ctx, url_, format, options)
+	cctx := (*C.struct_AVFormatContext)(ctx)
+	ret := C.avformat_open_input(&cctx, url_, (*C.struct_AVInputFormat)(format), (**C.struct_AVDictionary)(unsafe.Pointer(options)))
 	return CheckErr(ret)
 }
 
 func (ctx *FormatContext) OpenReader(r *Reader, format *InputFormat, options **Dictionary) error {
 	ctx.SetPB(r.ctx)
-	ret := C.avformat_open_input(&ctx, nil, format, options)
+	cctx := (*C.struct_AVFormatContext)(ctx)
+	ret := C.avformat_open_input(&cctx, nil, (*C.struct_AVInputFormat)(format), (**C.struct_AVDictionary)(unsafe.Pointer(options)))
 	return CheckErr(ret)
 }
 
@@ -1278,35 +1290,35 @@ const (
 )
 
 func (ctx *FormatContext) Seek(streamIndex int, timestamp Timing, flags SeekFlag) error {
-	return CheckErr(C.av_seek_frame(ctx, C.int(streamIndex), timestamp, C.int(flags)))
+	return CheckErr(C.av_seek_frame((*C.struct_AVFormatContext)(ctx), C.int(streamIndex), C.int64_t(timestamp), C.int(flags)))
 }
 
 func (ctx *FormatContext) PB() *IOContext {
-	return ctx.pb
+	return (*IOContext)(ctx.pb)
 }
 
 func (ctx *FormatContext) SetPB(pb *IOContext) {
-	ctx.pb = pb
+	ctx.pb = (*C.struct_AVIOContext)(pb)
 }
 
 func (ctx *FormatContext) InputFormat() *InputFormat {
-	return ctx.iformat
+	return (*InputFormat)(ctx.iformat)
 }
 
 func (ctx *FormatContext) SetInputFormat(ifmt *InputFormat) {
-	ctx.iformat = ifmt
+	ctx.iformat = (*C.struct_AVInputFormat)(ifmt)
 }
 
 func (ctx *FormatContext) OutputFormat() *OutputFormat {
-	return ctx.oformat
+	return (*OutputFormat)(ctx.oformat)
 }
 
 func (ctx *FormatContext) SetOutputFormat(ofmt *OutputFormat) {
-	ctx.oformat = ofmt
+	ctx.oformat = (*C.struct_AVOutputFormat)(ofmt)
 }
 
 func (ctx *FormatContext) Free() {
-	C.avformat_free_context(ctx)
+	C.avformat_free_context((*C.struct_AVFormatContext)(ctx))
 }
 
 // Read packets of a media file to get stream information.
@@ -1316,7 +1328,7 @@ func (ctx *FormatContext) Free() {
 // logical file position is not changed by this function; examined packets may
 // be buffered for later processing.
 func (ctx *FormatContext) FindStreamInfo(options **Dictionary) error {
-	return CheckErr(C.avformat_find_stream_info(ctx, options))
+	return CheckErr(C.avformat_find_stream_info((*C.struct_AVFormatContext)(ctx), (**C.struct_AVDictionary)(unsafe.Pointer(options))))
 }
 
 // Number of elements in AVFormatContext.streams.
@@ -1326,7 +1338,7 @@ func (ctx *FormatContext) NbStreams() int {
 
 // Position of the first frame of the component, in AV_TIME_BASE fractional seconds.
 func (ctx *FormatContext) StartTime() Timing {
-	return ctx.start_time
+	return Timing(ctx.start_time)
 }
 
 // A list of all streams in the file.
@@ -1352,7 +1364,7 @@ func (ctx *FormatContext) Streams() []*Stream {
 // User is required to call avcodec_close() and avformat_free_context() to clean
 // up the allocation by avformat_new_stream().
 func (ctx *FormatContext) NewStream(c *Codec) *Stream {
-	return C.avformat_new_stream(ctx, c)
+	return (*Stream)(C.avformat_new_stream((*C.struct_AVFormatContext)(ctx), (*C.struct_AVCodec)(c)))
 }
 
 // Print detailed information about the input or output format, such as
@@ -1368,7 +1380,7 @@ func (ctx *FormatContext) DumpFormat(index int, url string, isOutput bool) {
 	url_ := CString(url)
 	defer FreeString(url_)
 
-	C.av_dump_format(ctx, C.int(index), url_, BoolToInt(isOutput))
+	C.av_dump_format((*C.struct_AVFormatContext)(ctx), C.int(index), url_, BoolToInt(isOutput))
 }
 
 // Return the next frame of a stream.
@@ -1395,7 +1407,7 @@ func (ctx *FormatContext) DumpFormat(index int, url string, isOutput bool) {
 // Returns
 //     0 if OK, < 0 on error or end of file
 func (ctx *FormatContext) ReadFrame(pkt *Packet) error {
-	return CheckErr(C.av_read_frame(ctx, pkt))
+	return CheckErr(C.av_read_frame((*C.struct_AVFormatContext)(ctx), (*C.struct_AVPacket)(pkt)))
 }
 
 // Write a packet to an output media file ensuring correct interleaving.
@@ -1428,7 +1440,7 @@ func (ctx *FormatContext) ReadFrame(pkt *Packet) error {
 // Returns
 //     0 on success, a negative AVERROR on error. Libavformat will always take care of freeing the packet, even if this function fails.
 func (ctx *FormatContext) InterleavedWriteFrame(pkt *Packet) error {
-	return CheckErr(C.av_interleaved_write_frame(ctx, pkt))
+	return CheckErr(C.av_interleaved_write_frame((*C.struct_AVFormatContext)(ctx), (*C.struct_AVPacket)(pkt)))
 }
 
 // Allocate the stream private data and write the stream header to an output media file.
@@ -1450,7 +1462,7 @@ func (ctx *FormatContext) InterleavedWriteFrame(pkt *Packet) error {
 // See Also
 //   av_opt_find, av_dict_set, avio_open, av_oformat_next, avformat_init_output.
 func (ctx *FormatContext) WriteHeader(options **Dictionary) error {
-	return CheckErr(C.avformat_write_header(ctx, options))
+	return CheckErr(C.avformat_write_header((*C.struct_AVFormatContext)(ctx), (**C.struct_AVDictionary)(unsafe.Pointer(options))))
 }
 
 // Write the stream trailer to an output media file and free the file private data.
@@ -1463,7 +1475,7 @@ func (ctx *FormatContext) WriteHeader(options **Dictionary) error {
 // Returns
 //     0 if OK, AVERROR_xxx on error
 func (ctx *FormatContext) WriteTrailer() error {
-	return CheckErr(C.av_write_trailer(ctx))
+	return CheckErr(C.av_write_trailer((*C.struct_AVFormatContext)(ctx)))
 }
 
 // Return the output format in the list of registered output formats which best matches the provided parameters, or return NULL if there is no match.
@@ -1485,7 +1497,15 @@ func GuessFormat(shortName string, filename string, mimeType string) *OutputForm
 	mimeType_ := CString(mimeType)
 	defer FreeString(mimeType_)
 
-	return C.av_guess_format(shortName_, filename_, mimeType_)
+	return (*OutputFormat)(C.av_guess_format(shortName_, filename_, mimeType_))
+}
+
+func (ifmt *InputFormat) Name() string {
+	return C.GoString(ifmt.name)
+}
+
+func (ifmt *InputFormat) LongName() string {
+	return C.GoString(ifmt.long_name)
 }
 
 func (of *OutputFormat) Name() string {
@@ -1512,7 +1532,7 @@ func (of *OutputFormat) VideoCodec() CodecID {
 	return CodecID(of.video_codec)
 }
 
-type Frame = C.struct_AVFrame
+type Frame C.struct_AVFrame
 
 // Allocate an AVFrame and set its fields to default values.
 //
@@ -1525,14 +1545,15 @@ type Frame = C.struct_AVFrame
 //     this only allocates the AVFrame itself, not the data buffers. Those must be
 //     allocated through other means, e.g. with av_frame_get_buffer() or manually.
 func FrameAlloc() *Frame {
-	return C.av_frame_alloc()
+	return (*Frame)(C.av_frame_alloc())
 }
 
 // Free the frame and any dynamically allocated objects in it, e.g.
 //
 // extended_data. If the frame is reference counted, it will be unreferenced first.
 func (frame *Frame) Free() {
-	C.av_frame_free(&frame)
+	p := (*C.struct_AVFrame)(frame)
+	C.av_frame_free(&p)
 }
 
 // Allocate new buffer(s) for audio or video data.
@@ -1560,7 +1581,7 @@ func (frame *Frame) Free() {
 // Returns
 // 0 on success, a negative AVERROR on error.
 func (frame *Frame) GetBuffer(align int) error {
-	return CheckErr(C.av_frame_get_buffer(frame, C.int(align)))
+	return CheckErr(C.av_frame_get_buffer((*C.struct_AVFrame)(frame), C.int(align)))
 }
 
 // Ensure that the frame data is writable, avoiding data copy if possible.
@@ -1571,31 +1592,31 @@ func (frame *Frame) GetBuffer(align int) error {
 // Returns
 //     0 on success, a negative AVERROR on error.
 func (frame *Frame) MakeWritable() error {
-	return CheckErr(C.av_frame_make_writable(frame))
+	return CheckErr(C.av_frame_make_writable((*C.struct_AVFrame)(frame)))
 }
 
 // Presentation timestamp in time_base units (time when frame should be shown to user).
 func (frame *Frame) Pts() Timing {
-	return frame.pts
+	return Timing(frame.pts)
 }
 
 func (frame *Frame) SetPts(pts Timing) {
-	frame.pts = pts
+	frame.pts = C.int64_t(pts)
 }
 
 // frame timestamp estimated using various heuristics, in stream time base
 func (frame *Frame) BestEffortTimestamp() Timing {
-	return frame.best_effort_timestamp
+	return Timing(frame.best_effort_timestamp)
 }
 
 // DTS copied from the AVPacket that triggered returning this frame.
 func (frame *Frame) PktDts() Timing {
-	return frame.pkt_dts
+	return Timing(frame.pkt_dts)
 }
 
 // duration of the corresponding packet, expressed in AVStream->time_base units, 0 if unknown.
 func (frame *Frame) PktDuration() Timing {
-	return frame.pkt_duration
+	return Timing(frame.pkt_duration)
 }
 
 func (frame *Frame) Width() int {
@@ -1667,7 +1688,7 @@ var (
 	IO_FLAG_READ_WRITE IOFlags = C.AVIO_FLAG_READ_WRITE
 )
 
-type IOContext = C.AVIOContext
+type IOContext C.AVIOContext
 
 // Create and initialize a AVIOContext for accessing the resource indicated by url.
 //
@@ -1685,9 +1706,9 @@ func IOOpen(url string, flags IOFlags) (*IOContext, error) {
 	url_ := CString(url)
 	defer FreeString(url_)
 
-	var ctx *IOContext
+	var ctx *C.AVIOContext
 	err := CheckErr(C.avio_open(&ctx, url_, C.int(flags)))
-	return ctx, err
+	return (*IOContext)(ctx), err
 }
 
 type Reader struct {
@@ -1697,6 +1718,9 @@ type Reader struct {
 	id    int32
 	freed bool
 	err   error
+
+	// mu serializes FFmpeg/Go callbacks with Free and protects freed/err/ctx.
+	mu sync.Mutex
 }
 
 type Writer struct {
@@ -1705,9 +1729,31 @@ type Writer struct {
 	id    int32
 	freed bool
 	err   error
+
+	mu sync.Mutex
 }
 
-var bridgeSeed int32 = 1
+// Lifecycle errors recorded via Error after a Reader/Writer has been freed.
+//
+// They are plain sentinel errors, deliberately different from FFmpeg
+// EOF/EAGAIN *Error values, so a use-after-free is distinguishable from a
+// normal EOF or "try again" condition (errors.Is(err, goff.ErrReleased)).
+var (
+	ErrReleased = errors.New("goff: AVIO bridge released")
+	// ErrReaderReleased is recorded by Reader.Free when no I/O error is sticky.
+	ErrReaderReleased = fmt.Errorf("goff reader used after Free: already closed/freed/released (%w)", ErrReleased)
+	// ErrWriterReleased is recorded by Writer.Free when no I/O error is sticky.
+	ErrWriterReleased = fmt.Errorf("goff writer used after Free: already closed/freed/released (%w)", ErrReleased)
+)
+
+// bridgeSeed is the high base for bridge object ids.
+//
+// IDs are smuggled through the AVIOContext opaque void pointer as their
+// numeric value (never dereferenced). Starting above 4096 (the runtime's
+// minLegalPointer) keeps the unavoidable unsafe.Pointer(uintptr(id))
+// conversion legal under checkptr, which "go test -race" enables.
+var bridgeSeed int32 = 1 << 20
+
 var readers sync.Map
 var writers sync.Map
 
@@ -1737,6 +1783,11 @@ func finalizeWriter(obj *Writer) {
 	obj.Free()
 }
 
+// The AVIOContext opaque slot carries the numeric bridge id (not a real Go
+// pointer), so checkptr's pointer-arithmetic verification must not instrument
+// the cgo call wrapper below.
+//
+//go:nocheckptr
 func NewReader(inner io.ReadSeeker, size int64) *Reader {
 	r := &Reader{
 		inner: inner,
@@ -1747,7 +1798,7 @@ func NewReader(inner io.ReadSeeker, size int64) *Reader {
 
 	bufferSize := 4 * 1024 // 4KB, see doc for `avio_alloc_context`
 	buffer := C.av_malloc(C.size_t(bufferSize))
-	r.ctx = C.avio_alloc_context(
+	r.ctx = (*IOContext)(C.avio_alloc_context(
 		(*C.uchar)(buffer),            // buffer
 		C.int(bufferSize),             // buffer_size
 		0,                             // write_flag
@@ -1755,10 +1806,13 @@ func NewReader(inner io.ReadSeeker, size int64) *Reader {
 		CCallback(C.goff_reader_read_packet_trampoline), // read_packet
 		nil,                                      // write_packet
 		CCallback(C.goff_reader_seek_trampoline), // seek
-	)
+	))
 	return r
 }
 
+// See NewReader: opaque holds a numeric bridge id rather than a valid pointer.
+//
+//go:nocheckptr
 func NewWriter(inner io.WriteSeeker) *Writer {
 	w := &Writer{
 		inner: inner,
@@ -1768,7 +1822,7 @@ func NewWriter(inner io.WriteSeeker) *Writer {
 
 	bufferSize := 4 * 1024 // 4KB, see doc for `avio_alloc_context`
 	buffer := C.av_malloc(C.size_t(bufferSize))
-	w.ctx = C.avio_alloc_context(
+	w.ctx = (*IOContext)(C.avio_alloc_context(
 		(*C.uchar)(buffer), // buffer
 		C.int(bufferSize),  // buffer_size
 		1,                  // write_flag
@@ -1776,98 +1830,139 @@ func NewWriter(inner io.WriteSeeker) *Writer {
 		nil, // read_packet
 		CCallback(C.goff_writer_write_packet_trampoline), // write_packet
 		CCallback(C.goff_writer_seek_trampoline),         // seek
-	)
+	))
 	return w
 }
 
-// Free deallocates all associated resoures with a Reader
+// Free deallocates all associated resources with a Reader.
+//
+// Free is safe to call concurrently and repeatedly: the C buffer and
+// AVIOContext are released at most once, and later calls are no-ops. Free
+// waits for any in-flight callback to finish before releasing C memory, so a
+// callback can never race with teardown.
 func (r *Reader) Free() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.freed {
 		return
 	}
-
 	r.freed = true
+	if r.err == nil {
+		// Keep a pre-existing underlying I/O error observable; only record the
+		// released sentinel when no more specific failure is known.
+		r.err = ErrReaderReleased
+	}
+
 	freeReaderId(r.id)
-	C.av_free(unsafe.Pointer(r.ctx.buffer))
-	r.ctx.buffer = nil
-	C.avio_context_free(&r.ctx)
+
+	if r.ctx != nil {
+		ctxp := (*C.AVIOContext)(r.ctx)
+		if ctxp.buffer != nil {
+			C.av_free(unsafe.Pointer(ctxp.buffer))
+			ctxp.buffer = nil
+		}
+		C.avio_context_free(&ctxp)
+		r.ctx = (*IOContext)(ctxp) // avio_context_free sets ctxp to NULL
+	}
+
+	runtime.SetFinalizer(r, nil)
 }
 
-// Free deallocates all associated resoures with a Reader
+// Free deallocates all associated resources with a Writer.
+//
+// It is idempotent and always returns nil; Writer.Error carries lifecycle and
+// I/O failures.
 func (w *Writer) Free() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if w.freed {
 		return nil
 	}
-
 	w.freed = true
+	if w.err == nil {
+		w.err = ErrWriterReleased
+	}
+
 	freeWriterId(w.id)
-	C.av_free(unsafe.Pointer(w.ctx.buffer))
-	w.ctx.buffer = nil
-	C.avio_context_free(&w.ctx)
+
+	if w.ctx != nil {
+		ctxp := (*C.AVIOContext)(w.ctx)
+		if ctxp.buffer != nil {
+			C.av_free(unsafe.Pointer(ctxp.buffer))
+			ctxp.buffer = nil
+		}
+		C.avio_context_free(&ctxp)
+		w.ctx = (*IOContext)(ctxp)
+	}
+
+	runtime.SetFinalizer(w, nil)
 	return nil
 }
 
-// Error returns the last error of a reader, if any
+// Error returns the sticky error of a reader, if any.
+//
+// It is either the first underlying Read/Seek failure or the released
+// sentinel after Free. Safe for concurrent use.
 func (r *Reader) Error() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.err
 }
 
-// Error returns the last error of a writer, if any
+// Error returns the sticky error of a writer, if any.
 func (w *Writer) Error() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.err
 }
 
-//export goff_reader_read_packet
-func goff_reader_read_packet(opaque unsafe.Pointer, buf unsafe.Pointer, bufSize int) int {
-	id := int32(uintptr(opaque))
-	p, ok := readers.Load(id)
-	if !ok {
-		return C.AVERROR_EXTERNAL
+func bridgeBuffer(buf unsafe.Pointer, bufSize int) []byte {
+	if buf == nil || bufSize <= 0 {
+		return nil
 	}
-
-	r, ok := (p).(*Reader)
-	if !ok {
-		return C.AVERROR_EXTERNAL
-	}
-
-	if r.err != nil {
-		return C.AVERROR_EXTERNAL
-	}
-
 	h := reflect.SliceHeader{
 		Data: uintptr(buf),
 		Cap:  bufSize,
 		Len:  bufSize,
 	}
-	goBuf := *(*[]byte)(unsafe.Pointer(&h))
+	return *(*[]byte)(unsafe.Pointer(&h))
+}
+
+// readerRead is the state-checked read logic. r.mu is held for the whole
+// operation so Free cannot release the C context concurrently. It only uses
+// buf (supplied by FFmpeg/the caller) and r.inner, never r.ctx.buffer.
+func (r *Reader) readerRead(goBuf []byte) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.freed || r.err != nil {
+		return int(C.AVERROR_EXTERNAL)
+	}
 
 	readBytes, err := r.inner.Read(goBuf)
 	if err != nil {
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			if readBytes == 0 {
-				return C.AVERROR_EOF
-			} else {
-				return readBytes
+				return int(C.AVERROR_EOF)
 			}
+			return readBytes
 		}
 
+		// Sticky failure: subsequent callbacks short-circuit above.
 		r.err = err
-		return C.AVERROR_EXTERNAL
+		return int(C.AVERROR_EXTERNAL)
 	}
 
 	return readBytes
 }
 
-//export goff_reader_seek
-func goff_reader_seek(opaque unsafe.Pointer, offset int64, whence int) int64 {
-	id := int32(uintptr(opaque))
-	p, ok := readers.Load(id)
-	if !ok {
-		return -1
-	}
+func (r *Reader) readerSeek(offset int64, whence int) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	r, ok := (p).(*Reader)
-	if !ok {
+	if r.freed || r.err != nil {
 		return -1
 	}
 
@@ -1886,49 +1981,29 @@ func goff_reader_seek(opaque unsafe.Pointer, offset int64, whence int) int64 {
 	return newOffset
 }
 
-//export goff_writer_write_packet
-func goff_writer_write_packet(opaque unsafe.Pointer, buf unsafe.Pointer, bufSize int) int {
-	id := int32(uintptr(opaque))
-	p, ok := writers.Load(id)
-	if !ok {
-		return C.AVERROR_EXTERNAL
-	}
+func (w *Writer) writerWrite(goBuf []byte) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	w, ok := (p).(*Writer)
-	if !ok {
-		return C.AVERROR_EXTERNAL
+	if w.freed || w.err != nil {
+		// Sticky failure/release: the underlying Writer must not be touched again.
+		return int(C.AVERROR_EXTERNAL)
 	}
-
-	if w.err != nil {
-		return C.AVERROR_EXTERNAL
-	}
-
-	h := reflect.SliceHeader{
-		Data: uintptr(buf),
-		Cap:  bufSize,
-		Len:  bufSize,
-	}
-	goBuf := *(*[]byte)(unsafe.Pointer(&h))
 
 	writtenBytes, err := w.inner.Write(goBuf)
 	if err != nil {
 		w.err = err
-		return C.AVERROR_EXTERNAL
+		return int(C.AVERROR_EXTERNAL)
 	}
 
 	return writtenBytes
 }
 
-//export goff_writer_seek
-func goff_writer_seek(opaque unsafe.Pointer, offset int64, whence int) int64 {
-	id := int32(uintptr(opaque))
-	p, ok := writers.Load(id)
-	if !ok {
-		return -1
-	}
+func (w *Writer) writerSeek(offset int64, whence int) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	w, ok := (p).(*Writer)
-	if !ok {
+	if w.freed || w.err != nil {
 		return -1
 	}
 
@@ -1947,16 +2022,82 @@ func goff_writer_seek(opaque unsafe.Pointer, offset int64, whence int) int64 {
 	return newOffset
 }
 
+//export goff_reader_read_packet
+func goff_reader_read_packet(opaque unsafe.Pointer, buf unsafe.Pointer, bufSize int) int {
+	id := int32(uintptr(opaque))
+	p, ok := readers.Load(id)
+	if !ok {
+		// Never registered, or Free already removed the id. The caller still
+		// holds the Reader and can inspect Reader.Error for the released cause.
+		return int(C.AVERROR_EXTERNAL)
+	}
+
+	r, ok := p.(*Reader)
+	if !ok {
+		return int(C.AVERROR_EXTERNAL)
+	}
+
+	return r.readerRead(bridgeBuffer(buf, bufSize))
+}
+
+//export goff_reader_seek
+func goff_reader_seek(opaque unsafe.Pointer, offset int64, whence int) int64 {
+	id := int32(uintptr(opaque))
+	p, ok := readers.Load(id)
+	if !ok {
+		return -1
+	}
+
+	r, ok := p.(*Reader)
+	if !ok {
+		return -1
+	}
+
+	return r.readerSeek(offset, whence)
+}
+
+//export goff_writer_write_packet
+func goff_writer_write_packet(opaque unsafe.Pointer, buf unsafe.Pointer, bufSize int) int {
+	id := int32(uintptr(opaque))
+	p, ok := writers.Load(id)
+	if !ok {
+		return int(C.AVERROR_EXTERNAL)
+	}
+
+	w, ok := p.(*Writer)
+	if !ok {
+		return int(C.AVERROR_EXTERNAL)
+	}
+
+	return w.writerWrite(bridgeBuffer(buf, bufSize))
+}
+
+//export goff_writer_seek
+func goff_writer_seek(opaque unsafe.Pointer, offset int64, whence int) int64 {
+	id := int32(uintptr(opaque))
+	p, ok := writers.Load(id)
+	if !ok {
+		return -1
+	}
+
+	w, ok := p.(*Writer)
+	if !ok {
+		return -1
+	}
+
+	return w.writerSeek(offset, whence)
+}
+
 // Use only if used with IOOpen
 func (ctx *IOContext) Close() error {
-	return CheckErr(C.avio_close(ctx))
+	return CheckErr(C.avio_close((*C.AVIOContext)(ctx)))
 }
 
 func (ctx *IOContext) PutStr(s string) error {
 	s_ := CString(s)
 	defer FreeString(s_)
 
-	return CheckErr(C.avio_put_str(ctx, s_))
+	return CheckErr(C.avio_put_str((*C.AVIOContext)(ctx), s_))
 }
 
 var log_callback LogCallback
@@ -2085,7 +2226,7 @@ func OptSet(obj unsafe.Pointer, name string, val string, searchFlags SearchFlags
 }
 
 type (
-	Packet = C.struct_AVPacket
+	Packet C.struct_AVPacket
 )
 
 // Initialize optional fields of a packet with default values.
@@ -2093,7 +2234,7 @@ type (
 // Note, this does not touch the data and size members, which have to be
 // initialized separately.
 func (pkt *Packet) Init() {
-	C.av_init_packet(pkt)
+	C.av_init_packet((*C.struct_AVPacket)(pkt))
 }
 
 func (pkt *Packet) StreamIndex() int {
@@ -2107,26 +2248,26 @@ func (pkt *Packet) SetStreamIndex(i int) {
 // Presentation timestamp in AVStream->time_base units; the time at which the
 // decompressed packet will be presented to the user
 func (pkt *Packet) Pts() Timing {
-	return pkt.pts
+	return Timing(pkt.pts)
 }
 
 func (pkt *Packet) SetPts(pts Timing) {
-	pkt.pts = pts
+	pkt.pts = C.int64_t(pts)
 }
 
 // Decompression timestamp in AVStream->time_base units; the time at which the
 // packet is decompressed.
 func (pkt *Packet) Dts() Timing {
-	return pkt.dts
+	return Timing(pkt.dts)
 }
 
 func (pkt *Packet) SetDts(dts Timing) {
-	pkt.dts = dts
+	pkt.dts = C.int64_t(dts)
 }
 
 // Duration of this packet in AVStream->time_base units, 0 if unknown.
 func (pkt *Packet) Duration() Timing {
-	return pkt.duration
+	return Timing(pkt.duration)
 }
 
 func (pkt *Packet) Size() int {
@@ -2139,7 +2280,7 @@ func (pkt *Packet) Pos() int64 {
 }
 
 func (pkt *Packet) Unref() {
-	C.av_packet_unref(pkt)
+	C.av_packet_unref((*C.struct_AVPacket)(pkt))
 }
 
 // Convert valid timing fields (timestamps / durations) in a packet from one timebase to another.
@@ -2151,7 +2292,11 @@ func (pkt *Packet) Unref() {
 //     tb_src	source timebase, in which the timing fields in pkt are expressed
 //     tb_dst	destination timebase, to which the timing fields will be converted
 func (pkt *Packet) RescaleTs(tbSrc Rational, tbDst Rational) {
-	C.av_packet_rescale_ts(pkt, tbSrc, tbDst)
+	C.av_packet_rescale_ts(
+		(*C.struct_AVPacket)(pkt),
+		C.struct_AVRational(tbSrc),
+		C.struct_AVRational(tbDst),
+	)
 }
 
 type PictureType C.enum_AVPictureType
@@ -2449,7 +2594,7 @@ var (
 	SampleFormat_S64P SampleFormat = C.AV_SAMPLE_FMT_S64P
 )
 
-type Stream = C.struct_AVStream
+type Stream C.struct_AVStream
 
 func (s *Stream) Index() int {
 	return int(s.index)
@@ -2464,23 +2609,23 @@ func (s *Stream) SetID(id int) {
 }
 
 func (s *Stream) TimeBase() Rational {
-	return s.time_base
+	return Rational(s.time_base)
 }
 
 func (s *Stream) SetTimeBase(tb Rational) {
-	s.time_base = tb
+	s.time_base = C.struct_AVRational(tb)
 }
 
 func (s *Stream) StartTime() Timing {
-	return s.start_time
+	return Timing(s.start_time)
 }
 
 func (s *Stream) SetStartTime(st Timing) {
-	s.start_time = st
+	s.start_time = C.int64_t(st)
 }
 
 func (s *Stream) Duration() Timing {
-	return s.duration
+	return Timing(s.duration)
 }
 
 func (s *Stream) NbFrames() int64 {
@@ -2488,18 +2633,18 @@ func (s *Stream) NbFrames() int64 {
 }
 
 func (s *Stream) AvgFrameRate() Rational {
-	return s.avg_frame_rate
+	return Rational(s.avg_frame_rate)
 }
 
 func (s *Stream) CodecParameters() *CodecParameters {
-	return s.codecpar
+	return (*CodecParameters)(s.codecpar)
 }
 
 func (s *Stream) SetCodecParameters(cp *CodecParameters) {
-	s.codecpar = cp
+	s.codecpar = (*C.struct_AVCodecParameters)(cp)
 }
 
-type SwsContext = C.struct_SwsContext
+type SwsContext C.struct_SwsContext
 type SwsFilter = C.struct_SwsFilter
 
 type SwsFlags = int
@@ -2529,13 +2674,13 @@ func SwsGetCachedContext(
 	dstFilter *SwsFilter,
 	param *float64,
 ) *SwsContext {
-	return C.sws_getCachedContext(
-		context,
+	return (*SwsContext)(C.sws_getCachedContext(
+		(*C.struct_SwsContext)(context),
 		C.int(srcW), C.int(srcH), srcFormat.C(),
 		C.int(dstW), C.int(dstH), dstFormat.C(),
 		C.int(flags), srcFilter, dstFilter,
 		(*C.double)(param),
-	)
+	))
 }
 
 func (swctx *SwsContext) Scale(
@@ -2544,7 +2689,7 @@ func (swctx *SwsContext) Scale(
 	dst Planes, dstStride Linesizes,
 ) error {
 	return CheckErr(C.sws_scale(
-		swctx,
+		(*C.struct_SwsContext)(swctx),
 		(**C.uchar)(&srcSlice[0]),
 		(*C.int)(&srcStride[0]),
 		C.int(srcSliceY),
@@ -2555,15 +2700,15 @@ func (swctx *SwsContext) Scale(
 }
 
 func (swctx *SwsContext) Free() {
-	C.sws_freeContext(swctx)
+	C.sws_freeContext((*C.struct_SwsContext)(swctx))
 }
 
-type Rational = C.struct_AVRational
-type Timing = C.int64_t
+type Rational C.struct_AVRational
+type Timing C.int64_t
 
 var (
 	// Internal time base represented as fractional value.
-	TIME_BASE_Q Rational = C.AV_TIME_BASE_Q
+	TIME_BASE_Q Rational = Rational(C.AV_TIME_BASE_Q)
 
 	NOPTS_VALUE Timing = C.AV_NOPTS_VALUE
 )
@@ -2575,7 +2720,7 @@ func (t Timing) Rescale(bq Rational, cq Rational) Timing {
 	if t.IsNop() {
 		return t
 	}
-	return C.av_rescale_q(t, bq, cq)
+	return Timing(C.av_rescale_q(C.int64_t(t), C.struct_AVRational(bq), C.struct_AVRational(cq)))
 }
 
 func (t Timing) AsDuration(timebase Rational) time.Duration {
@@ -2610,9 +2755,9 @@ func (r Rational) Den() int {
 }
 
 func (r Rational) Mul(r2 Rational) Rational {
-	return C.av_mul_q(r, r2)
+	return Rational(C.av_mul_q(C.struct_AVRational(r), C.struct_AVRational(r2)))
 }
 
 func (r Rational) Div(r2 Rational) Rational {
-	return C.av_div_q(r, r2)
+	return Rational(C.av_div_q(C.struct_AVRational(r), C.struct_AVRational(r2)))
 }
