@@ -68,53 +68,89 @@ func decodeEx(r *bufiox.Reader, cfg *Config) (audio.Decoded, error) {
 type stream struct {
 	src            *bufiox.Reader
 	headerSize     int64
-	dataSize       int64
-	remaining      int64
+	length         int64 // actual readable bytes inside the 'data' chunk
+	pos            int64 // current logical offset inside the 'data' chunk
 	channelNum     int
 	bytesPerSample int
 	sampleRate     int
+
+	mu sync.Mutex
+}
+
+// probeDataSize returns how many bytes are actually readable inside the
+// 'data' chunk. The header's declared DataSize may be larger than the real
+// payload (a truncated or damaged file), in which case the smaller value is
+// used. On return, the source is positioned again at the data start.
+func probeDataSize(src *bufiox.Reader, headerSize, dataSize int64) (int64, error) {
+	end, err := src.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = src.Seek(headerSize, io.SeekStart); err != nil {
+		return 0, err
+	}
+	avail := end - headerSize
+	if avail < 0 {
+		avail = 0
+	}
+	if avail > dataSize {
+		// Chunks following 'data' (e.g. LIST) are not part of the payload.
+		avail = dataSize
+	}
+	return avail, nil
 }
 
 func (s *stream) Read(p []byte) (int, error) {
-	if s.remaining < int64(len(p)) {
-		if s.remaining <= 0 {
-			return 0, io.EOF
-		}
-		p = p[0:s.remaining]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.pos >= s.length {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > s.length-s.pos {
+		p = p[0 : s.length-s.pos]
 	}
 	n, err := s.src.Read(p)
-	s.remaining -= int64(n)
+	s.pos += int64(n)
 	return n, err
 }
 
 func (s *stream) Seek(offset int64, whence int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Resolve the requested offset to a logical position inside the data
+	// chunk, then clamp it to the legal interval [0, length].
+	var target int64
 	switch whence {
 	case io.SeekStart:
-		offset = offset + s.headerSize
+		target = offset
 	case io.SeekCurrent:
+		target = s.pos + offset
 	case io.SeekEnd:
-		offset = s.headerSize + s.dataSize + offset
-		whence = io.SeekStart
+		target = s.length + offset
+	default:
+		return 0, errors.New("wav: invalid whence")
 	}
-	n, err := s.src.Seek(offset, whence)
-	if err != nil {
+	if target < 0 {
+		target = 0
+	}
+	if target > s.length {
+		target = s.length
+	}
+	if _, err := s.src.Seek(s.headerSize+target, io.SeekStart); err != nil {
 		return 0, err
 	}
-	if n-s.headerSize < 0 {
-		return 0, fmt.Errorf("wav: invalid offset")
-	}
-	s.remaining = s.dataSize - (n - s.headerSize)
-	// There could be a tail in wav file.
-	if s.remaining < 0 {
-		s.remaining = 0
-		return s.dataSize, nil
-	}
-	return n - s.headerSize, nil
+	s.pos = target
+	return target, nil
 }
 
-// Length returns the size of decoded stream in bytes.
+// Length returns the size of decoded stream in bytes, i.e. the number of
+// bytes that can actually be read.
 func (s *stream) Length() int64 {
-	return s.dataSize
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.length
 }
 
 // SampleRate returns the sample rate like 44100.
@@ -152,8 +188,8 @@ func decode(src *bufiox.Reader) (audio.Decoded, error) {
 		return nil, errNotWAVE
 	}
 
-	// Read chunks
-	cfg := Config{HeaderSize: int64(len(b))}
+	// Read chunks. Only the first 12 bytes of b are consumed here.
+	cfg := Config{HeaderSize: 12}
 chunks:
 	for {
 		if _, err := src.ReadFull(b[:8]); err != nil {
@@ -198,11 +234,14 @@ chunks:
 	if cfg.BitsPerSample != 8 && cfg.BitsPerSample != 16 {
 		return nil, fmt.Errorf("wav: bits per sample must be 8 or 16 but was %d", cfg.BitsPerSample)
 	}
+	length, err := probeDataSize(src, cfg.HeaderSize, cfg.DataSize)
+	if err != nil {
+		return nil, err
+	}
 	s := &stream{
 		src:            src,
 		headerSize:     cfg.HeaderSize,
-		dataSize:       cfg.DataSize,
-		remaining:      cfg.DataSize,
+		length:         length,
 		sampleRate:     int(cfg.SampleRate),
 		channelNum:     cfg.Channels,
 		bytesPerSample: cfg.BitsPerSample >> 3,

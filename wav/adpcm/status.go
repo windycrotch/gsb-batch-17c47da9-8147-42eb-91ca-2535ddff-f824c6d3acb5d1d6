@@ -66,19 +66,28 @@ func loadStatus(b []byte) *status {
 	}
 }
 
-func loadBlock(channels int, block []byte, samples []byte) {
+// loadBlock decodes one ADPCM block. It returns the number of whole sample
+// bytes written into samples. A block truncated in the source still yields
+// every sample that its surviving bytes can reconstruct, and never reads
+// past the end of block.
+func loadBlock(channels int, block []byte, samples []byte) int {
+	headerLen := channels << 2
+	if len(block) < headerLen {
+		// Not enough bytes to recover even the predictor(s): no sample.
+		return 0
+	}
 	status1 := loadStatus(block)
 	status2 := status1
-	saveSample(samples, 0, status1.sample)
+	idx := saveSample(samples, 0, status1.sample)
 	if channels > 1 {
 		status2 = loadStatus(block[4:])
-		saveSample(samples, 2, status2.sample)
+		idx = saveSample(samples, 2, status2.sample)
 	}
-	idx := channels << 1
-	for _, code := range block[(channels << 2):] {
+	for _, code := range block[headerLen:] {
 		idx = status1.saveSample(samples, idx, code&0xf)
 		idx = status2.saveSample(samples, idx, code>>4)
 	}
+	return idx
 }
 
 // -------------------------------------------------------------------------------------
