@@ -1,0 +1,23 @@
+/m314dl
+*.mp4
+*.ts
+*.mkv
+*.m4s
+*.m314dl-state
+*.m314dl/
+*.rawsub
+
+# benchmark artifacts
+/bench/fixtures/
+/bench/benchwork/
+
+# release artifacts
+/dist/
+/RELEASE_NOTES.md
+
+# local junk
+*.xapk
+*.apk
+/m314dl.exe
+/.d.txt
+/.ua/

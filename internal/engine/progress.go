@@ -1,0 +1,350 @@
+package engine
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"golang.org/x/term"
+
+	"github.com/m314dev/m314dl/internal/ui"
+)
+
+// Progress adds up the counters of every stream downloading at the same time.
+// Speed is measured over the last 5 seconds, so it is not a lifetime average.
+type Progress struct {
+	total      atomic.Int64
+	done       atomic.Int64
+	bytes      atomic.Int64
+	knownBytes atomic.Int64
+	conns      atomic.Int64 // segment fetches in flight right now
+	// Segments whose size is known (from the response headers as soon as the
+	// fetch starts, or from the byte count when it ends) and their combined
+	// size give the per segment average the percentage and ETA are projected
+	// from. bytes alone would not do: it only holds what has arrived so far,
+	// and with 64 fetches in flight that is 64 half segments and no average.
+	sizedSegs  atomic.Int64
+	sizedBytes atomic.Int64
+
+	mu       sync.Mutex
+	samples  []sample // ring of (time, bytes) samples for the windowed speed
+	live     bool
+	start    time.Time
+	end      time.Time     // when Render stopped; zero while it runs
+	interval time.Duration // render tick override; 0 = default (1s TTY, 5s piped)
+	name     string        // output file shown at the end of the terminal line
+	tty      bool          // set by Render: draw the bar shape instead of the piped one
+
+	outMu sync.Mutex          // serializes status-line draws and Log
+	lw    *progressLineWriter // set while Render runs
+}
+
+type sample struct {
+	t time.Time
+	b int64
+}
+
+// NewProgress creates a Progress. interval overrides how often the line is
+// redrawn, both on a TTY and when piped; 0 keeps the defaults.
+func NewProgress(live bool, interval time.Duration) *Progress {
+	return &Progress{live: live, start: time.Now(), interval: interval}
+}
+
+func (p *Progress) AddTotal(n int64)      { p.total.Add(n) }
+func (p *Progress) AddDone(n int64)       { p.done.Add(n) }
+func (p *Progress) SetKnownBytes(n int64) { p.knownBytes.Store(n) }
+
+// AddConns adjusts the in-flight fetch count shown on the terminal line.
+func (p *Progress) AddConns(n int64) { p.conns.Add(n) }
+
+// SetName sets the file name the terminal line ends with. Leave it empty when
+// one Progress is shared by several downloads.
+func (p *Progress) SetName(name string) {
+	p.mu.Lock()
+	p.name = name
+	p.mu.Unlock()
+}
+
+// AddSized records that one segment is known to be n bytes long.
+func (p *Progress) AddSized(n int64) { p.sizedSegs.Add(1); p.sizedBytes.Add(n) }
+
+func (p *Progress) AddBytes(n int64) {
+	cur := p.bytes.Add(n)
+	now := time.Now()
+	p.mu.Lock()
+	// Keep at most one sample per 100ms. Taking a sample on every Read let a
+	// few dozen busy workers fill the ring within milliseconds. The window that
+	// Speed measures then shrank below its 0.1s floor, and a fast download
+	// showed "0B/s | ETA ?".
+	if k := len(p.samples); k == 0 || now.Sub(p.samples[k-1].t) >= 100*time.Millisecond {
+		p.samples = append(p.samples, sample{now, cur})
+		if len(p.samples) > 256 {
+			p.samples = p.samples[128:]
+		}
+	}
+	p.mu.Unlock()
+}
+
+// Speed returns bytes/sec over the last 5 seconds.
+func (p *Progress) Speed() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	cur := p.bytes.Load()
+	for _, s := range p.samples {
+		if now.Sub(s.t) <= 5*time.Second {
+			dt := now.Sub(s.t).Seconds()
+			if dt < 0.1 {
+				return 0
+			}
+			return float64(cur-s.b) / dt
+		}
+	}
+	return 0
+}
+
+func fmtBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2fGiB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1fMiB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.0fKiB", float64(b)/(1<<10))
+	}
+	return fmt.Sprintf("%dB", b)
+}
+
+// Line renders one status line.
+//
+// When output is piped (not a terminal), the two shapes below are a fixed
+// format that programs parse. VOD: "pct% | done/total segs | bytes | speed/s |
+// ETA x". Live: "REC elapsed | segs | bytes | speed/s". External tools and the
+// -rpc server read these lines, so keep the field order and the separators as
+// they are. "ETA ?" is the agreed marker for an unknown ETA.
+//
+// On a terminal the line is for a person: a bar, the size so far with the
+// estimated total, the fetches in flight, and the file name, in color when
+// ui.Color allows. A terminal line is redrawn in place and never parsed.
+func (p *Progress) Line() string {
+	done, total := p.done.Load(), p.total.Load()
+	bytes := p.bytes.Load()
+	speed := p.Speed()
+	elapsed := time.Since(p.start).Round(time.Second)
+	pct, eta, estTotal := p.estimate(done, total, bytes, speed)
+	if !p.tty {
+		if p.live {
+			return fmt.Sprintf("REC %s | %d segs | %s | %s/s", elapsed, done, fmtBytes(bytes), fmtBytes(int64(speed)))
+		}
+		return fmt.Sprintf("%5.1f%% | %d/%d segs | %s | %s/s | ETA %s", pct, done, total, fmtBytes(bytes), fmtBytes(int64(speed)), eta)
+	}
+	tail := ""
+	if n := p.conns.Load(); n > 0 {
+		word := "conns"
+		if n == 1 {
+			word = "conn"
+		}
+		tail += " | " + ui.Paint(ui.Dim, fmt.Sprintf("%d %s", n, word))
+	}
+	p.mu.Lock()
+	name := p.name
+	p.mu.Unlock()
+	if name != "" {
+		tail += " | " + name
+	}
+	rate := ui.Paint(ui.Green, fmtBytes(int64(speed))+"/s")
+	if p.live {
+		return fmt.Sprintf("%s %s | %d segs | %s | %s%s", ui.Paint(ui.Red, "REC"), elapsed, done, fmtBytes(bytes), rate, tail)
+	}
+	size := fmtBytes(bytes)
+	if total > 0 && done >= total {
+		eta = "0s" // the piped shape keeps its "?" marker; a person wants to see it finished
+	} else if estTotal > 0 {
+		size += "/~" + fmtBytes(estTotal)
+	}
+	return fmt.Sprintf("%s %s | %d/%d segs | %s | %s | %s%s",
+		ui.Paint(ui.Cyan, bar(pct, 20)), ui.Paint(ui.Cyan, fmt.Sprintf("%5.1f%%", pct)),
+		done, total, size, rate, ui.Paint(ui.Yellow, "ETA "+eta), tail)
+}
+
+// estimate computes the percentage, the ETA string ("?" when unknown) and the
+// projected total size (0 when unknown) from the counters. The percentage is
+// bytes over the projected total, so the bar keeps moving inside a long
+// segment instead of stepping once per commit. It uses the projection as soon
+// as one segment's size is known, a rough bar being better than one stuck at
+// 0 while 64 fetches run. The shown total and the ETA assume the segments
+// sized so far are typical, so they wait until a handful have been seen.
+func (p *Progress) estimate(done, total, bytes int64, speed float64) (pct float64, eta string, estTotal int64) {
+	eta = "?"
+	ss, sb := p.sizedSegs.Load(), p.sizedBytes.Load()
+	proj := p.knownBytes.Load()
+	if proj == 0 && total > 0 && ss > 0 {
+		proj = int64(float64(sb) / float64(ss) * float64(total))
+	}
+	if p.knownBytes.Load() > 0 || enoughDone(ss, total) {
+		estTotal = proj
+	}
+	switch {
+	case total > 0 && done >= total:
+		pct = 100
+	case proj > 0:
+		pct = min(100, float64(bytes)/float64(proj)*100)
+	case total > 0:
+		pct = float64(done) / float64(total) * 100
+	}
+	if speed > 1 && estTotal > bytes && done < total {
+		if etaSec := float64(estTotal-bytes) / speed; etaSec < 360000 {
+			eta = (time.Duration(etaSec) * time.Second).Round(time.Second).String()
+		}
+	}
+	return pct, eta, estTotal
+}
+
+// enoughDone says whether enough segments have been sized for a projection to
+// mean something: nine of them, or a quarter of a short playlist, so a 7-segment
+// download still shows an ETA instead of "?" until it is over.
+func enoughDone(done, total int64) bool {
+	return done > 8 || (done > 0 && done*4 >= total)
+}
+
+// bar draws "[████░░░░]" with width cells, filled in proportion to pct.
+func bar(pct float64, width int) string {
+	filled := int(float64(width) * pct / 100)
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
+}
+
+// Summary describes the finished download for the final "done" line: the
+// output size (outSize, or the bytes transferred when outSize is negative),
+// how long the download phase took, and its average speed.
+func (p *Progress) Summary(outSize int64) string {
+	p.mu.Lock()
+	end := p.end
+	p.mu.Unlock()
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if outSize < 0 {
+		outSize = p.bytes.Load()
+	}
+	elapsed := end.Sub(p.start)
+	avg := int64(0)
+	if secs := elapsed.Seconds(); secs > 0 {
+		avg = int64(float64(p.bytes.Load()) / secs)
+	}
+	return fmt.Sprintf("%s, %s at %s/s", fmtBytes(outSize), elapsed.Round(time.Second), fmtBytes(avg))
+}
+
+// Render prints progress to stderr until stop is closed. On a TTY it redraws
+// one line in place. Otherwise it prints a plain line every interval, which
+// programs can parse, survives redirection and has no ANSI escape codes in it.
+// The default interval is 1s on a TTY and 5s when piped; NewProgress's
+// interval overrides it.
+func (p *Progress) Render(stop <-chan struct{}) {
+	isTTY := term.IsTerminal(int(os.Stderr.Fd()))
+	interval := time.Second
+	if !isTTY {
+		interval = 5 * time.Second
+	}
+	if p.interval > 0 {
+		interval = p.interval
+		if interval < 50*time.Millisecond {
+			interval = 50 * time.Millisecond // floor: don't flood the consumer
+		}
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	lineWriter := progressLineWriter{out: os.Stderr, tty: isTTY, width: func() int {
+		w, _, err := term.GetSize(int(os.Stderr.Fd()))
+		if err != nil {
+			return 0
+		}
+		return w
+	}}
+	p.outMu.Lock()
+	p.tty = isTTY
+	p.lw = &lineWriter
+	p.outMu.Unlock()
+	for {
+		select {
+		case <-stop:
+			p.mu.Lock()
+			p.end = time.Now()
+			p.mu.Unlock()
+			p.outMu.Lock()
+			lineWriter.write(p.Line(), true)
+			p.lw = nil
+			p.outMu.Unlock()
+			return
+		case <-tick.C:
+			p.outMu.Lock()
+			lineWriter.write(p.Line(), false)
+			p.outMu.Unlock()
+		}
+	}
+}
+
+// Log prints a message on its own line. On a TTY the status line is erased
+// first and redrawn at the next tick, so messages from downloads sharing this
+// Progress never land in the middle of it.
+func (p *Progress) Log(line string) {
+	p.outMu.Lock()
+	defer p.outMu.Unlock()
+	out := io.Writer(os.Stderr)
+	if w := p.lw; w != nil {
+		out = w.out
+		if w.tty && w.previous > 0 {
+			fmt.Fprintf(out, "\r%s\r", strings.Repeat(" ", w.previous))
+			w.previous = 0
+		}
+	}
+	fmt.Fprintln(out, line)
+}
+
+// progressLineWriter redraws one line in place. It erases the previous draw by
+// padding with spaces instead of a clear-line escape code, because classic
+// Windows consoles do not understand that code by default. Widths are counted
+// in terminal columns (ui.Width), so color codes and the bar glyphs do not
+// count against the terminal width. The same width limit applies to every tick
+// and to the final line. One column is left spare so the terminal never wraps
+// the line on its own, including when the line is exactly as wide as the
+// terminal.
+type progressLineWriter struct {
+	out      io.Writer
+	tty      bool
+	width    func() int
+	previous int // columns drawn last time
+}
+
+func (w *progressLineWriter) write(line string, final bool) {
+	if !w.tty {
+		fmt.Fprintln(w.out, line)
+		return
+	}
+	columns := 0
+	if w.width != nil {
+		columns = w.width()
+	}
+	limit := max(0, columns-1)
+	if columns > 0 {
+		line = ui.Truncate(line, limit)
+	}
+	cells := ui.Width(line)
+	clearWidth := max(w.previous, cells)
+	if columns > 0 && clearWidth > limit {
+		clearWidth = limit
+	}
+	padding := strings.Repeat(" ", max(0, clearWidth-cells))
+	suffix := ""
+	if final {
+		suffix = "\n"
+	}
+	fmt.Fprintf(w.out, "\r%s%s%s", line, padding, suffix)
+	w.previous = cells
+}
