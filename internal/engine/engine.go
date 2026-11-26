@@ -189,6 +189,12 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 		}
 		state, out = s, f
 		defer out.Close()
+		// A live stream's listing changes between runs, so its checkpoint
+		// names the committed segments; a VOD's static listing resumes
+		// positionally and stays keyless. Once a checkpoint carries keys,
+		// keep it keyed. A legacy (keyless) one stays keyless: the keys of
+		// what a previous version committed are unknowable.
+		state.persistKeys = (st.Live || refresh != nil || state.hasKeys) && !state.legacy
 		// Resuming: segments already written count as done, so progress and ETA
 		// reflect real remaining work instead of restarting from 0/N.
 		if cfg.Progress != nil {
@@ -273,23 +279,86 @@ func DownloadStream(ctx context.Context, cfg Config, st *manifest.Stream, outPat
 
 // ---- resume state ----
 
-// resumeState is shared by the feeder, which reads NextIdx, and the writer,
-// which advances NextIdx and owns Offset. That is why NextIdx is atomic. Only
-// the writer writes Offset, and it is read only by saves made from the writer
-// goroutine.
+// resumeState is shared by the feeder and the writer, which run side by side
+// for the whole download. The writer advances NextIdx and owns Offset; the
+// feeder only reads NextIdx, which is why it is atomic. The committed
+// segment keys and the source numbering they were recorded under are guarded
+// by mu: the writer adds a key on every commit (recordCommit) and saves the
+// checkpoint, the feeder consults the keys to tell already-published
+// segments from new ones (committed) and tracks the numbering (setMediaSeq,
+// clearIDKeys).
+//
+// The key sets answer the question the plain NextIdx/Offset pair cannot:
+// which segments are the bytes already on disk? A live source replaces its
+// URLs (a fresh signature) and rewinds its media sequence, and then the
+// position of a segment in the listing says nothing about whether it was
+// already published. The keys name the content — its manifest identity, and
+// its URL with the signature stripped — so the answer survives both.
 type resumeState struct {
 	NextIdx atomic.Int64
 	Offset  int64
-	mu      sync.Mutex // serializes save()
+
+	mu       sync.Mutex
+	mediaSeq int64               // source numbering the feeder last saw
+	idKeys   map[string]struct{} // committed segments' identity keys
+	urlKeys  map[string]struct{} // committed segments' (and inits') URL keys
+	idOrder  []string            // idKeys in commit order, for the tail bound
+	urlOrder []string            // urlKeys in commit order
+	// hasKeys: the checkpoint on disk carried keys. persistKeys: save writes
+	// them. Keys are persisted for live streams, whose listing changes
+	// between runs; a VOD listing is static, so its positional checkpoint
+	// (NextIdx alone) already resumes exactly, and writing thousands of keys
+	// after every one of its segments would only churn the disk.
+	hasKeys, persistKeys bool
+	// legacy marks a keyless checkpoint from an older version (or a
+	// hand-written one): resume positionally, as before, and keep the
+	// checkpoint keyless. The keys of segments committed before this run are
+	// unknowable, and a partial key set would be worse than none.
+	legacy bool
 }
 
-// resumeSnapshot is the on-disk JSON form.
+// maxCommittedKeys bounds the committed-key sets (and so the checkpoint) on
+// a channel that records forever: 8192 keys is about 13 hours of 6-second
+// segments, far beyond any live window a rewind can jump back into.
+const maxCommittedKeys = 8192
+
+// resumeSnapshot is the on-disk JSON form. NextIdx and Offset say how much of
+// the output is committed; IDKeys and URLKeys say which segments those
+// committed items were, so a rerun can recognize them even after the source
+// replaced its URLs or rewound its numbering. MediaSeq is the source's
+// numbering at save time: a lower numbering on the next run means the saved
+// identities may name new content now.
 type resumeSnapshot struct {
-	NextIdx int64 `json:"next_idx"`
-	Offset  int64 `json:"offset"`
+	NextIdx  int64    `json:"next_idx"`
+	Offset   int64    `json:"offset"`
+	MediaSeq int64    `json:"media_seq,omitempty"`
+	IDKeys   []string `json:"id_keys,omitempty"`
+	URLKeys  []string `json:"url_keys,omitempty"`
 }
 
 func statePath(outPath string) string { return outPath + ".m314dl-state" }
+
+func keySet(keys []string) map[string]struct{} {
+	if len(keys) == 0 {
+		return nil
+	}
+	s := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		s[k] = struct{}{}
+	}
+	return s
+}
+
+func keyList(s map[string]struct{}) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(s))
+	for k := range s {
+		out = append(out, k)
+	}
+	return out
+}
 
 func openOutput(outPath string) (*resumeState, *os.File, error) {
 	st := &resumeState{}
@@ -298,6 +367,12 @@ func openOutput(outPath string) (*resumeState, *os.File, error) {
 		if json.Unmarshal(b, &snap) == nil {
 			st.NextIdx.Store(snap.NextIdx)
 			st.Offset = snap.Offset
+			st.mediaSeq = snap.MediaSeq
+			st.idKeys = keySet(snap.IDKeys)
+			st.urlKeys = keySet(snap.URLKeys)
+			st.idOrder, st.urlOrder = snap.IDKeys, snap.URLKeys
+			st.hasKeys = len(snap.IDKeys)+len(snap.URLKeys) > 0
+			st.legacy = snap.NextIdx > 0 && !st.hasKeys
 		}
 	}
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY, 0o644)
@@ -305,8 +380,13 @@ func openOutput(outPath string) (*resumeState, *os.File, error) {
 		return nil, nil, err
 	}
 	if fi, err := f.Stat(); err == nil && fi.Size() < st.Offset {
-		st.NextIdx.Store(0) // state file lies; start over
+		// state file lies; start over
+		st.NextIdx.Store(0)
 		st.Offset = 0
+		st.mediaSeq = 0
+		st.idKeys, st.urlKeys = nil, nil
+		st.idOrder, st.urlOrder = nil, nil
+		st.hasKeys, st.legacy = false, false
 	}
 	if err := f.Truncate(st.Offset); err != nil {
 		return nil, nil, err
@@ -319,27 +399,202 @@ func openOutput(outPath string) (*resumeState, *os.File, error) {
 
 // save writes the resume checkpoint atomically: it writes a temp file and then
 // renames it. A process killed without warning in the middle of a write can
-// then never leave a half-written state file behind.
+// then never leave a half-written state file behind. The rename can fail
+// transiently — on Windows the destination cannot be replaced while another
+// process (an indexer, a scanner, a watcher) has it open — so a failed
+// attempt is retried a few times before giving up to the next commit's save.
+// A checkpoint that is a commit or two stale is still consistent: it only
+// ever names a prefix of what is on disk, and openOutput truncates to it.
 func (s *resumeState) save(outPath string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, _ := json.Marshal(resumeSnapshot{NextIdx: s.NextIdx.Load(), Offset: s.Offset})
-	tmp := statePath(outPath) + ".tmp"
-	if os.WriteFile(tmp, b, 0o644) == nil {
-		os.Rename(tmp, statePath(outPath))
+	snap := resumeSnapshot{NextIdx: s.NextIdx.Load(), Offset: s.Offset, MediaSeq: s.mediaSeq}
+	if s.persistKeys {
+		snap.IDKeys = keyList(s.idKeys)
+		snap.URLKeys = keyList(s.urlKeys)
 	}
+	s.mu.Unlock()
+	b, _ := json.Marshal(snap)
+	tmp := statePath(outPath) + ".tmp"
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := os.WriteFile(tmp, b, 0o644); err != nil {
+			continue
+		}
+		if err := os.Rename(tmp, statePath(outPath)); err == nil {
+			return
+		}
+	}
+}
+
+// recordCommit notes a committed item's keys. The writer calls it once the
+// item is published (bytes on disk, or handed to the sink), so the committed
+// set always names exactly what the output holds, whatever numbering or
+// signing the source uses next.
+func (s *resumeState) recordCommit(it item) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idKeys == nil {
+		s.idKeys = map[string]struct{}{}
+	}
+	if s.urlKeys == nil {
+		s.urlKeys = map[string]struct{}{}
+	}
+	switch {
+	case it.isInit:
+		s.addURLKey(initKey(it.url, it.rng))
+	case it.seg != nil:
+		if id := segIDKey(it.seg); id != "" {
+			s.addIDKey(id)
+		}
+		s.addURLKey(segURLKey(it.seg))
+	default:
+		s.addURLKey(urlKey(it.url) + rangeKey(it.rng))
+	}
+}
+
+func (s *resumeState) addIDKey(k string) {
+	if _, ok := s.idKeys[k]; ok {
+		return
+	}
+	s.idKeys[k] = struct{}{}
+	s.idOrder = append(s.idOrder, k)
+	s.idKeys, s.idOrder = trimKeys(s.idKeys, s.idOrder)
+}
+
+func (s *resumeState) addURLKey(k string) {
+	if _, ok := s.urlKeys[k]; ok {
+		return
+	}
+	s.urlKeys[k] = struct{}{}
+	s.urlOrder = append(s.urlOrder, k)
+	s.urlKeys, s.urlOrder = trimKeys(s.urlKeys, s.urlOrder)
+}
+
+// trimKeys keeps the newest maxCommittedKeys of a committed-key set. The
+// oldest are the least likely to be listed again: a source only ever
+// re-lists what is near its live window.
+func trimKeys(set map[string]struct{}, order []string) (map[string]struct{}, []string) {
+	if len(order) <= maxCommittedKeys {
+		return set, order
+	}
+	keep := order[len(order)-maxCommittedKeys:]
+	set = make(map[string]struct{}, len(keep))
+	for _, k := range keep {
+		set[k] = struct{}{}
+	}
+	return set, keep
+}
+
+// committed reports whether the identity key or the URL key names a segment
+// that was already committed.
+func (s *resumeState) committed(id, uk string) (idHit, urlHit bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, idHit = s.idKeys[id]
+	_, urlHit = s.urlKeys[uk]
+	return
+}
+
+// committedURL is committed for the URL key alone (init segments have no
+// identity).
+func (s *resumeState) committedURL(uk string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.urlKeys[uk]
+	return ok
+}
+
+// committedID is committed for the identity key alone.
+func (s *resumeState) committedID(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.idKeys[id]
+	return ok
+}
+
+// checkpointInfo returns the source numbering the checkpoint's keys were
+// recorded under, and whether it carried keys at all.
+func (s *resumeState) checkpointInfo() (mediaSeq int64, hasKeys bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mediaSeq, s.hasKeys
+}
+
+// setMediaSeq tracks the source numbering the feeder last saw, so the
+// checkpoint can tell a rewind that happened while the process was down.
+func (s *resumeState) setMediaSeq(seq int64) {
+	s.mu.Lock()
+	s.mediaSeq = seq
+	s.mu.Unlock()
+}
+
+// clearIDKeys drops the committed identity keys when the source rewinds its
+// numbering: under the new numbering those identities may name new content,
+// and keeping them would hide it. URL keys stay — a segment the new window
+// lists under the same URL is the same content.
+func (s *resumeState) clearIDKeys() {
+	s.mu.Lock()
+	s.idKeys = map[string]struct{}{}
+	s.idOrder = nil
+	s.mu.Unlock()
 }
 
 // ---- feeder ----
 
 func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshFunc, state *resumeState, items chan<- item) error {
 	var idx int64
-	seen := map[string]bool{}
+	// Dedup has two layers. The seen maps remember what this run emitted;
+	// entries are retired once the commit lands (see the end of push). The
+	// state's committed-key sets (seeded from the checkpoint, grown by the
+	// writer on every commit) remember everything already published. Each
+	// layer comes in the same two flavors: the manifest identity (the HLS
+	// media sequence, the DASH number), stable across a re-signed URL but
+	// reusable for new content once the source rewinds its numbering; and
+	// the URL key (the path, the signature query stripped), which survives
+	// a rewind, so a segment the new window lists under the same name is
+	// not published twice.
+	seenID := map[string]bool{}
+	seenURL := map[string]bool{}
 	lastInit := ""
 	deadline := time.Time{}
 	if cfg.LiveLimit > 0 {
 		deadline = time.Now().Add(cfg.LiveLimit)
 	}
+
+	// Resume. A keyed checkpoint already names the committed segments (the
+	// state's key sets were loaded from it), so all the feeder has to do is
+	// start the index counter where the writer's NextIdx stands: the first
+	// new item then lands exactly where the writer resumes — whether or not
+	// the source still lists the same segments in the same order. A keyless
+	// checkpoint (a VOD's, an older version's, or a hand-written one) resumes
+	// positionally instead: items below NextIdx are dropped in emit, as they
+	// always were.
+	nextIdx0 := state.NextIdx.Load()
+	savedSeq, hasKeys := state.checkpointInfo()
+	keyed := nextIdx0 > 0 && hasKeys
+	// idUnsafe reports that the source's numbering rewound (just now, or
+	// while this process was down), so an identity seen before the rewind
+	// must not hide a new segment that reuses the number.
+	idUnsafe := false
+	if keyed {
+		idx = nextIdx0
+		if st.MediaSeq < savedSeq {
+			cfg.Verbose("live: %s: media sequence went back from %d to %d while away; trusting only content URLs", st.ID, savedSeq, st.MediaSeq)
+			idUnsafe = true
+			state.clearIDKeys()
+		}
+		if cfg.Progress != nil {
+			// the committed prefix the walk below skips still counts in the total
+			cfg.Progress.AddTotal(nextIdx0)
+		}
+	}
+	state.setMediaSeq(st.MediaSeq)
+	// replay lasts until the first new item is emitted. While it does, an
+	// init the checkpoint already names is not written again: its bytes are
+	// in the output from the previous run.
+	replay := keyed
 
 	emit := func(it item) bool {
 		if it.idx < state.NextIdx.Load() {
@@ -363,27 +618,47 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		// than a percentage, so there is no bar to run backwards.
 		fresh := 0
 		var batch []item
-		curKeys := make(map[string]struct{}, len(cur.Segments))
 		for i := range cur.Segments {
 			seg := &cur.Segments[i]
-			key := segKey(seg)
-			curKeys[key] = struct{}{}
-			if seen[key] {
+			id, uk := segIDKey(seg), segURLKey(seg)
+			init := segInit(seg, cur)
+			// A segment is a duplicate when this run already emitted it
+			// (the seen maps) or any run already committed it (the state's
+			// key sets, seeded from the checkpoint). While the identity is
+			// trustworthy it alone decides, so two segments that share a
+			// path and differ only in the query never collapse into one.
+			// After a rewind the URL key is the only name the content still
+			// has.
+			var dup bool
+			cid, cuk := state.committed(id, uk)
+			if id != "" && !idUnsafe {
+				dup = seenID[id] || cid
+			} else {
+				dup = seenURL[uk] || cuk || (id != "" && (seenID[id] || cid))
+			}
+			if dup {
 				continue
 			}
-			seen[key] = true
+			if id != "" {
+				seenID[id] = true
+			}
+			seenURL[uk] = true
 			if skipAd(cfg.AdFilters, seg.URL) {
 				cfg.Verbose("ad-skip: %s", seg.URL)
 				continue
 			}
 			fresh++
-			if init := segInit(seg, cur); init != nil && init.URL != lastInit {
+			if init != nil && init.URL != lastInit {
 				lastInit = init.URL
-				batch = append(batch, item{idx: idx, isInit: true, url: init.URL, rng: init.Range})
-				idx++
+				if !replay || !state.committedURL(initKey(init.URL, init.Range)) {
+					batch = append(batch, item{idx: idx, isInit: true, url: init.URL, rng: init.Range})
+					idx++
+					replay = false
+				}
 			}
 			batch = append(batch, item{idx: idx, seg: seg, url: seg.URL, rng: seg.Range, key: seg.Key, seq: seg.Seq})
 			idx++
+			replay = false
 		}
 		if cfg.Progress != nil {
 			cfg.Progress.AddTotal(int64(len(batch)))
@@ -393,17 +668,22 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 				return fresh, false
 			}
 		}
-		// Trim seen down to the segments the source still lists. Without this
-		// the map grows by one URL per segment for the life of the run, with no
-		// limit on a live channel that refreshes forever. A segment that has
-		// left the source's window is never listed again, so forgetting it is
-		// safe. A looping source that lists one again costs a single harmless
-		// re-download.
-		if len(seen) > len(curKeys) {
-			for k := range seen {
-				if _, ok := curKeys[k]; !ok {
-					delete(seen, k)
-				}
+		// Retire emitted keys the committed set now covers. The seen maps
+		// exist to bridge the gap between emission and commit: the feeder
+		// runs ahead of the writer, so a segment the source stops listing
+		// must stay remembered until its commit lands in the state's key
+		// sets — after that the state remembers it (bounded by its tail
+		// limit) and the entry here is redundant. What is left behind is
+		// only what can never be committed: ad-skipped and failed segments,
+		// and the live-edge backlog, all bounded in practice.
+		for k := range seenID {
+			if state.committedID(k) {
+				delete(seenID, k)
+			}
+		}
+		for k := range seenURL {
+			if state.committedURL(k) {
+				delete(seenURL, k)
 			}
 		}
 		return fresh, true
@@ -414,7 +694,11 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 		keep := 3
 		if n := len(st.Segments); n > keep {
 			for i := 0; i < n-keep; i++ {
-				seen[segKey(&st.Segments[i])] = true
+				seg := &st.Segments[i]
+				if id := segIDKey(seg); id != "" {
+					seenID[id] = true
+				}
+				seenURL[segURLKey(seg)] = true
 			}
 		}
 	}
@@ -463,13 +747,19 @@ func feed(ctx context.Context, cfg Config, st *manifest.Stream, refresh RefreshF
 			continue
 		}
 		// A playlist whose numbering went backwards comes from a packager that
-		// started over. Its identities now name different content, so what
-		// was seen under the old numbering must not hide the new segments.
+		// started over. Its identities now name different content, so identity
+		// keys recorded under the old numbering must not hide the new
+		// segments — forget them, here and in the checkpoint. URL keys stay:
+		// a segment the new window lists under the same URL is the same
+		// content and must not be published twice.
 		if cur.MediaSeq < lastMediaSeq {
-			cfg.Verbose("live: %s: media sequence went back from %d to %d; forgetting the seen window", st.ID, lastMediaSeq, cur.MediaSeq)
-			seen = map[string]bool{}
+			cfg.Verbose("live: %s: media sequence went back from %d to %d; forgetting identity keys, keeping content URLs", st.ID, lastMediaSeq, cur.MediaSeq)
+			seenID = map[string]bool{}
+			idUnsafe = true
+			state.clearIDKeys()
 		}
 		lastMediaSeq = cur.MediaSeq
+		state.setMediaSeq(cur.MediaSeq)
 		fresh, ok := push(cur)
 		if !ok {
 			return ctx.Err()
@@ -501,15 +791,52 @@ func segInit(seg *manifest.Segment, st *manifest.Stream) *manifest.InitMap {
 	return st.Init
 }
 
-// segKey is how the feeder tells a segment it has already fetched from a new
-// one across refreshes: the segment's Identity when the manifest gives one,
-// else its URL. The URL alone would make a live channel republish its whole
-// window the moment the source URL is replaced with a freshly signed one.
-func segKey(seg *manifest.Segment) string {
-	if seg.Identity != "" {
-		return seg.Identity + rangeKey(seg.Range)
+// segIDKey is the segment's manifest identity (the HLS media sequence, the
+// DASH number or presentation time), or "" when the format gives none. It is
+// stable across a re-signed URL, but a source that rewinds its numbering can
+// hand the same identity to new content.
+func segIDKey(seg *manifest.Segment) string {
+	if seg.Identity == "" {
+		return ""
 	}
-	return seg.URL + rangeKey(seg.Range)
+	return seg.Identity + rangeKey(seg.Range)
+}
+
+// segURLKey names a segment by its URL with the signature query stripped.
+// Formats that give no identity dedup by this, and every segment falls back
+// to it once the numbering rewinds: a CDN that re-signs its URLs hands the
+// same segment out under a new query string, and the path is what names the
+// content.
+func segURLKey(seg *manifest.Segment) string {
+	return urlKey(seg.URL) + rangeKey(seg.Range)
+}
+
+// initKey names an init segment the same way segURLKey names a segment.
+func initKey(u string, r *manifest.ByteRange) string {
+	return urlKey(u) + rangeKey(r)
+}
+
+// urlKey drops the query and fragment, which is where CDN signatures live.
+func urlKey(u string) string {
+	if i := strings.IndexAny(u, "?#"); i >= 0 {
+		return u[:i]
+	}
+	return u
+}
+
+// dedupKey is the item's content-stable name, used to key its part file: the
+// manifest identity when there is one, else the signature-stripped URL.
+func (it item) dedupKey() string {
+	if it.isInit {
+		return "init:" + initKey(it.url, it.rng)
+	}
+	if it.seg != nil {
+		if id := segIDKey(it.seg); id != "" {
+			return "id:" + id
+		}
+		return "url:" + segURLKey(it.seg)
+	}
+	return "url:" + urlKey(it.url) + rangeKey(it.rng)
 }
 
 func rangeKey(r *manifest.ByteRange) string {
@@ -555,7 +882,7 @@ func worker(ctx context.Context, cfg Config, ctl *controller, outPath string, it
 		if cfg.Progress != nil {
 			cfg.Progress.AddConns(1)
 		}
-		pressure, err := downloadSegment(ctx, cfg, ctl, it, partPath(cfg.PartDir, outPath, it.idx))
+		pressure, err := downloadSegment(ctx, cfg, ctl, it, partPathFor(cfg.PartDir, outPath, it))
 		if cfg.Progress != nil {
 			cfg.Progress.AddConns(-1)
 		}
@@ -853,6 +1180,7 @@ func writer(ctx context.Context, cfg Config, live bool, out *os.File, outPath st
 			return err
 		}
 		state.Offset += int64(len(data))
+		state.recordCommit(p.it)
 		return nil
 	}
 	// Checkpoint after every commit. This process may be killed without warning
@@ -958,7 +1286,17 @@ func sinkWriter(ctx context.Context, cfg Config, live bool, outPath string, stat
 		}
 		return nil
 	}
-	return commitInOrder(cfg, live, state, results, commit, nil)
+	// sinkWriter commits segments to a Sink (live restreaming) instead of a
+	// file: same ordering and hole tolerance, no output file, no resume
+	// checkpoint. The committed keys are still recorded: the feeder's dedup
+	// reads them to keep a replaced or rewound source from republishing.
+	return commitInOrder(cfg, live, state, results, func(idx int64, p pend) error {
+		err := commit(idx, p)
+		if err == nil && !p.hole {
+			state.recordCommit(p.it)
+		}
+		return err
+	}, nil)
 }
 
 // pacePrimeSegments is how many segments a paced restream sends back to back
@@ -973,7 +1311,7 @@ const pacePrimeSegments = 3
 // stream would leave its segments behind, and 1430 of those directories once
 // took up 43 GB that nobody could see.
 func readDecrypt(ctx context.Context, cfg Config, kc *keyCache, dec *cencDecryptor, trackID uint32, outPath string, idx int64, it item) ([]byte, error) {
-	part := partPath(cfg.PartDir, outPath, idx)
+	part := partPathFor(cfg.PartDir, outPath, it)
 	data, err := os.ReadFile(part)
 	if err != nil {
 		return nil, fmt.Errorf("read segment %d: %w", idx, err)

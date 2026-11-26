@@ -252,7 +252,7 @@ func TestIntraSegmentResume(t *testing.T) {
 	}
 	out := filepath.Join(t.TempDir(), "out.ts")
 	// a prior run got 30 of seg1's 100 bytes before being killed
-	if err := os.WriteFile(partPath("", out, 1), content(1)[:30], 0o644); err != nil {
+	if err := os.WriteFile(partPathFor("", out, item{idx: 1, seg: &st.Segments[1]}), content(1)[:30], 0o644); err != nil {
 		t.Fatal(err)
 	}
 

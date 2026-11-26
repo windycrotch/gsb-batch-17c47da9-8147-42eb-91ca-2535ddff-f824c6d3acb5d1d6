@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"net/http"
@@ -26,6 +27,20 @@ func partPath(dir, outPath string, idx int64) string {
 		outPath = filepath.Join(dir, filepath.Base(outPath))
 	}
 	return fmt.Sprintf("%s.part%d", outPath, idx)
+}
+
+// partPathFor names a segment's part file. The name carries a short hash of
+// the segment's content key (its manifest identity, or its URL with the
+// signature stripped) alongside the index, because the index is only a
+// position in one run's listing: a source that rewound its numbering while
+// the process was down makes the next run hand the same index to a different
+// segment, and resuming that segment from the other's leftover bytes would
+// corrupt the output. The hash makes a stale part file belong to its own
+// segment or to none.
+func partPathFor(dir, outPath string, it item) string {
+	h := fnv.New32a()
+	h.Write([]byte(it.dedupKey()))
+	return fmt.Sprintf("%s-%08x", partPath(dir, outPath, it.idx), h.Sum32())
 }
 
 // downloadSegment streams one segment's raw body into its part file. It
