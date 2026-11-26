@@ -6,6 +6,9 @@ import (
 	"flag"
 	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 ////////////////////////////////////////////////////////////////////////////
@@ -39,7 +42,8 @@ func init() {
 	debug(Opts.CRF, 3)
 
 	flag.Usage = Usage
-	flag.Parse()
+	parseFlags() // no-op inside the go-test binary (its -test.* flags
+	// are unknown to this flag set)
 
 	initDefaults() // read & populate defaults from ffcvt.json
 	debug(Opts.CRF, 3)
@@ -47,12 +51,31 @@ func init() {
 	getDefault() // re-read defaults based on cli -cfg & -t
 	//fmt.Fprintf(os.Stderr, "Defaults: '%+v'\n", Defaults)
 	debug(Opts.CRF, 3)
-	flag.Parse() // update Opts again from cli to overwrite defaults if necessary
+	parseFlags() // update Opts again from cli to overwrite defaults if necessary
 	initVals()   // update as per cli settings
 }
 
-//go:embed ffcvt.json
+// underTest reports whether the process is the generated go-test
+// binary (named pkg.test / pkg.test.exe), whose command line carries
+// -test.* flags this package's flag set does not define.
+func underTest() bool {
+	base := filepath.Base(os.Args[0])
+	return strings.HasSuffix(base, ".test") ||
+		strings.HasSuffix(base, ".test.exe")
+}
+
+// parseFlags parses the command line in normal builds and stays out of
+// the way under go test, where the testing harness owns the flags.
+func parseFlags() {
+	if underTest() {
+		return
+	}
+	flag.Parse()
+}
+
 // see https://pkg.go.dev/embed
+//
+//go:embed ffcvt.json
 var f embed.FS
 
 func initDefaults() {
