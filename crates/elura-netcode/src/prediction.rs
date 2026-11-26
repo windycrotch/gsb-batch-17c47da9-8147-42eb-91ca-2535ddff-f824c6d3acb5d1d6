@@ -127,6 +127,51 @@ impl<I, S> PredictionBuffer<I, S> {
     pub fn frames(&self) -> impl Iterator<Item = &PredictionFrame<I, S>> {
         self.frames.iter()
     }
+
+    /// Validates a reconnect against an authoritative Tick without mutating the buffer.
+    ///
+    /// An authoritative Tick behind the local confirmed Tick is refused, and the number of local
+    /// inputs strictly after the authoritative Tick that would have to be replayed must fit inside
+    /// the configured replay bound.
+    pub(crate) fn check_reconnect(&self, authoritative_server_tick: u64) -> NetcodeResult<usize> {
+        if authoritative_server_tick < self.confirmed_tick {
+            return Err(NetcodeError::InvalidInput(
+                "authoritative prediction Tick moved backwards",
+            ));
+        }
+        let retained = self
+            .frames
+            .iter()
+            .filter(|frame| frame.tick > authoritative_server_tick)
+            .count();
+        if retained > self.config.max_replay_steps {
+            return Err(NetcodeError::ReplayLimitExceeded);
+        }
+        Ok(retained)
+    }
+
+    /// Commits a previously validated reconnect, discarding confirmed frames.
+    ///
+    /// Only local inputs recorded strictly after the authoritative Tick survive, so inputs already
+    /// confirmed before the disconnect are never treated as pending replay work.
+    pub(crate) fn commit_reconnect(&mut self, authoritative_server_tick: u64) -> usize {
+        let before = self.frames.len();
+        self.frames
+            .retain(|frame| frame.tick > authoritative_server_tick);
+        self.confirmed_tick = authoritative_server_tick;
+        before - self.frames.len()
+    }
+
+    /// Restores prediction progress from a reconnect handshake.
+    ///
+    /// On success the buffer's confirmed Tick becomes the handshake's authoritative Tick and only
+    /// later local inputs remain for replay. A backwards Tick or a replay set larger than the
+    /// configured limit leaves the buffer completely unchanged so the caller can re-handshake.
+    pub fn reconnect(&mut self, authoritative_server_tick: u64) -> NetcodeResult<usize> {
+        let retained = self.check_reconnect(authoritative_server_tick)?;
+        self.commit_reconnect(authoritative_server_tick);
+        Ok(retained)
+    }
 }
 
 impl<I, S> PredictionBuffer<I, S>

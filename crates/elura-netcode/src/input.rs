@@ -208,6 +208,11 @@ impl<T> InputSender<T> {
         self.acknowledged_sequence
     }
 
+    /// Returns the highest input sequence this sender has issued so far.
+    pub fn last_issued_sequence(&self) -> u64 {
+        self.next_sequence - 1
+    }
+
     /// Returns the highest authoritative server Tick observed in an acknowledgement.
     pub fn acknowledged_server_tick(&self) -> u64 {
         self.acknowledged_server_tick
@@ -221,6 +226,67 @@ impl<T> InputSender<T> {
     /// Returns whether no unacknowledged inputs remain.
     pub fn is_empty(&self) -> bool {
         self.history.is_empty()
+    }
+
+    /// Validates a reconnect handshake against the issued input range without mutating state.
+    ///
+    /// A handshake may only acknowledge sequences the sender has actually issued. A cumulative
+    /// acknowledgement behind the sender's own progress is harmless (the sender simply keeps its
+    /// higher water mark), but one beyond the largest issued sequence can never be valid.
+    pub(crate) fn check_reconnect(
+        &self,
+        acknowledged_sequence: u64,
+        _authoritative_server_tick: u64,
+    ) -> NetcodeResult<usize> {
+        if acknowledged_sequence > self.last_issued_sequence() {
+            return Err(NetcodeError::InvalidAcknowledgement);
+        }
+        let cutoff = self.acknowledged_sequence.max(acknowledged_sequence);
+        let released = self
+            .history
+            .iter()
+            .filter(|frame| frame.sequence <= cutoff)
+            .count();
+        Ok(released)
+    }
+
+    /// Commits a previously validated handshake, dropping only confirmed inputs.
+    ///
+    /// Inputs already confirmed before the disconnect stay discarded: the handshake acknowledgement
+    /// is combined with the local high-water mark rather than resetting it, so no confirmed frame
+    /// can re-enter the history.
+    pub(crate) fn commit_reconnect(
+        &mut self,
+        acknowledged_sequence: u64,
+        authoritative_server_tick: u64,
+    ) -> usize {
+        self.acknowledged_sequence = self.acknowledged_sequence.max(acknowledged_sequence);
+        self.acknowledged_server_tick =
+            self.acknowledged_server_tick.max(authoritative_server_tick);
+        let before = self.history.len();
+        while self
+            .history
+            .front()
+            .is_some_and(|frame| frame.sequence <= self.acknowledged_sequence)
+        {
+            self.history.pop_front();
+        }
+        before - self.history.len()
+    }
+
+    /// Restores the sender from a reconnect handshake.
+    ///
+    /// On success the sender resumes from the server's acknowledged progress: its next generated
+    /// sequence is unchanged (input numbering never restarts at one) and the retained history holds
+    /// only inputs the server has not cumulatively acknowledged, so later packets carry only
+    /// genuinely unconfirmed inputs. An impossible acknowledgement leaves the sender unchanged.
+    pub fn reconnect(
+        &mut self,
+        acknowledged_sequence: u64,
+        authoritative_server_tick: u64,
+    ) -> NetcodeResult<usize> {
+        self.check_reconnect(acknowledged_sequence, authoritative_server_tick)?;
+        Ok(self.commit_reconnect(acknowledged_sequence, authoritative_server_tick))
     }
 }
 
@@ -409,6 +475,22 @@ impl InputReceiver {
     /// Returns the highest contiguous received input sequence.
     pub fn acknowledged_sequence(&self) -> u64 {
         self.sequences.acknowledged()
+    }
+
+    /// Builds the reconnect handshake a server offers a client resuming this stream.
+    ///
+    /// The receiver keeps its existing de-duplication window, so inputs carried by in-flight packets
+    /// sent before the disconnect are observed against the same cumulative acknowledgement and are
+    /// classified as duplicates instead of new inputs; the cumulative acknowledgement can therefore
+    /// never move backwards.
+    pub fn reconnect_handshake(
+        &self,
+        authoritative_server_tick: u64,
+    ) -> crate::reconnect::ReconnectHandshake {
+        crate::reconnect::ReconnectHandshake {
+            acknowledged_sequence: self.sequences.acknowledged(),
+            authoritative_server_tick,
+        }
     }
 
     /// Returns the number of out-of-order sequences waiting for a gap.

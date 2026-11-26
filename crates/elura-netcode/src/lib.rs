@@ -13,6 +13,7 @@ mod error;
 mod input;
 mod interpolation;
 mod prediction;
+mod reconnect;
 mod tick_sync;
 
 pub use entity_prediction::{
@@ -29,6 +30,7 @@ pub use interpolation::{
     InterpolationStats,
 };
 pub use prediction::{PredictionBuffer, PredictionConfig, PredictionFrame, ReconciliationReport};
+pub use reconnect::{ReconnectHandshake, ReconnectReport, recover_connection};
 pub use tick_sync::{
     TickSyncConfig, TickSyncReport, TickSyncRequest, TickSyncResponse, TickSyncSample,
     TickSynchronizer,
