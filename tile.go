@@ -55,13 +55,15 @@ type DecodedTile struct {
 
 // Draw will draw the tile to the target provided.  This will calculate the sprite from the provided tileset and set the
 // DecodedTiles' internal `sprite` property; this is so it is only calculated the first time.
-func (t *DecodedTile) Draw(ind, columns, numRows int, ts *Tileset, target pixel.Target, offset pixel.Vec) {
+func (t *DecodedTile) Draw(ind, columns, numRows int, ts *Tileset, target pixel.Target, offset pixel.Vec) error {
 	if t.IsNil() {
-		return
+		return nil
 	}
 
 	if t.sprite == nil {
-		t.setSprite(columns, numRows, ts)
+		if err := t.setSprite(columns, numRows, ts); err != nil {
+			return err
+		}
 
 		// Calculate the framing for the tile within its tileset's source image
 		pos := t.Position(ind, ts)
@@ -79,6 +81,7 @@ func (t *DecodedTile) Draw(ind, columns, numRows int, ts *Tileset, target pixel.
 		t.transform = transform
 	}
 	t.sprite.Draw(target, t.transform.Moved(offset))
+	return nil
 }
 
 // Position returns the relative game position.
@@ -98,12 +101,15 @@ func (t *DecodedTile) IsNil() bool {
 }
 
 func (t *DecodedTile) setParent(m *Map) {
+	if t == nil {
+		return
+	}
 	t.parentMap = m
 }
 
-func (t *DecodedTile) setSprite(columns, numRows int, ts *Tileset) {
+func (t *DecodedTile) setSprite(columns, numRows int, ts *Tileset) error {
 	if t.IsNil() {
-		return
+		return nil
 	}
 
 	if t.sprite == nil {
@@ -114,6 +120,11 @@ func (t *DecodedTile) setSprite(columns, numRows int, ts *Tileset) {
 		iY := float64(y)*float64(ts.TileHeight) + float64(ts.Margin+ts.Spacing*(y-1))
 		fY := iY + float64(ts.TileHeight)
 
-		t.sprite = pixel.NewSprite(ts.setSprite(), pixel.R(iX, iY, fX, fY))
+		picture, err := ts.setSprite()
+		if err != nil {
+			return err
+		}
+		t.sprite = pixel.NewSprite(picture, pixel.R(iX, iY, fX, fY))
 	}
+	return nil
 }

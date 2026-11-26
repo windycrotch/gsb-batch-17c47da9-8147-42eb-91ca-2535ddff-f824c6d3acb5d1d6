@@ -155,25 +155,33 @@ func Read(r io.Reader, dir string, openFileFunc func(name string) (http.File, er
 	}
 
 	log.WithField("Tileset count", len(m.Tilesets)).Debug("Read: processing tilesets")
+	// Preload every tileset sprite now, while the map is still being built.  A
+	// missing or unreadable atlas is an error: returning it here means the
+	// caller never receives a half-initialised map whose batches would fail
+	// later at draw time.
 	for _, ts := range m.Tilesets {
-		ts.setSprite()
+		if _, err := ts.setSprite(); err != nil {
+			log.WithError(err).Error("Read: could not preload tileset sprite")
+			return nil, err
+		}
 	}
 
 	return &m, nil
 }
 
 // ReadFile will read, decode and initialise a Tiled Map from a file path.
+//
+// Concurrent calls for the same path are deduplicated (single-flight): only one
+// load runs and every concurrent caller receives the same fully initialised
+// map, or the same explicit error.  A load error is never retained, so a later
+// call for the same path retries the load instead of being stuck in a failed
+// state, and a failed load never disturbs a map which was returned successfully
+// earlier.  Sequential calls each perform a fresh load whose batches and
+// sprites are independent of the previous map, so no state leaks between maps.
 func ReadFile(filePath string) (*Map, error) {
 	log.WithField("Filepath", filePath).Debug("ReadFile: reading file")
 
-	f, err := os.Open(filePath)
-	if err != nil {
-		log.WithError(err).Error("ReadFile: could not open file")
-		return nil, err
-	}
-	defer f.Close()
-
-	dir := filepath.Dir(filePath)
-
-	return Read(f, dir, nil)
+	return maps.loadFile(filePath, func() (*Map, error) {
+		return loadMapFromFile(filePath)
+	})
 }

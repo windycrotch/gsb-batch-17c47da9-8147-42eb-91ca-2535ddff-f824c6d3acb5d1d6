@@ -2,6 +2,7 @@ package tilepix
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -144,10 +145,20 @@ func (ts *Tileset) setParent(m *Map) {
 	}
 }
 
-func (ts *Tileset) setSprite() pixel.Picture {
+// setSprite loads and caches the sprite for the tileset's source image.  The
+// first call loads the picture data from disk; later calls return the cached
+// picture.  A missing or unreadable image is returned as an error rather than
+// being swallowed, so callers never build batches against a nil picture.
+func (ts *Tileset) setSprite() (pixel.Picture, error) {
 	if ts.sprite != nil {
 		// Return if sprite already set
-		return ts.picture
+		return ts.picture, nil
+	}
+
+	if ts.Image == nil {
+		err := errors.New("tileset has no image to create sprite from")
+		log.WithError(err).Error("Tileset.setSprite: tileset image is nil")
+		return nil, err
 	}
 
 	dir := ts.dir
@@ -155,15 +166,16 @@ func (ts *Tileset) setSprite() pixel.Picture {
 		dir = ts.parentMap.dir
 	}
 
-	sprite, pictureData, err := loadSpriteFromFile(filepath.Join(dir, ts.Image.Source))
+	imagePath := filepath.Join(dir, ts.Image.Source)
+	sprite, pictureData, err := loadSpriteFromFile(imagePath)
 	if err != nil {
-		log.WithField("Filepath", filepath.Join(dir, ts.Image.Source)).WithError(err).Error("Tileset.setSprite: could not load sprite from file")
-		return nil
+		log.WithField("Filepath", imagePath).WithError(err).Error("Tileset.setSprite: could not load sprite from file")
+		return nil, err
 	}
 
 	ts.sprite = sprite
 	ts.picture = pictureData
-	return ts.picture
+	return ts.picture, nil
 }
 
 // TileObjects will return all ObjectGroups contained in Tiles.

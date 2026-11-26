@@ -52,7 +52,11 @@ func (l *TileLayer) Batch() (*pixel.Batch, error) {
 			return nil, err
 		}
 
-		pictureData := l.Tileset.setSprite()
+		pictureData, err := l.Tileset.setSprite()
+		if err != nil {
+			log.WithError(err).Error("TileLayer.Batch: could not get tileset picture")
+			return nil, err
+		}
 		l.batch = pixel.NewBatch(&pixel.TrianglesData{}, pictureData)
 	}
 
@@ -79,7 +83,10 @@ func (l *TileLayer) Draw(target pixel.Target) error {
 			// The Y component of the offset is set in Tiled from top down, setting here to negative because we want
 			// from the bottom up.
 			layerOffset := pixel.V(l.OffSetX, -l.OffSetY)
-			tile.Draw(tileIndex, ts.Columns, numRows, ts, l.batch, layerOffset)
+			if err := tile.Draw(tileIndex, ts.Columns, numRows, ts, l.batch, layerOffset); err != nil {
+				log.WithError(err).Error("TileLayer.Draw: could not draw tile")
+				return err
+			}
 		}
 
 		// Batch is drawn to, layer is no longer dirty.
@@ -121,7 +128,9 @@ func (l *TileLayer) decode(width, height int) ([]GID, error) {
 	l.SetDirty(true)
 
 	if l.Tileset != nil {
-		l.Tileset.setSprite()
+		if _, err := l.Tileset.setSprite(); err != nil {
+			return nil, err
+		}
 	}
 
 	switch l.Data.Encoding {

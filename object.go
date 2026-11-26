@@ -148,7 +148,10 @@ func (o *Object) GetTile() (*DecodedTile, error) {
 		}
 
 		numRows := ts.Tilecount / ts.Columns
-		o.tile.setSprite(ts.Columns, numRows, ts)
+		if err := o.tile.setSprite(ts.Columns, numRows, ts); err != nil {
+			log.WithError(err).Error("Object.GetTile: could not set tile sprite")
+			return nil, err
+		}
 	}
 
 	return o.tile, nil
