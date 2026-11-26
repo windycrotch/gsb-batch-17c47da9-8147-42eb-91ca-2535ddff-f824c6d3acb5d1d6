@@ -30,7 +30,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"time"
+	"sync"
 
 	"github.com/DblK/shottower/config"
 	"github.com/google/uuid"
@@ -40,15 +40,53 @@ import (
 // This service should implement the business logic for every endpoint for the EditApi API.
 // Include any external packages or services that will be required by this service.
 type EditAPIService struct {
-	renders []*RenderQueue
-	config  config.ShottowerConfiguration
+	// mu protects renders, rendersByID and enqueueListeners.
+	mu sync.RWMutex
+
+	renders     []*RenderQueue
+	rendersByID map[string]*RenderQueue
+
+	// enqueueListeners are invoked (with the new render id) after a render is
+	// stored. The processing queue uses this as a wake-up signal.
+	enqueueListeners []func(string)
+
+	config config.ShottowerConfiguration
 }
 
 // NewEditAPIService creates a default api service
 func NewEditAPIService(cfg config.ShottowerConfiguration) EditAPIServicer {
 	return &EditAPIService{
-		config: cfg,
+		config:      cfg,
+		renders:     make([]*RenderQueue, 0),
+		rendersByID: make(map[string]*RenderQueue),
 	}
+}
+
+// OnRenderEnqueued registers a callback invoked whenever a render is posted.
+func (s *EditAPIService) OnRenderEnqueued(listener func(string)) {
+	if listener == nil {
+		return
+	}
+	s.mu.Lock()
+	s.enqueueListeners = append(s.enqueueListeners, listener)
+	s.mu.Unlock()
+}
+
+// LookupRender returns the tracked render with the given id.
+func (s *EditAPIService) LookupRender(id string) (*RenderQueue, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.rendersByID != nil {
+		if rq, ok := s.rendersByID[id]; ok {
+			return rq, true
+		}
+	}
+	for _, rq := range s.renders {
+		if rq != nil && rq.ID == id {
+			return rq, true
+		}
+	}
+	return nil, false
 }
 
 // DeleteTemplate - Delete Template
@@ -63,14 +101,20 @@ func (s *EditAPIService) DeleteTemplate(ctx context.Context, id string) (ImplRes
 }
 
 func (s *EditAPIService) GetQueue() []*RenderQueue {
-	return s.renders
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	queue := make([]*RenderQueue, len(s.renders))
+	copy(queue, s.renders)
+	return queue
 }
 
 func (s *EditAPIService) GetQueuePending() []*RenderQueue {
+	queue := s.GetQueue()
 	filteredQueue := make([]*RenderQueue, 0)
 
-	for _, render := range s.renders {
-		if render.Status == Queued {
+	for _, render := range queue {
+		if render != nil && render.GetStatus() == Queued {
 			filteredQueue = append(filteredQueue, render)
 		}
 	}
@@ -79,39 +123,46 @@ func (s *EditAPIService) GetQueuePending() []*RenderQueue {
 
 // GetRender - Get Render Status
 func (s *EditAPIService) GetRender(ctx context.Context, id string, data bool, merged bool) (ImplResponse, error) {
-	var renderQueue *RenderQueue
-	for _, n := range s.renders {
-		if n.ID == id {
-			renderQueue = n
-		}
-	}
+	renderQueue, found := s.LookupRender(id)
 
-	if renderQueue == nil {
+	if !found || renderQueue == nil {
 		return Response(http.StatusNotFound, nil), errors.New("Can not find id: '" + id + "'")
 	}
 
-	var responseData = RenderResponseData{
+	// Snapshot all mutable fields under the render state lock so the response
+	// always reflects one coherent point in the lifecycle.
+	renderQueue.rLockState()
+	responseData := RenderResponseData{
 		ID:      renderQueue.ID,
 		Owner:   "me",
 		Plan:    "free",
 		Status:  renderQueue.Status.String(),
+		Error:   renderQueue.Error,
 		Created: renderQueue.Created.Format("2006-01-02T15:04:05.123Z"),
 		Updated: renderQueue.Updated.Format("2006-01-02T15:04:05.123Z"),
 	}
 
 	if renderQueue.Status == Done {
-		responseData.URL = s.config.GetDownloadBaseURL() + "/renders/" + renderQueue.ID
-		responseData.Duration = renderQueue.FFMPEGCommand.GetDuration()
+		if s.config != nil {
+			responseData.URL = s.config.GetDownloadBaseURL() + "/renders/" + renderQueue.ID
+		} else {
+			responseData.URL = "/renders/" + renderQueue.ID
+		}
+		if renderQueue.FFMPEGCommand != nil {
+			responseData.Duration = renderQueue.FFMPEGCommand.GetDuration()
+		}
 		responseData.RenderTime = float32(renderQueue.Updated.Sub(renderQueue.Created).Milliseconds())
 	}
+
+	if data {
+		responseData.Data = renderQueue.Data
+	}
+	renderQueue.rUnlockState()
 
 	var response = RenderResponse{
 		Success:  true,
 		Message:  "OK",
 		Response: responseData,
-	}
-	if data {
-		response.Response.Data = renderQueue.Data
 	}
 	return Response(200, response), nil
 }
@@ -141,22 +192,35 @@ func (s *EditAPIService) GetTemplates(ctx context.Context) (ImplResponse, error)
 // PostRender - Render Asset
 func (s *EditAPIService) PostRender(ctx context.Context, edit Edit) (ImplResponse, error) {
 	var newUUID, _ = uuid.NewRandom()
+	id := newUUID.String()
+	renderQueue := NewRenderQueue(id, edit)
 
-	// Push a new render
-	s.renders = append(s.renders, &RenderQueue{
-		ID:      newUUID.String(),
-		Data:    edit,
-		Status:  Queued,
-		Created: time.Now(),
-		Updated: time.Now(),
-	})
+	// Push a new render under the store lock so concurrent requests can never
+	// overwrite each other's slice backing array or index entry.
+	s.mu.Lock()
+	if s.rendersByID == nil {
+		s.rendersByID = make(map[string]*RenderQueue)
+	}
+	s.renders = append(s.renders, renderQueue)
+	s.rendersByID[id] = renderQueue
+	listeners := make([]func(string), len(s.enqueueListeners))
+	copy(listeners, s.enqueueListeners)
+	s.mu.Unlock()
+
+	// Wake the processing queue outside of the store lock.
+	for _, listener := range listeners {
+		func(fn func(string)) {
+			defer func() { _ = recover() }()
+			fn(id)
+		}(listener)
+	}
 
 	return Response(201, QueuedResponse{
 		Success: true,
 		Message: "Created",
 		Response: QueuedResponseData{
 			Message: "Render Successfully Queued",
-			ID:      newUUID.String(),
+			ID:      id,
 		},
 	}), nil
 }

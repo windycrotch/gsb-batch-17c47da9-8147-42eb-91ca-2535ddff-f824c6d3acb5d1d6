@@ -530,7 +530,7 @@ func (s *FFMPEG) ToFFMPEG(renderQueue *RenderQueue, queue *ProcessingQueue) erro
 	_ = s.SetOutputFormat(renderQueue.Data.Output.Format)
 	_ = s.SetOutputQuality(renderQueue.Data.Output.Quality)
 	_ = s.SetOutputRepeat(renderQueue.Data.Output.Repeat)
-	s.currentID = queue.currentQueue.ID
+	s.currentID = renderQueue.ID
 	if renderQueue.Data.Output.Fps != nil {
 		_ = s.SetOutputFps(*renderQueue.Data.Output.Fps)
 	}

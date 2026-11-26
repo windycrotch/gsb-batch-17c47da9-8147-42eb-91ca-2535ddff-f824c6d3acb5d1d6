@@ -25,7 +25,11 @@ type LocalResource struct {
 	LocalURL         string
 	KeepCache        bool
 	IsRemoteResource bool
-	Used             []*LocalResourceTrackInfo
+	// Cleaned is true once the temporary local file has been removed after a
+	// render completed/failed. The metadata is retained for inspection, but
+	// subsequent renders must download the resource again.
+	Cleaned bool
+	Used    []*LocalResourceTrackInfo
 }
 
 type LocalResourceTrackInfo struct {

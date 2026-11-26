@@ -63,5 +63,5 @@ func (s *DownloadAPIService) DownloadByID(ctx context.Context, id string) (ImplR
 		return Response(http.StatusNotFound, nil), errors.New("Can not find id: '" + id + "'")
 	}
 
-	return Response(200, renderQueue.FileName), nil
+	return Response(200, renderQueue.GetFileName()), nil
 }

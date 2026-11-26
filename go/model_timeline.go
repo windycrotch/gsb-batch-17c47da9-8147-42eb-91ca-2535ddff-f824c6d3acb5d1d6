@@ -44,7 +44,13 @@ type Timeline struct {
 	Tracks []Track `json:"tracks"`
 
 	// Disable the caching of ingested source footage and assets. See  [caching](https://shotstack.io/docs/guide/architecting-an-application/caching) for more details.
-	Cache bool `json:"cache,omitempty" default:"true"`
+	//
+	// Cache defaults to false for lifecycle cleanup: temporary source assets are
+	// removed once their render reaches a terminal state. Set it to true to pin
+	// downloaded assets and skip their removal. There is deliberately no
+	// `default:"true"` struct tag because the defaults package cannot distinguish
+	// an explicit false from an omitted bool and would overwrite cache:false.
+	Cache bool `json:"cache,omitempty"`
 }
 
 // AssertTimelineRequired checks if the required fields are not zero-ed
