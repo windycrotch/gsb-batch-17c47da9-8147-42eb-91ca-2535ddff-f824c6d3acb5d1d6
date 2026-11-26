@@ -268,7 +268,10 @@ func (l *WebSocketNetListener) handleWebSocket(w http.ResponseWriter, r *http.Re
 
 // Accept 接收请求
 func (l *WebSocketNetListener) Accept() (NetConn, error) {
-	conn := <-l.connChan
+	conn, ok := <-l.connChan
+	if !ok || conn == nil {
+		return nil, net.ErrClosed
+	}
 
 	return NewWebSocketNetConn(conn, l.config), nil
 }

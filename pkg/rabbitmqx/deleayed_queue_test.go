@@ -2,22 +2,33 @@ package rabbitmqx
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/wagslane/go-rabbitmq"
 )
 
+func rabbitMQTestURL(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("RABBITMQ_URL")
+	if url == "" {
+		t.Skip("skip external RabbitMQ test; set RABBITMQ_URL to enable it")
+	}
+	return url
+}
+
 func TestNewDelayedQueue(t *testing.T) {
+	url := rabbitMQTestURL(t)
 	config := NewConfigByMap(map[string]interface{}{
-		"mqurl":      "amqp://admin:123456@192.168.33.10:5672/app",
+		"mqurl":      url,
 		"exchange":   "test.deleayed.ex",
 		"routingkey": "test.deleayed.rk",
 		"queue":      "test.deleayed.queue",
 	})
 	d, err := NewDelayedQueueConsumer(config)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 
 	d.Consume(func(d rabbitmq.Delivery) (action rabbitmq.Action) {
@@ -29,15 +40,13 @@ func TestNewDelayedQueue(t *testing.T) {
 }
 
 func TestPublishDelayed(t *testing.T) {
-	p, err := NewPublisher("amqp://admin:123456@192.168.33.10:5672/app")
+	url := rabbitMQTestURL(t)
+	p, err := NewPublisher(url)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	p.SetExchange("test.deleayed.ex")
 	p.SetRoutingKey([]string{"test.deleayed.rk"})
-	if err != nil {
-		t.Error(err)
-	}
 
 	t.Logf("Send: %v", time.Now().Unix())
 	if err := p.PublishDelayed([]byte("11111"), 1000*10); err != nil {

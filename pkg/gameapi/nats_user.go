@@ -46,6 +46,10 @@ func NewUserNats(natsUrl string, serverName string) (*UserNats, error) {
 
 // Puslish 发送用户消息
 func (u *UserNats) Publish(userID int64, p Packet) error {
+	if u == nil || u.nc == nil {
+		return ErrUserNoIn
+	}
+
 	pushMsg := PushActorMessage{
 		UserID: userID,
 		OpCode: p.OpCode(),
@@ -109,14 +113,22 @@ func (u *UserNats) Consume() <-chan PushActorMessage {
 
 // Close 关闭
 func (u *UserNats) Close() {
+	if u == nil {
+		return
+	}
+
 	u.closeOnce.Do(func() {
-		close(u.closeChan)
+		if u.closeChan != nil {
+			close(u.closeChan)
+		}
 		if u.receiveChan != nil {
 			close(u.receiveChan)
 		}
 		if u.sub != nil {
-			u.sub.Unsubscribe()
+			_ = u.sub.Unsubscribe()
 		}
-		u.nc.Close()
+		if u.nc != nil {
+			u.nc.Close()
+		}
 	})
 }

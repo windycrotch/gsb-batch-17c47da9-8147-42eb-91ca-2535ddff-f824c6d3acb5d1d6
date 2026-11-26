@@ -137,9 +137,10 @@ func (c *DefaultContext) SendActorPush(userID int64, opcode interface{}, msg pro
 
 // Valid 验证成功
 func (c *DefaultContext) Valid(userID int64) {
-	c.a.AddSession(userID, c.session)
-	c.session.valid()
+	// 先固化身份和有效状态，再发布在线归属，避免在线表先出现尚未完成登录标记的会话。
 	c.session.SetUserID(userID)
+	c.session.valid()
+	c.a.AddSession(userID, c.session)
 }
 
 // GetOpCode 获取此次处理的opcode

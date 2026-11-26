@@ -44,6 +44,11 @@ type (
 
 		sessions  map[int64]*Session // 有效Session映射
 		sessionMu sync.RWMutex
+
+		activeSessions map[int64]*Session // 全部活动Session，包含尚未登录的连接
+		activeMu       sync.Mutex
+
+		pushClient PacketPublisher // 跨实例推送出口，默认使用NATS
 	}
 
 	// Middleware 中间件处理
@@ -66,6 +71,11 @@ type (
 
 	// Handler 处理类型
 	Handler func(Context) error
+
+	// PacketPublisher 跨实例消息发布器。
+	PacketPublisher interface {
+		Publish(userID int64, p Packet) error
+	}
 
 	// SessionCreator session创建生成器，做一些预处理
 	SessionCreator func(net.Conn, *App) *Session
@@ -100,6 +110,8 @@ func New(name string, configPath string, addr string, instancdID int64) *App {
 	app.router = make(map[uint16]Handler)
 	app.exitChan = make(chan struct{})
 	app.sessions = make(map[int64]*Session)
+	app.activeSessions = make(map[int64]*Session)
+	app.pushClient = un
 	return app
 }
 
@@ -142,27 +154,92 @@ func (a *App) AddModule(module Module) {
 	a.modules = append(a.modules, module)
 }
 
-// AddSession 加入Session
+// AddSession 加入Session。
+// 同一账号以最近一次登录成功的会话为准；新会话接管时会关闭旧会话。
 func (a *App) AddSession(userID int64, session *Session) {
-	a.sessionMu.Lock()
-	defer a.sessionMu.Unlock()
+	if a == nil || session == nil || session.IsClosed() {
+		return
+	}
 
-	// 已有Session，关闭
-	if oldSession, ok := a.sessions[userID]; ok {
+	session.SetUserID(userID)
+
+	a.sessionMu.Lock()
+	if a.sessions == nil {
+		a.sessions = make(map[int64]*Session)
+	}
+
+	oldSession := a.sessions[userID]
+	if oldSession == session {
+		a.sessionMu.Unlock()
+		return
+	}
+
+	a.sessions[userID] = session
+	a.sessionMu.Unlock()
+
+	// 不能持锁关闭：Close会同步做归属清理，清理路径需要获取sessionMu。
+	if oldSession != nil {
 		oldSession.Close()
 	}
-	a.sessions[userID] = session
 }
 
-// DelSession 删除Session
+// DelSession 删除Session。只有当前在线表仍指向传入的sessionID时才删除，
+// 因此旧连接延迟断线不会误删已经接管账号的新会话。
 func (a *App) DelSession(userID int64, sessionid int64) {
 	a.sessionMu.Lock()
 	defer a.sessionMu.Unlock()
 
-	if _session, ok := a.sessions[userID]; ok {
-		if _session.ID == sessionid {
-			delete(a.sessions, userID)
-		}
+	if _session, ok := a.sessions[userID]; ok && _session != nil && _session.ID == sessionid {
+		delete(a.sessions, userID)
+	}
+}
+
+// releaseSession 执行会话资源在在线表和活动连接表中的核心清理。
+// 每个Session最多执行一次，可由Close同步调用，也可由OnDisConnect兜底调用。
+func (a *App) releaseSession(session *Session) {
+	if a == nil || session == nil || !session.markCleaned() {
+		return
+	}
+
+	atomic.AddInt64(&a.totalConn, -1)
+	a.removeActiveSession(session)
+	// DelSession会同时校验userID和sessionID，因此未登录会话或旧会话都不会误删当前归属。
+	a.DelSession(session.UserID(), session.ID)
+}
+
+func (a *App) addActiveSession(session *Session) {
+	if a == nil || session == nil {
+		return
+	}
+
+	a.activeMu.Lock()
+	defer a.activeMu.Unlock()
+	if a.activeSessions == nil {
+		a.activeSessions = make(map[int64]*Session)
+	}
+	a.activeSessions[session.ID] = session
+}
+
+func (a *App) removeActiveSession(session *Session) {
+	if a == nil || session == nil {
+		return
+	}
+
+	a.activeMu.Lock()
+	defer a.activeMu.Unlock()
+	delete(a.activeSessions, session.ID)
+}
+
+func (a *App) closeAllSessions() {
+	a.activeMu.Lock()
+	sessions := make([]*Session, 0, len(a.activeSessions))
+	for _, session := range a.activeSessions {
+		sessions = append(sessions, session)
+	}
+	a.activeMu.Unlock()
+
+	for _, session := range sessions {
+		session.Close()
 	}
 }
 
@@ -178,9 +255,9 @@ func (a *App) SendActor(userID int64, opcode uint16, msg proto.Message) error {
 		return err
 	}
 
-	// 如果在本实例，则直接发送
+	// 如果在本实例，则直接发送；本地没有存活会话时，走跨实例推送路径。
 	err = a.sendActorLocation(userID, p)
-	if err == ErrUserNoIn {
+	if err == ErrUserNoIn || errors.Is(err, ErrConnClosing) {
 		// 发送给其他实例
 		return a.sendActorPush(userID, p)
 	}
@@ -201,37 +278,67 @@ func (a *App) SendAllActor(opcode uint16, msg proto.Message) error {
 // sendActorLocation 发送消息给本地实例
 func (a *App) sendActorLocation(userID int64, p Packet) error {
 	a.sessionMu.RLock()
-	defer a.sessionMu.RUnlock()
-	if session, ok := a.sessions[userID]; ok {
-		if !session.IsClosed() {
-			// 如果定义handler，必须发送给handler处理
-			if _, ok := a.router[p.OpCode()]; ok {
-				session.receiveChan <- p
-				return nil
-			}
-			return session.WritePacket(p)
-		}
+	session := a.sessions[userID]
+	a.sessionMu.RUnlock()
+
+	if session == nil {
+		return ErrUserNoIn
 	}
 
-	return ErrUserNoIn
+	// 在线表可能因并发关闭尚未完成兜底清理；这里按“不在本实例”处理，
+	// 并条件删除当前已关闭的归属，避免继续向死会话投递。
+	if session.IsClosed() {
+		a.DelSession(userID, session.ID)
+		return ErrUserNoIn
+	}
+
+	var err error
+	// 如果定义handler，必须发送给handler处理
+	if _, ok := a.router[p.OpCode()]; ok {
+		err = session.deliverReceivePacket(p)
+	} else {
+		err = session.WritePacket(p)
+	}
+	if err != nil {
+		if session.IsClosed() {
+			a.DelSession(userID, session.ID)
+			return ErrUserNoIn
+		}
+		return err
+	}
+
+	return nil
 }
 
 // sendAllActorLocation 像所有的本地玩家发送消息
 func (a *App) sendAllActorLocation(m PushActorMessage) error {
 	a.sessionMu.RLock()
-	defer a.sessionMu.RUnlock()
-	for userID := range a.sessions {
-		session := a.sessions[userID]
-		if !session.IsClosed() {
-			p := NewDefaultPacket(m.Msg, m.OpCode)
-			// 如果定义handler，必须发送给handler处理
-			if _, ok := a.router[p.OpCode()]; ok {
-				session.receiveChan <- p
-			} else {
-				if err := session.WritePacket(p); err != nil {
-					return err
-				}
+	sessions := make([]*Session, 0, len(a.sessions))
+	for _, session := range a.sessions {
+		sessions = append(sessions, session)
+	}
+	a.sessionMu.RUnlock()
+
+	for _, session := range sessions {
+		if session == nil || session.IsClosed() {
+			continue
+		}
+
+		p := NewDefaultPacket(m.Msg, m.OpCode)
+		var err error
+		// 如果定义handler，必须发送给handler处理
+		if _, ok := a.router[p.OpCode()]; ok {
+			err = session.deliverReceivePacket(p)
+		} else {
+			err = session.WritePacket(p)
+		}
+		if err != nil {
+			p.Free()
+			if session.IsClosed() || errors.Is(err, ErrConnClosing) {
+				a.DelSession(session.UserID(), session.ID)
+				continue
 			}
+			return err
 		}
 	}
 
@@ -240,7 +347,14 @@ func (a *App) sendAllActorLocation(m PushActorMessage) error {
 
 // sendActorPush 发送消息给远程实例
 func (a *App) sendActorPush(userID int64, p Packet) error {
-	return a.un.Publish(userID, p)
+	// 生产路径始终使用NATS；pushClient仅用于在无外部依赖的单测中替换推送出口。
+	if a.un != nil {
+		return a.un.Publish(userID, p)
+	}
+	if a.pushClient != nil {
+		return a.pushClient.Publish(userID, p)
+	}
+	return ErrUserNoIn
 }
 
 // Init 初始化服务
@@ -379,14 +493,31 @@ func (a *App) Start() error {
 
 // Stop 停止服务
 func (a *App) Stop() {
-	// 关闭资源
+	if a == nil {
+		return
+	}
+
 	a.closeOnce.Do(func() {
+		if a.exitChan == nil {
+			a.exitChan = make(chan struct{})
+		}
 		close(a.exitChan)
-		a.listener.Close()
-		a.serviceManager.Destory(a.Addr)
+
+		// 先停止接收新连接，再关闭所有现有连接并解除读循环阻塞。
+		if a.listener != nil {
+			a.listener.Close()
+		}
+		a.closeAllSessions()
+
+		if a.un != nil {
+			a.un.Close()
+		}
+		if a.serviceManager != nil {
+			_ = a.serviceManager.Destory(a.Addr)
+		}
 	})
 
-	// 等待所有携程执行完
+	// 等待读、写、处理等所有协程执行完。
 	a.waitGroup.Wait()
 }
 
@@ -413,15 +544,15 @@ func (a *App) OnMessage(session *Session, p Packet) bool {
 			defer p.Free()
 
 			ctx := NewDefaultContext(context.Background(), a, session, p.OpCode(), p.Body())
-			// 处理消息之前，中间件过滤
+			// 处理消息之前，中间件过滤。任一前置中间件拒绝后，不再进入Handler。
 			for _, m := range a.beforeMiddleware {
-				if !m.Condition(p.OpCode()) {
+				if m.Condition != nil && !m.Condition(p.OpCode()) {
 					continue
 				}
 
 				if err := m.Do(ctx); err != nil {
 					log.Errorf("Middle %d is Error: %v", p.OpCode(), err)
-					continue
+					return
 				}
 			}
 
@@ -433,7 +564,7 @@ func (a *App) OnMessage(session *Session, p Packet) bool {
 
 			// 处理之后，中间件操作
 			for _, m := range a.afterMiddleware {
-				if !m.Condition(p.OpCode()) {
+				if m.Condition != nil && !m.Condition(p.OpCode()) {
 					continue
 				}
 
@@ -450,17 +581,21 @@ func (a *App) OnMessage(session *Session, p Packet) bool {
 	return true
 }
 
-// OnDisConnect 断线处理
+// OnDisConnect 断线处理。
+// Session.Close保证该方法只会被调度一次；这里再做一次幂等保护，
+// 避免旧连接的延迟清理或测试/外部重复调用导致回调和计数重复。
 func (a *App) OnDisConnect(session *Session) {
-	atomic.AddInt64(&a.totalConn, -1)
-
-	if a.disconnectListener != nil {
-		a.disconnectListener(session)
+	if a == nil || session == nil {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&session.appNotifyFlag, 0, 1) {
+		return
 	}
 
-	// 从有效连接中删除
-	if session.IsValid() {
-		a.DelSession(session.UserID(), session.ID)
+	a.releaseSession(session)
+
+	if a.disconnectListener != nil {
+		_ = a.disconnectListener(session)
 	}
 }
 
