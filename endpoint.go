@@ -9,8 +9,14 @@ import (
 )
 
 type Endpoint interface {
+	// Label identifies the endpoint in log lines, e.g. "remote:host/path".
+	Label() string
+
 	WriteAudio(timestamp uint32, payload []byte) error
 	WriteVideo(timestamp uint32, payload []byte) error
 	WriteSetFrame(timestamp uint32, data *rtmpmsg.DataMessage) error
+
+	// Close must be idempotent: repeated calls (from concurrent failure paths
+	// or a repeated shutdown) must never double-close the underlying resource.
 	Close()
 }

@@ -51,6 +51,8 @@ func _main() error {
 			return conn, &rtmp.ConnConfig{
 				Handler: &Handler{
 					HandleFunc: handleConn,
+					OutDir:     *outDir,
+					ProfileDir: *profileDir,
 				},
 
 				ControlState: rtmp.StreamControlStateConfig{
@@ -120,7 +122,7 @@ func handleConn(h *Handler) error {
 		err = handleRecord(h)
 	case "profile":
 		h.Logln("Inbound - profile:", sp[2])
-		err = handleProfile(h, *profileDir, sp[2])
+		err = handleProfile(h, sp[2])
 	default:
 		err = fmt.Errorf("unexpected route mode: /%s", sp[1])
 	}
@@ -139,39 +141,37 @@ func handleDirect(h *Handler, host, path string) error {
 
 	ep, err := DialRemote(h, host, path, h.PubMsg.PublishingName)
 	if err != nil {
+		h.Logln("Endpoint remote:"+host+"/"+path, "connect failure:", err)
 		return err
 	}
 
-	flvFile, err := CreateFlvFile(*outDir, fmt.Sprint(h.Time))
+	h.AddEndpoint(ep)
+
+	flvFile, err := CreateFlvFile(h.OutDir, fmt.Sprint(h.Time))
 	if err != nil {
 		return err
 	}
 
-	h.Endpoints = []Endpoint{
-		flvFile,
-		ep,
-	}
+	h.AddEndpoint(flvFile)
 
 	return nil
 }
 
 func handleRecord(h *Handler) error {
 
-	flvFile, err := CreateFlvFile(*outDir, fmt.Sprint(h.Time))
+	flvFile, err := CreateFlvFile(h.OutDir, fmt.Sprint(h.Time))
 	if err != nil {
 		return err
 	}
 
-	h.Endpoints = []Endpoint{
-		flvFile,
-	}
+	h.AddEndpoint(flvFile)
 
 	return nil
 }
 
-func handleProfile(h *Handler, profileDir, profileName string) error {
+func handleProfile(h *Handler, profileName string) error {
 
-	b, err := os.ReadFile(path.Join(profileDir, profileName+".json"))
+	b, err := os.ReadFile(path.Join(h.ProfileDir, profileName+".json"))
 	switch {
 	case err == nil:
 	case os.IsNotExist(err):
@@ -191,34 +191,52 @@ func handleProfile(h *Handler, profileDir, profileName string) error {
 		h.Logln("Webhook beforeConnect - requesting index", i, "url:", webhook.URL)
 		err := DoWebhook(h, webhook)
 		if err != nil {
+			// Original semantics: a beforeConnect failure aborts the session.
+			// No endpoint exists yet at this point; the returned error drives
+			// the normal connection shutdown (OnClose), keeping the invariant
+			// that an aborted session leaves nothing open.
 			h.Logln("Webhook beforeConnect - failed:", err)
 			return err
 		}
 	}
 
-	var endpoints []Endpoint
-
+	// Connect remotes one by one. A single remote failing to connect is
+	// isolated: log it as a connection failure and continue with the remaining
+	// remotes (and the recording), instead of aborting the whole session.
+	connected := 0
 	for i, remote := range profile.Remotes {
 		h.Logln("Endpoint", i, "connecting:", remote.Host)
 
 		ep, err := DialRemote(h, remote.Host, remote.Path, remote.Key)
 		if err != nil {
-			return err
+			h.Logln("Endpoint remote:"+remote.Host+"/"+remote.Path, "connect failure, skipping:", err)
+			continue
 		}
 
-		endpoints = append(endpoints, ep)
+		h.AddEndpoint(ep)
+		connected++
 	}
 
 	if profile.Recording {
-		flvFile, err := CreateFlvFile(*outDir, fmt.Sprint(h.Time))
+		flvFile, err := CreateFlvFile(h.OutDir, fmt.Sprint(h.Time))
 		if err != nil {
 			return err
 		}
-		endpoints = append(endpoints, flvFile)
+		h.AddEndpoint(flvFile)
 	}
 
-	h.Endpoints = endpoints
+	// If every remote failed to connect and recording is not enabled, there is
+	// no output at all: the session must fail explicitly rather than pretend
+	// streaming started. The returned error drives OnClose, which releases any
+	// endpoint that did get established.
+	if connected == 0 && !profile.Recording {
+		err := fmt.Errorf("all %d remote endpoint(s) failed to connect and recording is disabled", len(profile.Remotes))
+		h.Logln("Session cannot start:", err)
+		return err
+	}
 
+	// Register afterClose hooks before afterStart runs, so an afterStart
+	// failure still has the hooks available during the resulting OnClose.
 	for i, webhook := range profile.Webhooks["afterClose"] {
 		h.HooksOnClose = append(h.HooksOnClose, func() {
 			h.Logln("Webhook afterClose - requesting index", i, "url:", webhook.URL)
@@ -233,6 +251,10 @@ func handleProfile(h *Handler, profileDir, profileName string) error {
 		h.Logln("Webhook afterStart - requesting index", i, "url:", webhook.URL)
 		err := DoWebhook(h, webhook)
 		if err != nil {
+			// Original semantics: an afterStart failure aborts the session.
+			// Returning the error drives OnClose, which closes every connected
+			// remote and the created recording (no dangling connections or
+			// half-written files) and runs the afterClose webhooks.
 			h.Logln("Webhook afterStart - failed:", err)
 			return err
 		}
