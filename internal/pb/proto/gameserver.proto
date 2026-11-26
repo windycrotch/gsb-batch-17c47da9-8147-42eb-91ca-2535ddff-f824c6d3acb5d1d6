@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+option go_package = "./pb";
+
+package pb;
+
+// C2S_Ping 客户端向服务器发送心跳
+message C2S_Ping { int64 TickTime = 1; }
+message S2C_Pong { bool OK = 1; }
+
+// C2S_Login 登录服务器
+message C2S_Login {
+  string Account = 1;
+  string Password = 2;
+}
+message S2C_Login { bool Ok = 1; }
+
+// C2S_Say 玩家通信
+message C2S_Say {
+  int64 Actor = 1;
+  string Word = 2;
+}
+message S2C_Say {
+  string Word = 1;
+}
+
+// S2S_Hi 服务端玩家通信
+message S2S_Hi {
+  string Repeat = 1;
+}
